@@ -1,0 +1,10 @@
+[package]
+name = "singularity-media"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hardware-accelerated VAAPI/NVDEC/DXVA2 media pipeline, 10-band parametric biquad EQ, 400% volume booster, PiP, and direct stream recorder"
+
+[dependencies]
+serde.workspace = true

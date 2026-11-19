@@ -1,0 +1,17 @@
+[package]
+name = "singularity-chromium-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Safe Rust C-FFI bindings, zero-telemetry build pipeline, and Mullvad anti-fingerprinting hooks for Chromium"
+build = "build.rs"
+
+[dependencies]
+singularity-settings-registry = { path = "../singularity-settings-registry" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rand_core.workspace = true
+hex.workspace = true
+thiserror.workspace = true

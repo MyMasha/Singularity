@@ -1,0 +1,16 @@
+[package]
+name = "singularity-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Singularity instant page load pipeline, 0-RTT hover pre-connect, B-Tree RAM cache, uBlock network blocker, DoH/DoQ resolver, and tab freezer"
+
+[dependencies]
+singularity-settings-registry = { path = "../singularity-settings-registry" }
+singularity-chromium-ffi = { path = "../singularity-chromium-ffi" }
+singularity-net-mullvad = { path = "../singularity-net-mullvad" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

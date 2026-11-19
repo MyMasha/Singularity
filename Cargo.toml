@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/singularity-settings-registry",
+    "crates/singularity-chromium-ffi",
+    "crates/singularity-core",
+    "crates/singularity-net-mullvad",
+    "crates/singularity-vault",
+    "crates/singularity-media",
+    "crates/singularity-ui",
+    "crates/singularity-installer",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["Singularity Browser Architecture Team"]
+license = "MPL-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+toml = "0.8"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["zeroize", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+thiserror = "2.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true
+
+[profile.dev]
+opt-level = 1

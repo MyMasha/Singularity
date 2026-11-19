@@ -1,0 +1,22 @@
+[package]
+name = "singularity-vault"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Local-first zero-knowledge vault using Argon2id, XChaCha20-Poly1305, RFC 6238 TOTP, Passkey emulation, and offline k-anonymity breach bloom filter"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+hex.workspace = true
+thiserror.workspace = true

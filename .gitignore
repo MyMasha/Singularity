@@ -1,0 +1,24 @@
+/target/
+**/*.rs.bk
+*.singularity-vault
+.singularity/
+master.key
+master.dpapi
+tokens.enc
+.env
+.env.*
+.npmrc
+.netrc
+*.pem
+*.key
+.DS_Store
+Thumbs.db
+
+# Compiled release binaries are built & published via GitHub Actions Releases (never committed to Git)
+dist/singularity.exe
+dist/Singularity-Setup.exe
+dist/singularity-linux-x86_64
+dist/SHA256SUMS.txt
+dist/SHA256SUMS.txt.sig
+assets/singularity.exe
+assets/Singularity-Setup.exe

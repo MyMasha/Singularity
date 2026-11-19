@@ -1,0 +1,36 @@
+[package]
+name = "singularity-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Singularity OLED Pure Black (#000000) 200Hz+ UI Shell, Custom Cursor Engine, Black Hole WGSL Shader, Vim Navigation, and Virtualized 2,165+ Settings Inspector"
+
+[[bin]]
+name = "singularity"
+path = "src/main.rs"
+
+[dependencies]
+singularity-settings-registry = { path = "../singularity-settings-registry" }
+singularity-core = { path = "../singularity-core" }
+singularity-net-mullvad = { path = "../singularity-net-mullvad" }
+singularity-vault = { path = "../singularity-vault" }
+singularity-media = { path = "../singularity-media" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+rand_core.workspace = true
+base64.workspace = true
+hex.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+tao = "0.37"
+wry = "0.57"
+
