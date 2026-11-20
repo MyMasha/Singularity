@@ -766,11 +766,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.3");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.4");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v1.0.4"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1019,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v103_multi_window_ui_slot_isolation_nc_suppressor_and_http_pool_headroom() {
+    fn test_v103_multi_window_ui_slot_isolation_borderless_dwm_and_http_pool_headroom() {
         // 1. Two concurrent windows MUST receive two distinct WebView2 UI slots (`slot-0` vs `slot-1`),
         //    and releasing Window 1's slot immediately makes `slot-0` reusable!
         let test_dir = std::env::temp_dir().join(format!(
@@ -1047,15 +1047,14 @@ mod tests {
         win2.release_ui_webview_slot();
         win3.release_ui_webview_slot();
 
-        // 2. Verify Win32 frameless NC suppressor, hidden-until-ready window creation, startup watchdog,
-        //    canonical CONTENT_BROWSER_ARGS, and 32-worker Keep-Alive starvation protection!
+        // 2. Verify borderless DWM color-none (zero blue Win98 border regression!), hidden-until-ready
+        //    window creation, startup watchdog, canonical CONTENT_BROWSER_ARGS, and 32-worker pool headroom!
         let server_src = include_str!("server.rs");
         assert!(server_src.contains("HTTP_WORKER_THREADS: usize = 32"));
-        assert!(server_src.contains("install_win32_frameless_nc_suppressor"));
-        assert!(server_src.contains("DwmExtendFrameIntoClientArea"));
-        assert!(server_src.contains("SetWindowSubclass"));
-        assert!(server_src.contains("WM_NCACTIVATE"));
-        assert!(server_src.contains("WM_NCPAINT"));
+        assert!(server_src.contains("DWMWA_BORDER_COLOR"));
+        assert!(server_src.contains("DWMWA_COLOR_NONE"));
+        assert!(!server_src.contains("WM_NCPAINT"));
+        assert!(!server_src.contains("SetWindowSubclass"));
         assert!(server_src.contains("allocate_ui_webview_slot"));
         assert!(server_src.contains("release_ui_webview_slot"));
         assert!(server_src.contains("UiStartupWatchdog"));

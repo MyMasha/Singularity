@@ -1119,7 +1119,10 @@ fn run_windows_frameless_browser(
             ) -> i32;
         }
         const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        const DWMWA_BORDER_COLOR: u32 = 34;
+        const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
         let dark: u32 = 1;
+        let no_border: u32 = DWMWA_COLOR_NONE;
         unsafe {
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -1127,93 +1130,12 @@ fn run_windows_frameless_browser(
                 &dark as *const u32 as *const core::ffi::c_void,
                 core::mem::size_of::<u32>() as u32,
             );
-        }
-    }
-
-    /// Prevents Windows' `DefWindowProcW` from ever painting a classic Win98 blue `#99B4D1`
-    /// non-client titlebar over our frameless `tao` window during focus switches, multi-window
-    /// activation (`WM_NCACTIVATE`), or `WM_NCPAINT`, while extending DWM shadow cleanly.
-    fn install_win32_frameless_nc_suppressor(hwnd: *mut core::ffi::c_void) {
-        if hwnd.is_null() {
-            return;
-        }
-        #[repr(C)]
-        struct DwmMargins {
-            cx_left_width: i32,
-            cx_right_width: i32,
-            cy_top_height: i32,
-            cy_bottom_height: i32,
-        }
-        type SubclassProc = extern "system" fn(
-            hwnd: *mut core::ffi::c_void,
-            u_msg: u32,
-            w_param: usize,
-            l_param: isize,
-            u_id_subclass: usize,
-            dw_ref_data: usize,
-        ) -> isize;
-        #[link(name = "dwmapi")]
-        extern "system" {
-            fn DwmExtendFrameIntoClientArea(
-                hwnd: *mut core::ffi::c_void,
-                p_mar_inset: *const DwmMargins,
-            ) -> i32;
-        }
-        #[link(name = "comctl32")]
-        extern "system" {
-            fn SetWindowSubclass(
-                hwnd: *mut core::ffi::c_void,
-                pfn_subclass: SubclassProc,
-                u_id_subclass: usize,
-                dw_ref_data: usize,
-            ) -> i32;
-            fn DefSubclassProc(
-                hwnd: *mut core::ffi::c_void,
-                u_msg: u32,
-                w_param: usize,
-                l_param: isize,
-            ) -> isize;
-            fn RemoveWindowSubclass(
-                hwnd: *mut core::ffi::c_void,
-                pfn_subclass: SubclassProc,
-                u_id_subclass: usize,
-            ) -> i32;
-        }
-        const SUBCLASS_ID: usize = 0x51A6_0001;
-        const WM_NCDESTROY: u32 = 0x0082;
-        const WM_NCPAINT: u32 = 0x0085;
-        const WM_NCACTIVATE: u32 = 0x0086;
-
-        extern "system" fn nc_suppressor_proc(
-            hwnd: *mut core::ffi::c_void,
-            u_msg: u32,
-            w_param: usize,
-            l_param: isize,
-            u_id_subclass: usize,
-            _dw_ref_data: usize,
-        ) -> isize {
-            unsafe {
-                match u_msg {
-                    WM_NCPAINT => 0,
-                    WM_NCACTIVATE => DefSubclassProc(hwnd, u_msg, w_param, -1isize),
-                    WM_NCDESTROY => {
-                        let _ = RemoveWindowSubclass(hwnd, nc_suppressor_proc, u_id_subclass);
-                        DefSubclassProc(hwnd, u_msg, w_param, l_param)
-                    }
-                    _ => DefSubclassProc(hwnd, u_msg, w_param, l_param),
-                }
-            }
-        }
-
-        let margins = DwmMargins {
-            cx_left_width: 0,
-            cx_right_width: 0,
-            cy_top_height: 1,
-            cy_bottom_height: 0,
-        };
-        unsafe {
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-            let _ = SetWindowSubclass(hwnd, nc_suppressor_proc, SUBCLASS_ID, 0);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &no_border as *const u32 as *const core::ffi::c_void,
+                core::mem::size_of::<u32>() as u32,
+            );
         }
     }
 
@@ -2583,7 +2505,6 @@ fn run_windows_frameless_browser(
         .map_err(|e| format!("Window creation error: {}", e))?;
     let main_hwnd = window.hwnd() as *mut core::ffi::c_void;
     enable_win32_immersive_dark_window(main_hwnd);
-    install_win32_frameless_nc_suppressor(main_hwnd);
     // Clamp detached window cleanly inside its current monitor if it landed near a screen edge
     if let (Some((px, py)), Some(mon)) = (startup_pos, window.current_monitor()) {
         let mpos = mon.position();
