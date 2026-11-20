@@ -50,12 +50,21 @@ use zeroize::Zeroizing;
 
 const BRAND_LOGO_128_PNG: &[u8] = include_bytes!("../assets/logo_128.png");
 const MAX_CONCURRENT_CONNECTIONS: usize = 96;
-const HTTP_WORKER_THREADS: usize = 12;
+const HTTP_WORKER_THREADS: usize = 32;
 const MAX_KEEPALIVE_REQUESTS_PER_CONN: usize = 64;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
 const MAX_PROXY_REDIRECTS: usize = 5;
 const MAX_PROXY_BODY_BYTES: usize = 5 * 1024 * 1024;
+
+#[cfg(target_os = "windows")]
+const UI_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections";
+#[cfg(target_os = "windows")]
+const CONTENT_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections \
+     --safebrowsing-disable-download-protection \
+     --autoplay-policy=no-user-gesture-required";
 
 static STATE_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -77,6 +86,7 @@ struct ServerConfig {
     transfer_token: Arc<String>,
     bootstrap_nonce: Arc<String>,
     bootstrap_consumed: Arc<AtomicBool>,
+    recovery_bootstrap_nonce: Arc<Mutex<Option<String>>>,
     rendered_html: Arc<Vec<u8>>,
     adopt_tab_tx: AdoptTabCallback,
 }
@@ -101,9 +111,21 @@ impl ServerConfig {
             transfer_token: Arc::new(transfer_token),
             bootstrap_nonce: Arc::new(bootstrap_nonce),
             bootstrap_consumed: Arc::new(AtomicBool::new(false)),
+            recovery_bootstrap_nonce: Arc::new(Mutex::new(None)),
             rendered_html: Arc::new(rendered_html),
             adopt_tab_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn mint_recovery_bootstrap_nonce(&self) -> String {
+        let mut boot_raw = [0u8; 24];
+        OsRng.fill_bytes(&mut boot_raw);
+        let fresh = hex::encode(boot_raw);
+        if let Ok(mut guard) = self.recovery_bootstrap_nonce.lock() {
+            *guard = Some(fresh.clone());
+        }
+        fresh
     }
 
     #[cfg(target_os = "windows")]
@@ -130,12 +152,21 @@ impl ServerConfig {
         let Some(nonce) = provided else {
             return false;
         };
-        let expected = self.bootstrap_nonce.as_bytes();
         let actual = nonce.trim().as_bytes();
-        if expected.len() != actual.len() || !bool::from(expected.ct_eq(actual)) {
-            return false;
+        let expected = self.bootstrap_nonce.as_bytes();
+        if expected.len() == actual.len() && bool::from(expected.ct_eq(actual)) {
+            return !self.bootstrap_consumed.swap(true, Ordering::AcqRel);
         }
-        !self.bootstrap_consumed.swap(true, Ordering::AcqRel)
+        if let Ok(mut guard) = self.recovery_bootstrap_nonce.lock() {
+            if let Some(ref rec) = *guard {
+                let rec_bytes = rec.as_bytes();
+                if rec_bytes.len() == actual.len() && bool::from(rec_bytes.ct_eq(actual)) {
+                    *guard = None;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn is_valid_host(&self, host_header: &str) -> bool {
@@ -200,6 +231,7 @@ impl HttpThreadPool {
             let conns = Arc::clone(&active_conns);
             let _ = std::thread::Builder::new()
                 .name(format!("singularity-http-{}", idx))
+                .stack_size(256 * 1024)
                 .spawn(move || loop {
                     let stream = {
                         let (lock, cvar) = &*q;
@@ -213,7 +245,7 @@ impl HttpThreadPool {
                         let _guard = ConnGuard {
                             counter: Arc::clone(&conns),
                         };
-                        let _ = handle_ipc_connection(stream, Arc::clone(&s), &c);
+                        let _ = handle_ipc_connection(stream, Arc::clone(&s), &c, &conns);
                     }
                 });
         }
@@ -401,6 +433,7 @@ fn run_windows_frameless_browser(
         },
         AdoptExternalTab(TabHandoffPayload),
         CloseExtensionPopup,
+        UiStartupWatchdog,
     }
 
     #[derive(Debug, Deserialize)]
@@ -547,6 +580,14 @@ fn run_windows_frameless_browser(
             std::cell::RefCell::new(WebViewLayoutCache::default());
     }
 
+    fn invalidate_ui_layout_cache() {
+        LAYOUT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            cache.ui_visible = None;
+            cache.ui_bounds = None;
+        });
+    }
+
     fn invalidate_tab_layout_cache(tab_id: Option<u64>) {
         LAYOUT_CACHE.with(|c| {
             let mut cache = c.borrow_mut();
@@ -589,8 +630,12 @@ fn run_windows_frameless_browser(
         in_fullscreen: bool,
     ) {
         let phys = window.inner_size();
-        let w = phys.width.max(1);
-        let h = phys.height.max(1);
+        // Never shrink WebView2 surfaces to 1x1 while the window is minimized (0x0 client area).
+        if phys.width == 0 || phys.height == 0 {
+            return;
+        }
+        let w = phys.width;
+        let h = phys.height;
         let scale = window.scale_factor();
         let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(h);
         let content_h = h.saturating_sub(bar_h).max(1);
@@ -612,16 +657,21 @@ fn run_windows_frameless_browser(
             ) {
                 if let Some(r) = rect {
                     if cache.ui_bounds != Some(r) {
-                        let _ = ui_wv.set_bounds(Rect {
-                            position: PhysicalPosition::new(r.0, r.1).into(),
-                            size: PhysicalSize::new(r.2, r.3).into(),
-                        });
-                        cache.ui_bounds = Some(r);
+                        if ui_wv
+                            .set_bounds(Rect {
+                                position: PhysicalPosition::new(r.0, r.1).into(),
+                                size: PhysicalSize::new(r.2, r.3).into(),
+                            })
+                            .is_ok()
+                        {
+                            cache.ui_bounds = Some(r);
+                        }
                     }
                 }
                 if cache.ui_visible != Some(vis) {
-                    let _ = ui_wv.set_visible(vis);
-                    cache.ui_visible = Some(vis);
+                    if ui_wv.set_visible(vis).is_ok() {
+                        cache.ui_visible = Some(vis);
+                    }
                 }
             }
 
@@ -634,25 +684,34 @@ fn run_windows_frameless_browser(
             ) {
                 if let Some(r) = rect {
                     if cache.tab_bounds.get(&tid).copied() != Some(r) {
-                        let _ = wv.set_bounds(Rect {
-                            position: PhysicalPosition::new(r.0, r.1).into(),
-                            size: PhysicalSize::new(r.2, r.3).into(),
-                        });
-                        cache.tab_bounds.insert(tid, r);
+                        if wv
+                            .set_bounds(Rect {
+                                position: PhysicalPosition::new(r.0, r.1).into(),
+                                size: PhysicalSize::new(r.2, r.3).into(),
+                            })
+                            .is_ok()
+                        {
+                            cache.tab_bounds.insert(tid, r);
+                        }
                     }
                 }
                 if cache.tab_visible.get(&tid).copied() != Some(vis) {
-                    let _ = wv.set_visible(vis);
-                    cache.tab_visible.insert(tid, vis);
+                    if wv.set_visible(vis).is_ok() {
+                        cache.tab_visible.insert(tid, vis);
+                    }
                 }
                 let want_low = !vis;
                 if cache.tab_low_mem.get(&tid).copied() != Some(want_low) {
-                    let _ = wv.set_memory_usage_level(if want_low {
-                        MemoryUsageLevel::Low
-                    } else {
-                        MemoryUsageLevel::Normal
-                    });
-                    cache.tab_low_mem.insert(tid, want_low);
+                    if wv
+                        .set_memory_usage_level(if want_low {
+                            MemoryUsageLevel::Low
+                        } else {
+                            MemoryUsageLevel::Normal
+                        })
+                        .is_ok()
+                    {
+                        cache.tab_low_mem.insert(tid, want_low);
+                    }
                 }
             }
 
@@ -1068,6 +1127,93 @@ fn run_windows_frameless_browser(
                 &dark as *const u32 as *const core::ffi::c_void,
                 core::mem::size_of::<u32>() as u32,
             );
+        }
+    }
+
+    /// Prevents Windows' `DefWindowProcW` from ever painting a classic Win98 blue `#99B4D1`
+    /// non-client titlebar over our frameless `tao` window during focus switches, multi-window
+    /// activation (`WM_NCACTIVATE`), or `WM_NCPAINT`, while extending DWM shadow cleanly.
+    fn install_win32_frameless_nc_suppressor(hwnd: *mut core::ffi::c_void) {
+        if hwnd.is_null() {
+            return;
+        }
+        #[repr(C)]
+        struct DwmMargins {
+            cx_left_width: i32,
+            cx_right_width: i32,
+            cy_top_height: i32,
+            cy_bottom_height: i32,
+        }
+        type SubclassProc = extern "system" fn(
+            hwnd: *mut core::ffi::c_void,
+            u_msg: u32,
+            w_param: usize,
+            l_param: isize,
+            u_id_subclass: usize,
+            dw_ref_data: usize,
+        ) -> isize;
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmExtendFrameIntoClientArea(
+                hwnd: *mut core::ffi::c_void,
+                p_mar_inset: *const DwmMargins,
+            ) -> i32;
+        }
+        #[link(name = "comctl32")]
+        extern "system" {
+            fn SetWindowSubclass(
+                hwnd: *mut core::ffi::c_void,
+                pfn_subclass: SubclassProc,
+                u_id_subclass: usize,
+                dw_ref_data: usize,
+            ) -> i32;
+            fn DefSubclassProc(
+                hwnd: *mut core::ffi::c_void,
+                u_msg: u32,
+                w_param: usize,
+                l_param: isize,
+            ) -> isize;
+            fn RemoveWindowSubclass(
+                hwnd: *mut core::ffi::c_void,
+                pfn_subclass: SubclassProc,
+                u_id_subclass: usize,
+            ) -> i32;
+        }
+        const SUBCLASS_ID: usize = 0x51A6_0001;
+        const WM_NCDESTROY: u32 = 0x0082;
+        const WM_NCPAINT: u32 = 0x0085;
+        const WM_NCACTIVATE: u32 = 0x0086;
+
+        extern "system" fn nc_suppressor_proc(
+            hwnd: *mut core::ffi::c_void,
+            u_msg: u32,
+            w_param: usize,
+            l_param: isize,
+            u_id_subclass: usize,
+            _dw_ref_data: usize,
+        ) -> isize {
+            unsafe {
+                match u_msg {
+                    WM_NCPAINT => 0,
+                    WM_NCACTIVATE => DefSubclassProc(hwnd, u_msg, w_param, -1isize),
+                    WM_NCDESTROY => {
+                        let _ = RemoveWindowSubclass(hwnd, nc_suppressor_proc, u_id_subclass);
+                        DefSubclassProc(hwnd, u_msg, w_param, l_param)
+                    }
+                    _ => DefSubclassProc(hwnd, u_msg, w_param, l_param),
+                }
+            }
+        }
+
+        let margins = DwmMargins {
+            cx_left_width: 0,
+            cx_right_width: 0,
+            cy_top_height: 1,
+            cy_bottom_height: 0,
+        };
+        unsafe {
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            let _ = SetWindowSubclass(hwnd, nc_suppressor_proc, SUBCLASS_ID, 0);
         }
     }
 
@@ -2082,7 +2228,10 @@ fn run_windows_frameless_browser(
             .unwrap_or_else(|| url.to_string());
         let resume_script = build_resume_init_script(url, resume_time_sec, resume_scroll_y);
 
-        let build_once = |ctx: &mut WebContext, with_ext_path: bool| -> wry::Result<WebView> {
+        let build_once = |ctx: &mut WebContext,
+                          with_ext_path: bool,
+                          with_custom_args: bool|
+         -> wry::Result<WebView> {
             let load_proxy = proxy.clone();
             let title_proxy = proxy.clone();
             let newwin_proxy = proxy.clone();
@@ -2099,12 +2248,11 @@ fn run_windows_frameless_browser(
                 .with_background_color((0, 0, 0, 255))
                 .with_autoplay(true)
                 .with_incognito(incognito)
-                .with_browser_extensions_enabled(true)
-                .with_additional_browser_args(
-                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections \
-                     --safebrowsing-disable-download-protection \
-                     --autoplay-policy=no-user-gesture-required",
-                )
+                .with_browser_extensions_enabled(true);
+            if with_custom_args {
+                builder = builder.with_additional_browser_args(CONTENT_BROWSER_ARGS);
+            }
+            let mut builder = builder
                 .with_download_started_handler(move |uri, path| {
                     let downloads_dir = resolve_user_downloads_dir();
                     let (dest_path, filename) =
@@ -2372,11 +2520,15 @@ fn run_windows_frameless_browser(
         };
 
         let want_ext = load_extensions_now && has_installed_extensions(extensions_dir);
-        let wv = match build_once(content_web_context, want_ext) {
+        let wv = match build_once(content_web_context, want_ext, true) {
             Ok(w) => w,
-            Err(_) if want_ext => build_once(content_web_context, false)
+            Err(_) if want_ext => match build_once(content_web_context, false, true) {
+                Ok(w) => w,
+                Err(_) => build_once(content_web_context, false, false)
+                    .map_err(|e| format!("Content WebView error: {}", e))?,
+            },
+            Err(_) => build_once(content_web_context, false, false)
                 .map_err(|e| format!("Content WebView error: {}", e))?,
-            Err(e) => return Err(format!("Content WebView error: {}", e)),
         };
         let _ = wv.set_theme(Theme::Dark);
         if !incognito && !*cookies_hydrated {
@@ -2412,6 +2564,7 @@ fn run_windows_frameless_browser(
     let mut win_builder = WindowBuilder::new()
         .with_title("Singularity")
         .with_window_icon(win_icon)
+        .with_visible(false)
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_background_color((0, 0, 0, 255))
@@ -2420,12 +2573,17 @@ fn run_windows_frameless_browser(
         // so the window fits half, third, and quarter zones across 100%-200% DPI scaling.
         .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)));
     if let Some((px, py)) = startup_pos {
-        win_builder = win_builder.with_position(TaoPhysicalPosition::new(px.max(-32000), py.max(0)));
+        win_builder = win_builder.with_position(TaoPhysicalPosition::new(
+            px.max(-32000),
+            py.max(-32000),
+        ));
     }
     let window = win_builder
         .build(&event_loop)
         .map_err(|e| format!("Window creation error: {}", e))?;
-    enable_win32_immersive_dark_window(window.hwnd() as *mut core::ffi::c_void);
+    let main_hwnd = window.hwnd() as *mut core::ffi::c_void;
+    enable_win32_immersive_dark_window(main_hwnd);
+    install_win32_frameless_nc_suppressor(main_hwnd);
     // Clamp detached window cleanly inside its current monitor if it landed near a screen edge
     if let (Some((px, py)), Some(mon)) = (startup_pos, window.current_monitor()) {
         let mpos = mon.position();
@@ -2439,17 +2597,24 @@ fn run_windows_frameless_browser(
     }
 
     // Separate WebView2 contexts:
-    // - `browser-ui`     : privileged Singularity UI shell (Chrome extensions strictly disabled)
-    // - `browser-engine` : shared browsing tabs profile (Chrome extensions natively enabled)
-    let (ui_data_dir, content_data_dir, extensions_dir) = {
-        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+    // - `browser-ui-slots/slot-<N>` : isolated per-live-window UI shell (zero multi-window collision!)
+    // - `browser-engine`            : shared browsing tabs profile (Chrome extensions natively enabled)
+    let (ui_data_dir, content_data_dir, extensions_dir, fallback_ui_dir) = {
+        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
         shell
             .roaming
             .register_live_window(bind_port, window.hwnd(), &server_cfg.transfer_token);
+        let ui_slot = shell.roaming.allocate_ui_webview_slot();
+        let fallback_dir = shell
+            .roaming
+            .root_dir()
+            .join("browser-ui-slots")
+            .join(format!("fallback-{}", std::process::id()));
         (
-            shell.roaming.ui_webview_dir(),
+            ui_slot,
             shell.roaming.webview_engine_dir(),
             shell.roaming.extensions_dir(),
+            fallback_dir,
         )
     };
     let _ = std::fs::create_dir_all(&ui_data_dir);
@@ -2461,28 +2626,57 @@ fn run_windows_frameless_browser(
 
     let phys = window.inner_size();
 
-    let ui_proxy = proxy.clone();
-    let ui_webview = WebViewBuilder::new_with_web_context(&mut ui_web_context)
-        .with_bounds(Rect {
-            position: PhysicalPosition::new(0, 0).into(),
-            size: PhysicalSize::new(phys.width.max(1), phys.height.max(1)).into(),
-        })
-        .with_background_color((0, 0, 0, 255))
-        .with_autoplay(true)
-        .with_devtools(false)
-        .with_default_context_menus(false)
-        .with_additional_browser_args(
-            "--disable-features=msWebOOUI,msPdfOOUI,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections",
-        )
-        .with_url(app_url)
-        .with_ipc_handler(move |req: wry::http::Request<String>| {
-            let _ = ui_proxy.send_event(WinEvent::UiIpc(req.body().clone()));
-        })
-        .build_as_child(&window)
-        .map_err(|e| format!("UI WebView error: {}", e))?;
+    let build_ui_webview = |ctx: &mut WebContext, use_custom_args: bool| -> wry::Result<WebView> {
+        let ui_proxy = proxy.clone();
+        let mut b = WebViewBuilder::new_with_web_context(ctx)
+            .with_bounds(Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(phys.width.max(1), phys.height.max(1)).into(),
+            })
+            .with_background_color((0, 0, 0, 255))
+            .with_autoplay(true)
+            .with_devtools(false)
+            .with_default_context_menus(false)
+            .with_url(app_url)
+            .with_ipc_handler(move |req: wry::http::Request<String>| {
+                let _ = ui_proxy.send_event(WinEvent::UiIpc(req.body().clone()));
+            });
+        if use_custom_args {
+            b = b.with_additional_browser_args(UI_BROWSER_ARGS);
+        }
+        b.build_as_child(&window)
+    };
+
+    let ui_webview = match build_ui_webview(&mut ui_web_context, true) {
+        Ok(wv) => wv,
+        Err(_) => {
+            let _ = std::fs::create_dir_all(&fallback_ui_dir);
+            ui_web_context = WebContext::new(Some(fallback_ui_dir));
+            build_ui_webview(&mut ui_web_context, false)
+                .map_err(|e| format!("UI WebView error: {}", e))?
+        }
+    };
     let _ = ui_webview.set_theme(Theme::Dark);
     apply_win32_black_class_brush(ui_webview.hwnd().0 as *mut core::ffi::c_void);
 
+    // Show the window only AFTER `ui_webview` exists & its black brush is active so Windows
+    // never flashes a raw black parent frame or classic Win98 blue caption bar.
+    window.set_visible(true);
+    let _ = ui_webview.set_visible(true);
+    let _ = ui_webview.focus();
+
+    // One-shot startup watchdog: if the UI WebView ever stalls during initial navigation on a
+    // secondary window, automatically re-bootstrap with a fresh single-use nonce after 4s.
+    let watchdog_proxy = proxy.clone();
+    let _ = std::thread::Builder::new()
+        .name("singularity-ui-watchdog".into())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(4));
+            let _ = watchdog_proxy.send_event(WinEvent::UiStartupWatchdog);
+        });
+
+    let watchdog_cfg = server_cfg.clone();
     let main_win_id: WindowId = window.id();
 
     // Per-tab WebView2 pool: preserves exact DOM, YouTube playback, SPA state, and enables real RAM unloading.
@@ -2509,11 +2703,24 @@ fn run_windows_frameless_browser(
     let mut user_f11_fullscreen = false;
     let mut was_maximized_before_fs = false;
     let mut last_maximized: Option<bool> = None;
+    let mut ui_ready_received = false;
+    let mut was_minimized = false;
     let mut cookies_hydrated = false;
     let mut extensions_need_load = true;
     // Active floating Chrome extension popup: (ext_id, window_id, auto_close_on_blur, Window, WebView)
     let mut ext_popup: Option<(String, WindowId, bool, Window, WebView)> = None;
     let mut last_ext_popup_closed: Option<(String, std::time::Instant)> = None;
+
+    invalidate_ui_layout_cache();
+    sync_webview_bounds(
+        &window,
+        &ui_webview,
+        &tab_webviews,
+        active_tab_id,
+        web_visible,
+        overlay_open,
+        false,
+    );
 
     let close_ext_popup = |slot: &mut Option<(String, WindowId, bool, Window, WebView)>,
                            last_closed: &mut Option<(String, std::time::Instant)>| {
@@ -2543,6 +2750,7 @@ fn run_windows_frameless_browser(
                 win.set_maximized(true);
             }
         }
+        invalidate_ui_layout_cache();
         sync_webview_bounds(win, ui_wv, tab_wvs, active_tid, web_vis, ov_open, next_fs);
         sync_maximized_state(win, ui_wv, last_max, false);
         emit_ui_sync(ui_wv, &serde_json::json!({ "fullscreen": next_fs }));
@@ -2616,8 +2824,9 @@ fn run_windows_frameless_browser(
                     }
                 }
                 {
-                    let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                     shell.roaming.unregister_live_window();
+                    shell.roaming.release_ui_webview_slot();
                     shell.roaming.flush_async_persistence();
                 }
                 *control_flow = ControlFlow::Exit;
@@ -2643,6 +2852,15 @@ fn run_windows_frameless_browser(
                 ..
             } => {
                 if window_id == main_win_id {
+                    if new_size.width == 0 || new_size.height == 0 {
+                        was_minimized = true;
+                        return;
+                    }
+                    if was_minimized {
+                        was_minimized = false;
+                        invalidate_ui_layout_cache();
+                        invalidate_tab_layout_cache(None);
+                    }
                     sync_webview_bounds(
                         &window,
                         &ui_webview,
@@ -2672,6 +2890,8 @@ fn run_windows_frameless_browser(
                 ..
             } => {
                 if window_id == main_win_id {
+                    invalidate_ui_layout_cache();
+                    invalidate_tab_layout_cache(None);
                     sync_webview_bounds(
                         &window,
                         &ui_webview,
@@ -2701,6 +2921,8 @@ fn run_windows_frameless_browser(
                     if let Ok(cmd) = serde_json::from_str::<UiIpcCmd>(&raw) {
                         match cmd {
                             UiIpcCmd::UiReady => {
+                                ui_ready_received = true;
+                                invalidate_ui_layout_cache();
                                 sync_webview_bounds(
                                     &window,
                                     &ui_webview,
@@ -2838,9 +3060,10 @@ fn run_windows_frameless_browser(
                                     }
                                 }
                                 {
-                                    let shell =
+                                    let mut shell =
                                         shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                                     shell.roaming.unregister_live_window();
+                                    shell.roaming.release_ui_webview_slot();
                                     shell.roaming.flush_async_persistence();
                                 }
                                 *control_flow = ControlFlow::Exit;
@@ -3364,6 +3587,7 @@ fn run_windows_frameless_browser(
                                 })
                                 .with_background_color((16, 17, 22, 255))
                                 .with_browser_extensions_enabled(true)
+                                .with_additional_browser_args(CONTENT_BROWSER_ARGS)
                                 .with_initialization_script(EXT_POPUP_INIT_SCRIPT)
                                 .with_ipc_handler(move |req: wry::http::Request<String>| {
                                     if req.body().contains("close_ext_popup") {
@@ -3852,9 +4076,10 @@ fn run_windows_frameless_browser(
                                     tab_scroll_ys.remove(&tab_id);
                                     last_favicon_at.remove(&tab_id);
                                     if is_only_tab {
-                                        let shell =
+                                        let mut shell =
                                             shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                                         shell.roaming.unregister_live_window();
+                                        shell.roaming.release_ui_webview_slot();
                                         shell.roaming.flush_async_persistence();
                                         *control_flow = ControlFlow::Exit;
                                     } else {
@@ -4303,6 +4528,24 @@ fn run_windows_frameless_browser(
                         }),
                     );
                 }
+                WinEvent::UiStartupWatchdog => {
+                    if !ui_ready_received {
+                        let fresh_nonce = watchdog_cfg.mint_recovery_bootstrap_nonce();
+                        let fresh_url = format!("http://127.0.0.1:{}/?boot={}", bind_port, fresh_nonce);
+                        let _ = ui_webview.load_url(&fresh_url);
+                        invalidate_ui_layout_cache();
+                        sync_webview_bounds(
+                            &window,
+                            &ui_webview,
+                            &tab_webviews,
+                            active_tab_id,
+                            web_visible,
+                            overlay_open,
+                            html_fullscreen || user_f11_fullscreen,
+                        );
+                        let _ = ui_webview.focus();
+                    }
+                }
             },
             _ => {}
         }
@@ -4542,13 +4785,14 @@ fn handle_ipc_connection(
     mut stream: TcpStream,
     shell_mutex: Arc<Mutex<SingularityBrowserShell>>,
     cfg: &ServerConfig,
+    active_conns: &AtomicUsize,
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     for req_idx in 0..MAX_KEEPALIVE_REQUESTS_PER_CONN {
         let timeout = if req_idx == 0 {
-            Duration::from_secs(5)
+            Duration::from_secs(3)
         } else {
-            Duration::from_secs(2)
+            Duration::from_millis(350)
         };
         match read_http_request(&mut stream, timeout) {
             Ok(Some(req)) => {
@@ -4557,8 +4801,11 @@ fn handle_ipc_connection(
                     .get("connection")
                     .map(|c| c.to_ascii_lowercase().contains("close"))
                     .unwrap_or(false);
-                let keep_alive =
-                    !client_wants_close && (req_idx + 1 < MAX_KEEPALIVE_REQUESTS_PER_CONN);
+                let pool_has_headroom =
+                    active_conns.load(Ordering::Acquire) < (HTTP_WORKER_THREADS / 2);
+                let keep_alive = !client_wants_close
+                    && pool_has_headroom
+                    && (req_idx + 1 < MAX_KEEPALIVE_REQUESTS_PER_CONN);
                 let resp = dispatch_http_request(&req, cfg, &shell_mutex);
                 write_http_response(&mut stream, &resp, keep_alive)?;
                 if !keep_alive {

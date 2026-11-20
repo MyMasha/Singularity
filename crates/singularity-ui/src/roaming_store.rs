@@ -525,6 +525,7 @@ fn load_window_session_file(path: &Path) -> Option<WindowSessionFile> {
 pub struct RoamingSingularityStore {
     root_dir: PathBuf,
     window_id: String,
+    ui_slot_lock_path: Option<PathBuf>,
     pub merged_windows_count: usize,
     pub is_secondary_live_window: bool,
     pub startup_handoff: Option<TabHandoffPayload>,
@@ -535,6 +536,7 @@ pub struct RoamingSingularityStore {
 
 impl Drop for RoamingSingularityStore {
     fn drop(&mut self) {
+        self.release_ui_webview_slot();
         self.master_key.zeroize();
     }
 }
@@ -758,6 +760,7 @@ impl RoamingSingularityStore {
         let store = Self {
             root_dir,
             window_id,
+            ui_slot_lock_path: None,
             merged_windows_count,
             is_secondary_live_window,
             startup_handoff,
@@ -907,6 +910,65 @@ impl RoamingSingularityStore {
 
     pub fn ui_webview_dir(&self) -> PathBuf {
         self.root_dir.join("browser-ui")
+    }
+
+    /// Allocates an isolated, reusable per-live-window WebView2 user-data directory
+    /// (`browser-ui-slots/slot-<N>`) so concurrent Singularity windows never collide on a shared
+    /// `browser-ui` WebView2 host process (`0x8007139F` environment mismatch, startup stall, or
+    /// cross-window black screen).
+    pub fn allocate_ui_webview_slot(&mut self) -> PathBuf {
+        use std::io::Write as _;
+        if let Some(ref existing_lock) = self.ui_slot_lock_path {
+            if let Some(parent) = existing_lock.parent() {
+                return parent.to_path_buf();
+            }
+        }
+        let slots_root = self.root_dir.join("browser-ui-slots");
+        let _ = std::fs::create_dir_all(&slots_root);
+        let current_pid = std::process::id();
+        let owner_payload = format!("{}\n{}\n", current_pid, self.window_id);
+
+        for idx in 0..32usize {
+            let slot_dir = slots_root.join(format!("slot-{}", idx));
+            let _ = std::fs::create_dir_all(&slot_dir);
+            let lock_path = slot_dir.join(".owner.pid");
+
+            if let Ok(raw) = std::fs::read_to_string(&lock_path) {
+                let mut lines = raw.lines();
+                let owner_pid = lines
+                    .next()
+                    .and_then(|l| l.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                let owner_win = lines.next().unwrap_or("").trim();
+                if owner_pid != 0
+                    && is_process_alive(owner_pid)
+                    && (owner_pid != current_pid || owner_win != self.window_id)
+                {
+                    continue;
+                }
+                let _ = std::fs::remove_file(&lock_path);
+            }
+
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                let _ = f.write_all(owner_payload.as_bytes());
+                self.ui_slot_lock_path = Some(lock_path);
+                return slot_dir;
+            }
+        }
+
+        let fallback = slots_root.join(format!("ephemeral-{}", self.window_id));
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    }
+
+    pub fn release_ui_webview_slot(&mut self) {
+        if let Some(lock_path) = self.ui_slot_lock_path.take() {
+            let _ = std::fs::remove_file(lock_path);
+        }
     }
 
     pub fn extensions_dir(&self) -> PathBuf {

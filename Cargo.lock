@@ -2067,7 +2067,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "singularity-chromium-ffi"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "hex",
  "rand_core",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2093,21 +2093,21 @@ dependencies = [
 
 [[package]]
 name = "singularity-installer"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "singularity-media"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "singularity-net-mullvad"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-settings-registry"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-ui"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-vault"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "argon2",
  "base64 0.22.1",

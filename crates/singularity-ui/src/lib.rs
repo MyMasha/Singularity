@@ -766,11 +766,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.2");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.3");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.2"));
+        assert!(SINGULARITY_UI_HTML.contains("v1.0.3"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1014,6 +1014,56 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("1280 / iw"));
         assert!(SINGULARITY_UI_HTML.contains("for (int i = 0; i < 32; i++)"));
         assert!(SINGULARITY_UI_HTML.contains("contain: layout style;"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_v103_multi_window_ui_slot_isolation_nc_suppressor_and_http_pool_headroom() {
+        // 1. Two concurrent windows MUST receive two distinct WebView2 UI slots (`slot-0` vs `slot-1`),
+        //    and releasing Window 1's slot immediately makes `slot-0` reusable!
+        let test_dir = std::env::temp_dir().join(format!(
+            "singularity_v103_ui_slots_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        let mut win1 = RoamingSingularityStore::open_at(test_dir.clone()).expect("open win1");
+        let mut win2 = RoamingSingularityStore::open_at_with_options(test_dir.clone(), None, true)
+            .expect("open win2");
+        let slot1 = win1.allocate_ui_webview_slot();
+        let slot2 = win2.allocate_ui_webview_slot();
+        assert_ne!(slot1, slot2, "Simultaneous windows must never share one UI WebView2 slot");
+        assert!(slot1.ends_with("slot-0"));
+        assert!(slot2.ends_with("slot-1"));
+
+        // Dropping/releasing win1 frees slot-0 for reuse by a third window
+        win1.release_ui_webview_slot();
+        let mut win3 = RoamingSingularityStore::open_at_with_options(test_dir.clone(), None, true)
+            .expect("open win3");
+        let slot3 = win3.allocate_ui_webview_slot();
+        assert_eq!(slot3, slot1, "Released UI slot should be reused cleanly");
+        win2.release_ui_webview_slot();
+        win3.release_ui_webview_slot();
+
+        // 2. Verify Win32 frameless NC suppressor, hidden-until-ready window creation, startup watchdog,
+        //    canonical CONTENT_BROWSER_ARGS, and 32-worker Keep-Alive starvation protection!
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("HTTP_WORKER_THREADS: usize = 32"));
+        assert!(server_src.contains("install_win32_frameless_nc_suppressor"));
+        assert!(server_src.contains("DwmExtendFrameIntoClientArea"));
+        assert!(server_src.contains("SetWindowSubclass"));
+        assert!(server_src.contains("WM_NCACTIVATE"));
+        assert!(server_src.contains("WM_NCPAINT"));
+        assert!(server_src.contains("allocate_ui_webview_slot"));
+        assert!(server_src.contains("release_ui_webview_slot"));
+        assert!(server_src.contains("UiStartupWatchdog"));
+        assert!(server_src.contains("mint_recovery_bootstrap_nonce"));
+        assert!(server_src.contains("invalidate_ui_layout_cache"));
+        assert!(server_src.contains("CONTENT_BROWSER_ARGS"));
+        assert!(server_src.contains("UI_BROWSER_ARGS"));
+        assert!(server_src.contains(".with_visible(false)"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }

@@ -2081,7 +2081,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.2</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.3</div>
         </div>
       </aside>
 
