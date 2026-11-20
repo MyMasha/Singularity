@@ -204,11 +204,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     gap: 10px;
     background: linear-gradient(180deg, var(--bar-bg-top) 0%, var(--bar-bg-bot) 100%);
     border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-    backdrop-filter: blur(20px) saturate(135%);
-    -webkit-backdrop-filter: blur(20px) saturate(135%);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    contain: layout style;
     z-index: 30;
     app-region: drag;
     -webkit-app-region: drag;
+  }
+  body.bar-only .apple-bar {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: #0b0c10;
   }
   .apple-bar.tabs-expanded {
     grid-template-columns: minmax(0, 1fr) clamp(190px, 22vw, 330px) auto;
@@ -461,7 +467,26 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     align-items: center;
     gap: 6px;
     cursor: pointer;
+    contain: layout style;
     transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, opacity 0.14s ease;
+  }
+  .tab-pill.dragging {
+    opacity: 0.55;
+    cursor: grabbing;
+  }
+  .tab-pill.detaching {
+    opacity: 1;
+    background: rgba(240, 178, 84, 0.22);
+    border-color: var(--gold-bright);
+    color: #ffffff;
+    box-shadow: 0 0 0 1px var(--gold-bright), 0 0 14px rgba(240, 178, 84, 0.45);
+    cursor: grabbing;
+  }
+  .tab-pill.drop-before {
+    box-shadow: inset 2.5px 0 0 0 var(--gold-bright);
+  }
+  .tab-pill.drop-after {
+    box-shadow: inset -2.5px 0 0 0 var(--gold-bright);
   }
   .tab-pill::after {
     content: "";
@@ -899,10 +924,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     height: 38px;
     padding: 0 6px 0 13px;
     border-radius: 10px;
-    background: rgba(10, 12, 18, 0.78);
+    background: rgba(10, 12, 18, 0.84);
     border: 1px solid rgba(255, 255, 255, 0.11);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
     display: flex;
     align-items: center;
     gap: 9px;
@@ -938,10 +963,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     gap: 2px;
     padding: 3px;
     border-radius: 9px;
-    background: rgba(10, 12, 18, 0.74);
+    background: rgba(10, 12, 18, 0.82);
     border: 1px solid rgba(255, 255, 255, 0.085);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
   }
 
   .quick-pill {
@@ -2056,7 +2081,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.1</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.2</div>
         </div>
       </aside>
 
@@ -3518,6 +3543,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       addBtn(L("Reload", "Recharger"), "Ctrl+R", () => executeTabContextAction("reload_tab", t.id, null, null));
       addBtn(t.unloaded ? L("Wake tab", "Réveiller l'onglet") : L("Put to sleep (RAM)", "Mettre en veille (RAM)"), "", () => executeTabContextAction("unload_tab", t.id, null, null));
       addSep();
+      addBtn(L("Move tab to new window", "Déplacer dans une nouvelle fenêtre"), "", () => executeTabContextAction("move_tab_new_window", t.id, null, null, null));
+      addSep();
       const hdr = document.createElement("div");
       hdr.className = "tctx-header";
       hdr.textContent = L("Tab groups", "Groupes d'onglets");
@@ -3561,6 +3588,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       addBtn(L("Close group", "Fermer le groupe"), "", () => executeTabContextAction("close_group", null, g.id, null), false, true);
     } else {
       addBtn(L("New tab", "Nouvel onglet"), "Ctrl+T", () => executeTabContextAction("new_tab", null, null, null));
+      addBtn(L("New window", "Nouvelle fenêtre"), "Ctrl+N", () => executeTabContextAction("new_window", null, null, null));
       addBtn(L("Reopen closed tab", "Rouvrir l'onglet fermé"), "Ctrl+Shift+T", () => executeTabContextAction("reopen_closed_tab", null, null, null), closedTabsStack.length === 0);
       addSep();
       addBtn(L("Create new group", "Créer un nouveau groupe"), "", () => executeTabContextAction("new_group_empty", null, null, null));
@@ -3577,10 +3605,63 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     menu.style.top = py + "px";
   }
 
-  function executeTabContextAction(action, tabId, groupId, targetGroupId) {
+  function detachTabToWindow(tabId, opts) {
+    const t = tabs.find(x => x.id === tabId);
+    if (!t) return;
+    const forceNewWindow = !!(opts && opts.forceNewWindow);
+    const targetWindowId = (opts && opts.targetWindowId) ? String(opts.targetWindowId) : null;
+    if (hasNativeIpc()) {
+      sendNativeIpc({
+        cmd: "detach_tab",
+        tab_id: t.id,
+        url: (t.url && /^https?:\/\//i.test(t.url)) ? t.url : "",
+        title: t.title || "",
+        favicon_url: (t.faviconUrl && /^https?:\/\//i.test(t.faviconUrl)) ? t.faviconUrl : null,
+        media_time_sec: t.mediaTimeSec >= 2 ? Math.floor(t.mediaTimeSec) : null,
+        scroll_y: t.scrollY > 0 ? Math.floor(t.scrollY) : null,
+        force_new_window: forceNewWindow,
+        target_window_id: targetWindowId,
+        is_only_tab: tabs.length <= 1
+      });
+    } else if (t.url && /^https?:\/\//i.test(t.url)) {
+      window.open(t.url, "_blank", "noopener");
+      if (tabs.length > 1) removeDetachedTabFromList(t.id);
+    }
+  }
+
+  function removeDetachedTabFromList(tabId) {
+    const idx = tabs.findIndex(t => t.id === tabId);
+    if (idx === -1) return;
+    if (tabs.length <= 1) {
+      sendNativeIpc({ cmd: "close" });
+      return;
+    }
+    tabs.splice(idx, 1);
+    pruneEmptyGroups();
+    if (activeTabId === tabId) {
+      const next = tabs[Math.min(idx, tabs.length - 1)];
+      activeTabId = next.id;
+      syncViewportToActiveTab("activate");
+    } else {
+      renderTabs(false);
+      persistOpenTabsIfEnabled(false);
+    }
+  }
+
+  function executeTabContextAction(action, tabId, groupId, targetGroupId, targetWindowId) {
     switch (action) {
       case "new_tab":
         createNewTab();
+        break;
+      case "new_window":
+        if (hasNativeIpc()) sendNativeIpc({ cmd: "open_new_window" });
+        else window.open(window.location.href, "_blank");
+        break;
+      case "move_tab_new_window":
+        if (tabId) detachTabToWindow(tabId, { forceNewWindow: true });
+        break;
+      case "move_tab_to_window":
+        if (tabId && targetWindowId) detachTabToWindow(tabId, { targetWindowId });
         break;
       case "new_tab_right": {
         const idx = tabs.findIndex(t => t.id === tabId);
@@ -3623,7 +3704,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           if (!t.url || isInternalSettingsUrl(t.url)) return;
           t.unloaded = true;
           sendNativeIpc({ cmd: "unload_tab", tab_id: t.id });
-          renderTabs(false);
+          updateSingleTabPill(t);
+          updateRamStatusUI();
           showToast(L(`Tab put to sleep: ${t.title || t.url}`, `Onglet mis en veille : ${t.title || t.url}`));
         }
         break;
@@ -3702,7 +3784,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
   }
 
-  // Delegated scroll + bulletproof middle-click tab close + native right-click context menu
+  let suppressTabClickUntil = 0;
+
+  // Delegated clicks, pointer-capture tab dragging (reorder + tear-off + cross-window drop),
+  // bulletproof middle-click tab close, wheel scroll & native right-click context menu
   (function wireTabsStripInteractions() {
     const strip = document.getElementById("tabs-strip");
     const barWrap = document.querySelector(".tabs-bar-wrap");
@@ -3748,6 +3833,186 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     strip.addEventListener("pointerup", onMidUpOrAux, true);
     strip.addEventListener("mouseup", onMidUpOrAux, true);
     strip.addEventListener("auxclick", onMidUpOrAux, true);
+
+    // Delegated left-click handler for tabs, close buttons, and group pills (zero per-tab closures!)
+    strip.addEventListener("click", (ev) => {
+      if (ev.button !== 0) return;
+      if (performance.now() < suppressTabClickUntil) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      const closeBtn = ev.target && ev.target.closest ? ev.target.closest(".tab-close-btn") : null;
+      if (closeBtn) {
+        const p = closeBtn.closest(".tab-pill");
+        const tid = p ? Number(p.dataset.tabId || 0) : 0;
+        if (tid) {
+          ev.stopPropagation();
+          closeTab(tid);
+        }
+        return;
+      }
+      const grpBtn = ev.target && ev.target.closest ? ev.target.closest(".tab-group-pill") : null;
+      if (grpBtn && grpBtn.dataset.groupId) {
+        ev.stopPropagation();
+        toggleTabGroupCollapsed(grpBtn.dataset.groupId);
+        return;
+      }
+      const pill = ev.target && ev.target.closest ? ev.target.closest(".tab-pill") : null;
+      if (pill) {
+        const tid = Number(pill.dataset.tabId || 0);
+        if (tid) activateTab(tid);
+      }
+    });
+
+    strip.addEventListener("dblclick", (ev) => {
+      const grpBtn = ev.target && ev.target.closest ? ev.target.closest(".tab-group-pill") : null;
+      if (grpBtn && grpBtn.dataset.groupId) {
+        ev.stopPropagation();
+        openGroupEditor(grpBtn.dataset.groupId);
+      }
+    });
+
+    // Chrome-grade Pointer-Capture Tab Drag Engine:
+    // - Drag horizontally along the tab strip => smooth live reorder
+    // - Drag vertically out of the tab bar (or outside the window) => release on another Singularity
+    //   window to move the tab there, OR release on the desktop to tear off into a brand-new window!
+    let dragState = null;
+
+    function clearDropMarkers() {
+      const marked = strip.querySelectorAll(".drop-before, .drop-after");
+      for (let i = 0; i < marked.length; i++) {
+        marked[i].classList.remove("drop-before", "drop-after");
+      }
+    }
+
+    function finishTabDrag(cancelled) {
+      if (!dragState) return;
+      const st = dragState;
+      dragState = null;
+      clearDropMarkers();
+      if (st.pill) {
+        st.pill.classList.remove("dragging", "detaching");
+      }
+      try {
+        if (strip.hasPointerCapture && strip.hasPointerCapture(st.pointerId)) {
+          strip.releasePointerCapture(st.pointerId);
+        }
+      } catch (_) {}
+
+      if (!st.started || cancelled) return;
+      suppressTabClickUntil = performance.now() + 200;
+
+      if (st.detaching) {
+        detachTabToWindow(st.tabId, { forceNewWindow: false });
+        return;
+      }
+
+      if (st.targetTabId && st.targetTabId !== st.tabId) {
+        const fromIdx = tabs.findIndex(t => t.id === st.tabId);
+        const toIdxOrig = tabs.findIndex(t => t.id === st.targetTabId);
+        if (fromIdx !== -1 && toIdxOrig !== -1 && fromIdx !== toIdxOrig) {
+          const targetGroup = tabs[toIdxOrig].groupId || null;
+          const [moved] = tabs.splice(fromIdx, 1);
+          let insertIdx = tabs.findIndex(t => t.id === st.targetTabId);
+          if (insertIdx === -1) insertIdx = tabs.length;
+          else if (st.insertAfter) insertIdx += 1;
+          moved.groupId = targetGroup;
+          tabs.splice(insertIdx, 0, moved);
+          pruneEmptyGroups();
+          renderTabs(false);
+          persistOpenTabsIfEnabled(false);
+        }
+      }
+    }
+
+    strip.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      if (ev.target && ev.target.closest && ev.target.closest(".tab-close-btn")) return;
+      const pill = ev.target && ev.target.closest ? ev.target.closest(".tab-pill") : null;
+      if (!pill) return;
+      const tabId = Number(pill.dataset.tabId || 0);
+      if (!tabId) return;
+      dragState = {
+        tabId,
+        pill,
+        pointerId: ev.pointerId,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        started: false,
+        detaching: false,
+        targetTabId: null,
+        insertAfter: false
+      };
+    });
+
+    strip.addEventListener("pointermove", (ev) => {
+      if (!dragState || ev.pointerId !== dragState.pointerId) return;
+      const dx = ev.clientX - dragState.startX;
+      const dy = ev.clientY - dragState.startY;
+      if (!dragState.started) {
+        if (dx * dx + dy * dy < 36) return; // 6px deadzone keeps clicks instantaneous
+        dragState.started = true;
+        dragState.pill.classList.add("dragging");
+        try { strip.setPointerCapture(ev.pointerId); } catch (_) {}
+      }
+
+      const barRect = barWrap.getBoundingClientRect();
+      const outVert = ev.clientY > barRect.bottom + 26 || ev.clientY < barRect.top - 22 || Math.abs(dy) >= 34;
+      const outHoriz = ev.clientX < -20 || ev.clientX > window.innerWidth + 20;
+      const wantDetach = outVert || outHoriz;
+
+      if (wantDetach !== dragState.detaching) {
+        dragState.detaching = wantDetach;
+        dragState.pill.classList.toggle("detaching", wantDetach);
+        if (wantDetach) {
+          clearDropMarkers();
+          dragState.targetTabId = null;
+          showToast(
+            L("Release to move tab to another window or open a new window", "Relâchez pour déplacer vers une autre fenêtre ou en créer une nouvelle"),
+            null,
+            1800
+          );
+        }
+      }
+
+      if (dragState.detaching) return;
+
+      // Compute horizontal insertion marker across visible tab pills
+      clearDropMarkers();
+      dragState.targetTabId = null;
+      const pills = strip.querySelectorAll(".tab-pill");
+      let bestPill = null;
+      let bestDist = Infinity;
+      let after = false;
+      for (let i = 0; i < pills.length; i++) {
+        const p = pills[i];
+        const pid = Number(p.dataset.tabId || 0);
+        if (pid === dragState.tabId) continue;
+        const r = p.getBoundingClientRect();
+        const mid = (r.left + r.right) * 0.5;
+        const dist = Math.abs(ev.clientX - mid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPill = p;
+          after = ev.clientX >= mid;
+        }
+      }
+      if (bestPill) {
+        dragState.targetTabId = Number(bestPill.dataset.tabId || 0) || null;
+        dragState.insertAfter = after;
+        bestPill.classList.add(after ? "drop-after" : "drop-before");
+      }
+    });
+
+    strip.addEventListener("pointerup", (ev) => {
+      if (!dragState || ev.pointerId !== dragState.pointerId) return;
+      finishTabDrag(false);
+    });
+    strip.addEventListener("pointercancel", (ev) => {
+      if (!dragState || ev.pointerId !== dragState.pointerId) return;
+      finishTabDrag(true);
+    });
 
     barWrap.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
@@ -3799,34 +4064,122 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     });
   })();
 
+  const TAB_CLOSE_SVG = `<svg width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 2l6 6M8 2L2 8"/></svg>`;
+
+  function buildTabPillTooltip(t, grp) {
+    const timeHint = t.mediaTimeSec >= 3
+      ? L(` · resumes at ${formatMediaTimestamp(t.mediaTimeSec)}`, ` · reprise à ${formatMediaTimestamp(t.mediaTimeSec)}`)
+      : "";
+    const grpHint = grp && grp.title ? ` [${grp.title}]` : "";
+    return (t.title || L("New Tab", "Nouvel onglet"))
+      + grpHint
+      + timeHint
+      + (t.unloaded ? L(" (sleeping / RAM freed — click to wake)", " (en veille / RAM libérée — cliquez pour charger)") : "")
+      + L(" · Drag out: move to new/other window · Middle-click: close", " · Glisser hors barre : nouvelle/autre fenêtre · Clic molette : fermer");
+  }
+
+  function faviconSignatureForTab(t) {
+    return `${t.url || ""}|${t.faviconUrl || ""}|${t.unloaded ? "1" : "0"}`;
+  }
+
+  function syncTabPillElement(pill, t, grp) {
+    const isAct = t.id === activeTabId;
+    pill.classList.toggle("active", isAct);
+    pill.classList.toggle("sleeping", !!t.unloaded);
+    pill.classList.toggle("in-group", !!grp);
+    if (grp) {
+      pill.style.setProperty("--group-color", grp.color || "#f0b254");
+    } else {
+      pill.style.removeProperty("--group-color");
+    }
+    const nextTitle = buildTabPillTooltip(t, grp);
+    if (pill.title !== nextTitle) pill.title = nextTitle;
+
+    const favSig = faviconSignatureForTab(t);
+    if (pill.dataset.favSig !== favSig) {
+      pill.dataset.favSig = favSig;
+      const oldIcon = pill.querySelector(".tab-icon-wrap");
+      const newIcon = createTabFaviconNode(t);
+      if (oldIcon) oldIcon.replaceWith(newIcon);
+      else pill.prepend(newIcon);
+    }
+    const lbl = pill.querySelector(".tab-label");
+    const nextLabel = t.title || L("New Tab", "Nouvel onglet");
+    if (lbl && lbl.textContent !== nextLabel) lbl.textContent = nextLabel;
+  }
+
+  // O(1) in-place update for a single tab's title / favicon / sleep state without touching other tabs!
+  function updateSingleTabPill(t) {
+    if (!t) return;
+    const strip = document.getElementById("tabs-strip");
+    if (!strip) return;
+    const pill = strip.querySelector(`.tab-pill[data-tab-id="${t.id}"]`);
+    if (!pill) return;
+    syncTabPillElement(pill, t, findTabGroup(t.groupId));
+  }
+
+  function createTabPillElement(t, grp) {
+    const pill = document.createElement("div");
+    pill.dataset.tabId = String(t.id);
+    pill.className = "tab-pill";
+    pill.dataset.favSig = faviconSignatureForTab(t);
+
+    pill.appendChild(createTabFaviconNode(t));
+
+    const lbl = document.createElement("span");
+    lbl.className = "tab-label";
+    lbl.textContent = t.title || L("New Tab", "Nouvel onglet");
+    pill.appendChild(lbl);
+
+    const cls = document.createElement("span");
+    cls.className = "tab-close-btn";
+    cls.title = L("Close tab (Ctrl+W)", "Fermer l'onglet (Ctrl+W)");
+    cls.innerHTML = TAB_CLOSE_SVG;
+    pill.appendChild(cls);
+
+    syncTabPillElement(pill, t, grp);
+    return pill;
+  }
+
+  // Keyed incremental DOM reconciliation: reuses existing `.tab-pill` elements & cached favicons
+  // so 38+ open tabs never suffer full DOM destruction/rebuild jank!
   function renderTabs(scrollActiveIntoView) {
     const strip = document.getElementById("tabs-strip");
-    strip.replaceChildren();
+    const existingPills = new Map();
+    const existingGroups = new Map();
+    for (let i = 0; i < strip.children.length; i++) {
+      const ch = strip.children[i];
+      if (ch.dataset && ch.dataset.tabId) existingPills.set(Number(ch.dataset.tabId), ch);
+      else if (ch.dataset && ch.dataset.groupId) existingGroups.set(ch.dataset.groupId, ch);
+    }
 
     let visibleTabCount = 0;
-    for (const t of tabs) {
+    const groupMemberCounts = new Map();
+    for (let i = 0; i < tabs.length; i++) {
+      const t = tabs[i];
       const g = findTabGroup(t.groupId);
       if (!g || !g.collapsed) visibleTabCount++;
+      if (t.groupId) groupMemberCounts.set(t.groupId, (groupMemberCounts.get(t.groupId) || 0) + 1);
     }
     strip.classList.toggle("compact-tabs", visibleTabCount >= 6);
     strip.classList.toggle("very-compact", visibleTabCount >= 12);
 
-    const groupMemberCounts = new Map();
-    for (const t of tabs) {
-      if (t.groupId) groupMemberCounts.set(t.groupId, (groupMemberCounts.get(t.groupId) || 0) + 1);
-    }
-
+    const desiredNodes = [];
     let activePill = null;
     let lastGroupId = null;
 
-    for (const t of tabs) {
+    for (let i = 0; i < tabs.length; i++) {
+      const t = tabs[i];
       const grp = findTabGroup(t.groupId);
       const curGroupId = grp ? grp.id : null;
 
       if (curGroupId && curGroupId !== lastGroupId) {
-        const gBtn = document.createElement("button");
-        gBtn.type = "button";
-        gBtn.dataset.groupId = grp.id;
+        let gBtn = existingGroups.get(grp.id);
+        if (!gBtn) {
+          gBtn = document.createElement("button");
+          gBtn.type = "button";
+          gBtn.dataset.groupId = grp.id;
+        }
         const hasTitle = !!(grp.title && grp.title.trim());
         gBtn.className = "tab-group-pill"
           + (grp.collapsed ? " collapsed" : "")
@@ -3837,77 +4190,52 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           `${hasTitle ? grp.title : "Group"} (${cnt} tab${cnt > 1 ? "s" : ""}) · Click: collapse/expand · Double-click: rename · Right-click: menu`,
           `${hasTitle ? grp.title : "Groupe"} (${cnt} onglet${cnt > 1 ? "s" : ""}) · Clic: réduire/déplier · Double-clic: renommer · Clic droit: options`
         );
-        if (hasTitle) {
-          const sp = document.createElement("span");
-          sp.textContent = grp.title.trim();
-          gBtn.appendChild(sp);
+        const gSig = `${hasTitle ? grp.title.trim() : ""}|${grp.collapsed ? cnt : ""}`;
+        if (gBtn.dataset.gSig !== gSig) {
+          gBtn.dataset.gSig = gSig;
+          gBtn.replaceChildren();
+          if (hasTitle) {
+            const sp = document.createElement("span");
+            sp.textContent = grp.title.trim();
+            gBtn.appendChild(sp);
+          }
+          if (grp.collapsed) {
+            const cntEl = document.createElement("span");
+            cntEl.className = "tab-group-count";
+            cntEl.textContent = String(cnt);
+            gBtn.appendChild(cntEl);
+          }
         }
-        if (grp.collapsed) {
-          const cntEl = document.createElement("span");
-          cntEl.className = "tab-group-count";
-          cntEl.textContent = String(cnt);
-          gBtn.appendChild(cntEl);
-        }
-        gBtn.addEventListener("click", (ev) => {
-          if (ev.button !== 0) return;
-          ev.stopPropagation();
-          toggleTabGroupCollapsed(grp.id);
-        });
-        gBtn.addEventListener("dblclick", (ev) => {
-          ev.stopPropagation();
-          openGroupEditor(grp.id);
-        });
-        strip.appendChild(gBtn);
+        desiredNodes.push(gBtn);
       }
       lastGroupId = curGroupId;
 
-      if (grp && grp.collapsed) {
-        continue;
+      if (grp && grp.collapsed) continue;
+
+      let pill = existingPills.get(t.id);
+      if (pill) {
+        syncTabPillElement(pill, t, grp);
+      } else {
+        pill = createTabPillElement(t, grp);
       }
-
-      const isAct = t.id === activeTabId;
-      const pill = document.createElement("div");
-      pill.dataset.tabId = String(t.id);
-      pill.className = "tab-pill"
-        + (isAct ? " active" : "")
-        + (t.unloaded ? " sleeping" : "")
-        + (grp ? " in-group" : "");
-      if (grp) {
-        pill.style.setProperty("--group-color", grp.color || "#f0b254");
-      }
-      const timeHint = t.mediaTimeSec >= 3
-        ? L(` · resumes at ${formatMediaTimestamp(t.mediaTimeSec)}`, ` · reprise à ${formatMediaTimestamp(t.mediaTimeSec)}`)
-        : "";
-      const grpHint = grp && grp.title ? ` [${grp.title}]` : "";
-      pill.title = (t.title || L("New Tab", "Nouvel onglet"))
-        + grpHint
-        + timeHint
-        + (t.unloaded ? L(" (sleeping / RAM freed — click to wake)", " (en veille / RAM libérée — cliquez pour charger)") : "")
-        + L(" · Middle-click: close · Right-click: menu", " · Clic molette: fermer · Clic droit: menu");
-      pill.addEventListener("click", (ev) => {
-        if (ev.button !== 0) return;
-        activateTab(t.id);
-      });
-
-      pill.appendChild(createTabFaviconNode(t));
-
-      const lbl = document.createElement("span");
-      lbl.className = "tab-label";
-      lbl.textContent = t.title || L("New Tab", "Nouvel onglet");
-      pill.appendChild(lbl);
-
-      const cls = document.createElement("span");
-      cls.className = "tab-close-btn";
-      cls.title = L("Close tab (Ctrl+W)", "Fermer l'onglet (Ctrl+W)");
-      cls.innerHTML = `<svg width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 2l6 6M8 2L2 8"/></svg>`;
-      cls.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        closeTab(t.id);
-      });
-      pill.appendChild(cls);
-      strip.appendChild(pill);
-      if (isAct) activePill = pill;
+      desiredNodes.push(pill);
+      if (t.id === activeTabId) activePill = pill;
     }
+
+    // Minimal DOM reconciliation: only move/insert/remove nodes that actually changed order!
+    const desiredSet = new Set(desiredNodes);
+    for (let i = strip.children.length - 1; i >= 0; i--) {
+      if (!desiredSet.has(strip.children[i])) {
+        strip.children[i].remove();
+      }
+    }
+    for (let i = 0; i < desiredNodes.length; i++) {
+      const node = desiredNodes[i];
+      if (strip.children[i] !== node) {
+        strip.insertBefore(node, strip.children[i] || null);
+      }
+    }
+
     syncOmnibarLayout(bootInitialized);
     if (scrollActiveIntoView && activePill) {
       activePill.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
@@ -4168,6 +4496,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         break;
       case "new_tab":
         createNewTab();
+        break;
+      case "new_window":
+        if (hasNativeIpc()) sendNativeIpc({ cmd: "open_new_window" });
+        else window.open(window.location.href, "_blank");
         break;
       case "close_active_tab":
         closeTab(activeTabId);
@@ -5160,8 +5492,35 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         msg.ctx_action,
         msg.ctx_tab_id || null,
         msg.ctx_group_id || null,
-        msg.ctx_target_group_id || null
+        msg.ctx_target_group_id || null,
+        msg.ctx_target_window_id || null
       );
+      return;
+    }
+    if (typeof msg.tab_detached === "number") {
+      removeDetachedTabFromList(Number(msg.tab_detached));
+      return;
+    }
+    if (msg.adopt_external_tab) {
+      const ext = msg.adopt_external_tab;
+      const rawUrl = typeof ext.url === "string" ? ext.url.trim() : "";
+      const safeUrl = (/^https?:\/\//i.test(rawUrl) || isInternalSettingsUrl(rawUrl)) ? rawUrl : "";
+      const id = nextTabId++;
+      tabs.push({
+        id,
+        title: (ext.title && String(ext.title).trim()) || (safeUrl ? deriveTitleFromUrl(safeUrl) : L("New Tab", "Nouvel onglet")),
+        url: safeUrl,
+        mediaTimeSec: Math.max(0, Math.floor(Number(ext.media_time_sec || 0))),
+        scrollY: Math.max(0, Math.floor(Number(ext.scroll_y || 0))),
+        groupId: null,
+        faviconUrl: (ext.favicon_url && /^https?:\/\//i.test(ext.favicon_url)) ? ext.favicon_url : "",
+        lastActiveAt: Date.now(),
+        unloaded: false
+      });
+      activeTabId = id;
+      syncViewportToActiveTab("activate");
+      if (!safeUrl) focusSearchForNewTab();
+      showToast(L("Tab moved to this window", "Onglet déplacé dans cette fenêtre"));
       return;
     }
     if (msg.ext_ctx_action && msg.ext_ctx_id) {
@@ -5239,15 +5598,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       : getActiveTab();
     if (!targetTab) return;
 
-    let tabsChanged = false;
+    let pillDirty = false;
     if (typeof msg.unloaded === "boolean" && targetTab.unloaded !== msg.unloaded) {
       targetTab.unloaded = msg.unloaded;
-      tabsChanged = true;
+      pillDirty = true;
     }
     if (msg.favicon_url && /^https?:\/\//i.test(msg.favicon_url) && targetTab.url) {
       if (targetTab.faviconUrl !== msg.favicon_url) {
         targetTab.faviconUrl = msg.favicon_url;
-        tabsChanged = true;
+        pillDirty = true;
         persistOpenTabsIfEnabled(true);
       }
     }
@@ -5263,7 +5622,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         }
         if (hostChanged) {
           targetTab.faviconUrl = "";
-          tabsChanged = true;
+          pillDirty = true;
         }
         targetTab.url = msg.url;
         persistOpenTabsIfEnabled(false);
@@ -5295,12 +5654,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (msg.title && msg.title.trim() && targetTab.url) {
       if (targetTab.title !== msg.title.trim()) {
         targetTab.title = msg.title.trim();
-        tabsChanged = true;
+        pillDirty = true;
         persistOpenTabsIfEnabled(false);
       }
     }
-    if (tabsChanged) {
-      renderTabs(false);
+    if (pillDirty) {
+      // O(1) single-pill DOM sync instead of re-rendering the entire tab strip
+      updateSingleTabPill(targetTab);
     }
   };
 
@@ -5336,6 +5696,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     } else if (ctrl && !e.shiftKey && (k === "t" || code === "KeyT")) {
       e.preventDefault();
       handleBrowserShortcut("new_tab", 0);
+    } else if (ctrl && !e.shiftKey && (k === "n" || code === "KeyN")) {
+      e.preventDefault();
+      handleBrowserShortcut("new_window", 0);
     } else if (ctrl && !e.shiftKey && (k === "w" || code === "KeyW" || code === "F4")) {
       e.preventDefault();
       handleBrowserShortcut("close_active_tab", 0);
@@ -6674,11 +7037,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
    * BOOTSTRAP & LIVE STATE SYNC
    * ============================================================================ */
   let bootInitialized = false;
+  let lastStateRev = 0;
 
-  async function refreshHeaderState() {
+  async function refreshHeaderState(forceFull) {
     try {
-      const res = await apiFetch("/api/state");
+      const qs = (bootInitialized && !forceFull && lastStateRev > 0) ? `?rev=${lastStateRev}` : "";
+      const res = await apiFetch("/api/state" + qs);
       const st = await res.json();
+      if (typeof st.rev === "number") lastStateRev = st.rev;
+      if (st.unchanged && bootInitialized) return;
 
       if (!bootInitialized && typeof st.language === "string") {
         currentLang = st.language === "fr" ? "fr" : "en";
@@ -6760,7 +7127,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         let restoredCount = 0;
         let restoredActiveMedia = 0;
         const mergedWins = Math.floor(Number(st.merged_windows_count || 0));
-        if (restoreSessionEnabled && Array.isArray(st.saved_tabs) && st.saved_tabs.length > 0) {
+        const isDetachedHandoff = !!st.is_detached_handoff;
+        if ((restoreSessionEnabled || isDetachedHandoff) && Array.isArray(st.saved_tabs) && st.saved_tabs.length > 0) {
           const now = Date.now();
           if (Array.isArray(st.saved_tab_groups)) {
             tabGroups = st.saved_tab_groups
@@ -6800,16 +7168,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           openTutorialWizard(0, true);
         } else if (restoredCount > 0) {
           syncViewportToActiveTab("activate");
-          const mediaNote = restoredActiveMedia >= 3
-            ? L(` · video resumes at ${formatMediaTimestamp(restoredActiveMedia)}`, ` · reprise vidéo à ${formatMediaTimestamp(restoredActiveMedia)}`)
-            : "";
-          const winNote = mergedWins > 1
-            ? L(`${mergedWins} windows merged · `, `${mergedWins} fenêtres combinées · `)
-            : "";
-          showToast(L(
-            `Session restored (${winNote}${restoredCount} tab${restoredCount === 1 ? "" : "s"}${mediaNote})`,
-            `Session restaurée (${winNote}${restoredCount} onglet${restoredCount > 1 ? "s" : ""}${mediaNote})`
-          ));
+          if (!isDetachedHandoff) {
+            const mediaNote = restoredActiveMedia >= 3
+              ? L(` · video resumes at ${formatMediaTimestamp(restoredActiveMedia)}`, ` · reprise vidéo à ${formatMediaTimestamp(restoredActiveMedia)}`)
+              : "";
+            const winNote = mergedWins > 1
+              ? L(`${mergedWins} windows merged · `, `${mergedWins} fenêtres combinées · `)
+              : "";
+            showToast(L(
+              `Session restored (${winNote}${restoredCount} tab${restoredCount === 1 ? "" : "s"}${mediaNote})`,
+              `Session restaurée (${winNote}${restoredCount} onglet${restoredCount > 1 ? "s" : ""}${mediaNote})`
+            ));
+          }
         } else {
           focusSearchForNewTab();
         }
@@ -7096,13 +7466,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           float closestR = 100.0;
           float spinPhase = u_time * 0.56 + pDive * 2.2;
 
-          for (int i = 0; i < 48; i++) {
+          for (int i = 0; i < 32; i++) {
             float r = length(pos);
             closestR = min(closestR, r);
             if (r <= 1.015) { captured = 1.0; break; }
-            if (r > 26.0 && i > 8) { break; }
+            if (r > 26.0 && i > 6) { break; }
 
-            float dt = clamp(0.165 * (r - 0.90), 0.055, 0.95);
+            float dt = clamp(0.22 * (r - 0.90), 0.075, 1.15);
             vec3 a1 = geodesicAccel(pos, h2);
             vec3 midPos = pos + vel * (0.5 * dt);
             vec3 midVel = vel + a1 * (0.5 * dt);
@@ -7160,6 +7530,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
     const NOISE_DIM = 128;
     const noiseTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, noiseTex);
     gl.texImage2D(
       gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
@@ -7174,6 +7545,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     setTimeout(() => {
       try {
         const data = buildTileableNoiseRGBA(NOISE_DIM);
+        gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, noiseTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, NOISE_DIM, NOISE_DIM, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
       } catch (_) {}
@@ -7197,8 +7569,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const uBgTint = gl.getUniformLocation(prog, "u_bgTint");
     const uNoise = gl.getUniformLocation(prog, "u_noise");
 
+    // Static WebGL pipeline state bound once instead of every frame
+    gl.useProgram(prog);
+    gl.uniform1i(uNoise, 0);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const MIN_FRAME_MS = 15.8; // Smooth 60fps cap so 144Hz/240Hz monitors never burn excess GPU
     const bootMs = performance.now();
     let lastFrameMs = bootMs;
+    let lastDrawMs = 0;
     let rafPending = false;
     let lensOffsetCurrentX = 0.14;
 
@@ -7207,7 +7587,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       const ih = Math.max(1, window.innerHeight);
       // Do not shrink the WebGL2 backing buffer while ui_webview is collapsed to the 46px top bar!
       if (ih < 120) return false;
-      const dpr = Math.min(window.devicePixelRatio || 1, 1.0, 1600 / iw, 900 / ih);
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.0, 1280 / iw, 720 / ih);
       const w = Math.max(1, Math.floor(iw * dpr));
       const h = Math.max(1, Math.floor(ih * dpr));
       if (canvas.width !== w || canvas.height !== h) {
@@ -7225,6 +7605,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       const rawDtMs = Math.max(0.0, nowMs - lastFrameMs);
       const clampedDtMs = Math.min(rawDtMs, 33.34);
       lastFrameMs = nowMs;
+      lastDrawMs = nowMs;
 
       const smoothFactor = 1.0 - Math.exp(-clampedDtMs * 0.0045);
       mouseSmoothX += (mouseTargetX - mouseSmoothX) * smoothFactor;
@@ -7235,16 +7616,6 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
       const tSec = (nowMs - bootMs) * 0.001;
       const th = getActiveThemeConfig();
-
-      gl.viewport(0, 0, canvas.width, canvas.height);
-      gl.useProgram(prog);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, noiseTex);
-      gl.uniform1i(uNoise, 0);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-      gl.enableVertexAttribArray(aPos);
-      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
       gl.uniform2f(uRes, canvas.width, canvas.height);
       gl.uniform1f(uTime, tSec);
@@ -7262,7 +7633,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function revealCanvasAfterDraw() {
-      if (window.innerHeight < 120) return;
+      if (document.hidden || window.innerHeight < 120) return;
       syncCanvasSize();
       drawScene(performance.now());
       canvas.style.visibility = "visible";
@@ -7270,13 +7641,25 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function scheduleNextFrame() {
-      if (!rafPending && !bhSuspended) { rafPending = true; requestAnimationFrame(frame); }
+      if (!rafPending && !bhSuspended && !document.hidden && window.innerHeight >= 120) {
+        rafPending = true;
+        requestAnimationFrame(frame);
+      }
     }
 
     window.addEventListener("resize", () => {
       if (window.innerHeight < 120) return;
       syncCanvasSize();
-      if (!bhSuspended) {
+      if (!bhSuspended && !document.hidden) {
+        revealCanvasAfterDraw();
+        scheduleNextFrame();
+      }
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && !bhSuspended && window.innerHeight >= 120) {
+        lastFrameMs = performance.now();
+        lastDrawMs = 0;
         revealCanvasAfterDraw();
         scheduleNextFrame();
       }
@@ -7284,7 +7667,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
     bhResumeFn = function() {
       lastFrameMs = performance.now();
-      if (window.innerHeight >= 120) {
+      lastDrawMs = 0;
+      if (!document.hidden && window.innerHeight >= 120) {
         revealCanvasAfterDraw();
       }
       scheduleNextFrame();
@@ -7292,8 +7676,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
     function frame(nowMs) {
       rafPending = false;
-      if (bhSuspended) return;
-      if (window.innerHeight < 120) {
+      if (bhSuspended || document.hidden || window.innerHeight < 120) return;
+      if (lastDrawMs > 0 && (nowMs - lastDrawMs) < MIN_FRAME_MS) {
         scheduleNextFrame();
         return;
       }
@@ -7323,14 +7707,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   renderTabs(false);
   initBlackHoleRenderer();
   refreshHeaderState();
-  setInterval(refreshHeaderState, 10000);
-  // Keep exact SPA URLs (YouTube watch?v=..., Twitch, Discord) synced in real time
   setInterval(() => {
+    if (!document.hidden) refreshHeaderState(false);
+  }, 10000);
+  // Keep exact SPA URLs (YouTube watch?v=..., Twitch, Discord) synced with minimal IPC overhead
+  setInterval(() => {
+    if (document.hidden) return;
     const t = getActiveTab();
     if (t && t.url && !isInternalSettingsUrl(t.url) && !anyModalOpen()) {
       sendNativeIpc({ cmd: "sync_tab_url", tab_id: t.id });
     }
-  }, 3000);
+  }, 8000);
   // Periodically unload inactive tabs from RAM according to the active 4-mode RAM policy
   setInterval(sweepInactiveTabsForRam, 30000);
   sendNativeIpc({ cmd: "ui_ready" });

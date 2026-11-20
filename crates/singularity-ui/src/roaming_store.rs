@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const TOKENS_ENVELOPE_MAGIC: &str = "SINGULARITY-ROAMING-TOKENS-V3-XCHACHA20-POLY1305";
@@ -197,6 +198,42 @@ pub struct WindowSessionFile {
     pub tabs: Vec<SavedTabEntry>,
     #[serde(default)]
     pub tab_groups: Vec<SavedTabGroup>,
+}
+
+/// Authenticated peer descriptor published by each live Singularity window in
+/// `%APPDATA%\.singularity\windows\<window_id>.json` for instant cross-window tab transfers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveWindowDescriptor {
+    pub window_id: String,
+    pub pid: u32,
+    pub port: u16,
+    pub hwnd: isize,
+    pub transfer_token: String,
+    pub updated_unix: u64,
+}
+
+/// Single-use tab detach handoff payload written under `%APPDATA%\.singularity\handoff\<id>.json`
+/// so tearing a tab out into a brand-new window never exposes URLs on OS command lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabHandoffPayload {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub favicon_url: Option<String>,
+    #[serde(default)]
+    pub media_time_sec: Option<u64>,
+    #[serde(default)]
+    pub scroll_y: Option<u32>,
+    #[serde(default)]
+    pub pos_x: Option<i32>,
+    #[serde(default)]
+    pub pos_y: Option<i32>,
+}
+
+pub fn is_valid_handoff_id(id: &str) -> bool {
+    (16..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn default_restore_session() -> bool {
@@ -490,6 +527,7 @@ pub struct RoamingSingularityStore {
     window_id: String,
     pub merged_windows_count: usize,
     pub is_secondary_live_window: bool,
+    pub startup_handoff: Option<TabHandoffPayload>,
     master_key: [u8; 32],
     pub profile: UserProfile,
     pub tokens: RoamingTokensPlaintext,
@@ -503,24 +541,50 @@ impl Drop for RoamingSingularityStore {
 
 impl RoamingSingularityStore {
     pub fn open_default() -> Result<Self, String> {
+        Self::open_default_with_options(None, false)
+    }
+
+    pub fn open_default_with_options(
+        detach_handoff_id: Option<&str>,
+        force_new_window: bool,
+    ) -> Result<Self, String> {
         let dir = ensure_roaming_dir_initialized()?;
-        Self::open_at(dir)
+        Self::open_at_with_options(dir, detach_handoff_id, force_new_window)
     }
 
     pub fn open_at(root_dir: PathBuf) -> Result<Self, String> {
+        Self::open_at_with_options(root_dir, None, false)
+    }
+
+    pub fn open_at_with_options(
+        root_dir: PathBuf,
+        detach_handoff_id: Option<&str>,
+        force_new_window: bool,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(&root_dir)
             .map_err(|e| format!("Cannot create {}: {}", root_dir.display(), e))?;
         let engine_dir = root_dir.join("browser-engine");
         let sessions_dir = root_dir.join("sessions");
         let favicons_dir = root_dir.join("favicons");
+        let windows_dir = root_dir.join("windows");
+        let handoff_dir = root_dir.join("handoff");
         let _ = std::fs::create_dir_all(&engine_dir);
         let _ = std::fs::create_dir_all(&sessions_dir);
         let _ = std::fs::create_dir_all(&favicons_dir);
+        let _ = std::fs::create_dir_all(&windows_dir);
+        let _ = std::fs::create_dir_all(&handoff_dir);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for d in [&root_dir, &engine_dir, &sessions_dir, &favicons_dir] {
+            for d in [
+                &root_dir,
+                &engine_dir,
+                &sessions_dir,
+                &favicons_dir,
+                &windows_dir,
+                &handoff_dir,
+            ] {
                 if let Ok(meta) = std::fs::metadata(d) {
                     let mut perms = meta.permissions();
                     perms.set_mode(0o700);
@@ -541,112 +605,154 @@ impl RoamingSingularityStore {
         let window_id = generate_window_id();
         let current_pid = std::process::id();
 
-        // Multi-window crash-proof session discovery:
-        // - Simultaneous Singularity windows each write to their own `sessions/<win_id>.json`
-        //   so they NEVER overwrite each other's tabs.
-        // - When reopened after closing or PC shutdown, all dead window sessions are combined
-        //   cleanly into ONE single window with all tabs, tab groups & video timestamps merged!
-        let mut live_other_windows = 0usize;
-        let mut dead_sessions: Vec<(PathBuf, WindowSessionFile)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-            for ent in entries.flatten() {
-                let p = ent.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Some(sess) = load_window_session_file(&p) {
-                    if sess.pid != current_pid && is_process_alive(sess.pid) {
-                        live_other_windows += 1;
-                    } else {
-                        dead_sessions.push((p, sess));
-                    }
-                }
-            }
-        }
+        let startup_handoff = detach_handoff_id
+            .and_then(|id| Self::consume_detach_handoff(&root_dir, id));
 
         let mut merged_windows_count = 0usize;
         let mut is_secondary_live_window = false;
         let mut claimed_dead_paths: Vec<PathBuf> = Vec::new();
 
-        if !dead_sessions.is_empty() {
-            dead_sessions.sort_by_key(|(_, s)| s.updated_unix);
-            let mut merged_tabs: Vec<SavedTabEntry> = Vec::new();
-            let mut merged_groups: Vec<SavedTabGroup> = Vec::new();
-            let mut url_to_idx: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            let mut used_group_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut final_active_idx: usize = 0;
-
-            let mut non_empty_windows = 0usize;
-            for (win_pos, (path, sess)) in dead_sessions.into_iter().enumerate() {
-                claimed_dead_paths.push(path);
-                if sess.tabs.is_empty() {
-                    continue;
-                }
-                non_empty_windows += 1;
-                let mut group_remap: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for mut g in sess.tab_groups {
-                    let orig_id = g.id.clone();
-                    if !used_group_ids.insert(g.id.clone()) {
-                        let new_id = format!("{}-w{}", g.id, win_pos);
-                        used_group_ids.insert(new_id.clone());
-                        g.id = new_id.clone();
-                    }
-                    group_remap.insert(orig_id, g.id.clone());
-                    merged_groups.push(g);
-                }
-
-                let active_in_sess = sess
-                    .active_tab_index
-                    .min(sess.tabs.len().saturating_sub(1));
-                for (tab_pos, mut tab) in sess.tabs.into_iter().enumerate() {
-                    if let Some(ref gid) = tab.group_id {
-                        tab.group_id = group_remap.get(gid).cloned();
-                    }
-                    let norm = normalize_url_without_media_time(&tab.url);
-                    if let Some(&existing_i) = url_to_idx.get(&norm) {
-                        // Keep freshest timestamp/scroll/group when same URL existed in 2 windows
-                        if tab.media_time_sec.unwrap_or(0)
-                            > merged_tabs[existing_i].media_time_sec.unwrap_or(0)
-                        {
-                            merged_tabs[existing_i].media_time_sec = tab.media_time_sec;
-                        }
-                        if tab.scroll_y.unwrap_or(0) > merged_tabs[existing_i].scroll_y.unwrap_or(0)
-                        {
-                            merged_tabs[existing_i].scroll_y = tab.scroll_y;
-                        }
-                        if merged_tabs[existing_i].group_id.is_none() && tab.group_id.is_some() {
-                            merged_tabs[existing_i].group_id = tab.group_id;
-                        }
-                        if tab_pos == active_in_sess {
-                            final_active_idx = existing_i;
-                        }
-                    } else if merged_tabs.len() < 200 {
-                        let idx = merged_tabs.len();
-                        url_to_idx.insert(norm, idx);
-                        merged_tabs.push(tab);
-                        if tab_pos == active_in_sess {
-                            final_active_idx = idx;
-                        }
-                    }
-                }
-            }
-
-            if !merged_tabs.is_empty() {
-                profile.saved_tabs = merged_tabs;
-                profile.saved_tab_groups = merged_groups;
-                profile.active_tab_index = final_active_idx;
-                merged_windows_count = non_empty_windows;
-            }
-        } else if live_other_windows > 0 {
-            // Another Singularity window is already live: start this second window cleanly
-            // with its own independent tab list (it will merge on next full restart!).
+        if let Some(ref h) = startup_handoff {
+            // Torn-off tab window: boot cleanly with ONLY this detached tab (never steal or
+            // duplicate another window's open tabs!).
             is_secondary_live_window = true;
             profile.saved_tabs.clear();
             profile.saved_tab_groups.clear();
             profile.active_tab_index = 0;
+            let trimmed_url = h.url.trim();
+            let is_valid_settings = trimmed_url == "singularity://settings"
+                || (trimmed_url.starts_with("singularity://settings/")
+                    && trimmed_url.len() <= 64
+                    && trimmed_url["singularity://settings/".len()..]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+            if trimmed_url.starts_with("https://")
+                || trimmed_url.starts_with("http://")
+                || is_valid_settings
+            {
+                profile.saved_tabs.push(SavedTabEntry {
+                    title: if h.title.trim().is_empty() {
+                        trimmed_url.to_string()
+                    } else {
+                        h.title.trim().chars().take(180).collect()
+                    },
+                    url: trimmed_url.to_string(),
+                    media_time_sec: h.media_time_sec,
+                    scroll_y: h.scroll_y,
+                    group_id: None,
+                    favicon_url: h.favicon_url.clone(),
+                });
+            }
+        } else if force_new_window {
+            is_secondary_live_window = true;
+            profile.saved_tabs.clear();
+            profile.saved_tab_groups.clear();
+            profile.active_tab_index = 0;
+        } else {
+            // Multi-window crash-proof session discovery:
+            // - Simultaneous Singularity windows each write to their own `sessions/<win_id>.json`
+            //   so they NEVER overwrite each other's tabs.
+            // - When reopened after closing or PC shutdown, all dead window sessions are combined
+            //   cleanly into ONE single window with all tabs, tab groups & video timestamps merged!
+            let mut live_other_windows = 0usize;
+            let mut dead_sessions: Vec<(PathBuf, WindowSessionFile)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+                for ent in entries.flatten() {
+                    let p = ent.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Some(sess) = load_window_session_file(&p) {
+                        if sess.pid != current_pid && is_process_alive(sess.pid) {
+                            live_other_windows += 1;
+                        } else {
+                            dead_sessions.push((p, sess));
+                        }
+                    }
+                }
+            }
+
+            if !dead_sessions.is_empty() {
+                dead_sessions.sort_by_key(|(_, s)| s.updated_unix);
+                let mut merged_tabs: Vec<SavedTabEntry> = Vec::new();
+                let mut merged_groups: Vec<SavedTabGroup> = Vec::new();
+                let mut url_to_idx: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                let mut used_group_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut final_active_idx: usize = 0;
+
+                let mut non_empty_windows = 0usize;
+                for (win_pos, (path, sess)) in dead_sessions.into_iter().enumerate() {
+                    claimed_dead_paths.push(path);
+                    if sess.tabs.is_empty() {
+                        continue;
+                    }
+                    non_empty_windows += 1;
+                    let mut group_remap: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for mut g in sess.tab_groups {
+                        let orig_id = g.id.clone();
+                        if !used_group_ids.insert(g.id.clone()) {
+                            let new_id = format!("{}-w{}", g.id, win_pos);
+                            used_group_ids.insert(new_id.clone());
+                            g.id = new_id.clone();
+                        }
+                        group_remap.insert(orig_id, g.id.clone());
+                        merged_groups.push(g);
+                    }
+
+                    let active_in_sess = sess
+                        .active_tab_index
+                        .min(sess.tabs.len().saturating_sub(1));
+                    for (tab_pos, mut tab) in sess.tabs.into_iter().enumerate() {
+                        if let Some(ref gid) = tab.group_id {
+                            tab.group_id = group_remap.get(gid).cloned();
+                        }
+                        let norm = normalize_url_without_media_time(&tab.url);
+                        if let Some(&existing_i) = url_to_idx.get(&norm) {
+                            if tab.media_time_sec.unwrap_or(0)
+                                > merged_tabs[existing_i].media_time_sec.unwrap_or(0)
+                            {
+                                merged_tabs[existing_i].media_time_sec = tab.media_time_sec;
+                            }
+                            if tab.scroll_y.unwrap_or(0)
+                                > merged_tabs[existing_i].scroll_y.unwrap_or(0)
+                            {
+                                merged_tabs[existing_i].scroll_y = tab.scroll_y;
+                            }
+                            if merged_tabs[existing_i].group_id.is_none() && tab.group_id.is_some()
+                            {
+                                merged_tabs[existing_i].group_id = tab.group_id;
+                            }
+                            if tab_pos == active_in_sess {
+                                final_active_idx = existing_i;
+                            }
+                        } else if merged_tabs.len() < 200 {
+                            let idx = merged_tabs.len();
+                            url_to_idx.insert(norm, idx);
+                            merged_tabs.push(tab);
+                            if tab_pos == active_in_sess {
+                                final_active_idx = idx;
+                            }
+                        }
+                    }
+                }
+
+                if !merged_tabs.is_empty() {
+                    profile.saved_tabs = merged_tabs;
+                    profile.saved_tab_groups = merged_groups;
+                    profile.active_tab_index = final_active_idx;
+                    merged_windows_count = non_empty_windows;
+                }
+            } else if live_other_windows > 0 {
+                // Another Singularity window is already live: start this second window cleanly
+                // with its own independent tab list (it will merge on next full restart!).
+                is_secondary_live_window = true;
+                profile.saved_tabs.clear();
+                profile.saved_tab_groups.clear();
+                profile.active_tab_index = 0;
+            }
         }
 
         let store = Self {
@@ -654,6 +760,7 @@ impl RoamingSingularityStore {
             window_id,
             merged_windows_count,
             is_secondary_live_window,
+            startup_handoff,
             master_key,
             profile,
             tokens,
@@ -698,8 +805,100 @@ impl RoamingSingularityStore {
         self.root_dir.join("favicons")
     }
 
+    pub fn windows_dir(&self) -> PathBuf {
+        self.root_dir.join("windows")
+    }
+
+    pub fn handoff_dir(&self) -> PathBuf {
+        self.root_dir.join("handoff")
+    }
+
     pub fn window_session_file_path(&self) -> PathBuf {
         self.sessions_dir().join(format!("{}.json", self.window_id))
+    }
+
+    pub fn live_window_file_path(&self) -> PathBuf {
+        self.windows_dir().join(format!("{}.json", self.window_id))
+    }
+
+    /// Publishes this window's authenticated loopback transfer descriptor so other Singularity
+    /// windows can drop dragged tabs directly into this window.
+    pub fn register_live_window(&self, port: u16, hwnd: isize, transfer_token: &str) {
+        let _ = std::fs::create_dir_all(self.windows_dir());
+        let desc = LiveWindowDescriptor {
+            window_id: self.window_id.clone(),
+            pid: std::process::id(),
+            port,
+            hwnd,
+            transfer_token: transfer_token.to_string(),
+            updated_unix: unix_now(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&desc) {
+            let _ = atomic_write(&self.live_window_file_path(), &bytes);
+        }
+    }
+
+    /// Removes this window's live peer descriptor on clean shutdown.
+    pub fn unregister_live_window(&self) {
+        let _ = std::fs::remove_file(self.live_window_file_path());
+    }
+
+    /// Lists all other currently alive Singularity windows (pruning stale descriptors from dead PIDs).
+    pub fn list_other_live_windows(&self) -> Vec<LiveWindowDescriptor> {
+        let current_pid = std::process::id();
+        let Ok(entries) = std::fs::read_dir(self.windows_dir()) else {
+            return Vec::new();
+        };
+        let mut live = Vec::new();
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(desc) = serde_json::from_str::<LiveWindowDescriptor>(&raw) else {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            };
+            if desc.window_id == self.window_id || desc.pid == current_pid {
+                continue;
+            }
+            if is_process_alive(desc.pid) {
+                live.push(desc);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        live.sort_by_key(|d| d.updated_unix);
+        live
+    }
+
+    /// Writes a single-use tab detach handoff file and returns its random 32-hex-char ID.
+    pub fn write_detach_handoff(&self, payload: &TabHandoffPayload) -> Result<String, String> {
+        let dir = self.handoff_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut rnd = [0u8; 16];
+        OsRng.fill_bytes(&mut rnd);
+        let id = hex::encode(rnd);
+        let bytes = serde_json::to_vec(payload)
+            .map_err(|e| format!("Failed serializing tab handoff: {}", e))?;
+        atomic_write(&dir.join(format!("{}.json", id)), &bytes)?;
+        Ok(id)
+    }
+
+    /// Reads and immediately deletes a single-use tab detach handoff file.
+    pub fn consume_detach_handoff(root_dir: &Path, handoff_id: &str) -> Option<TabHandoffPayload> {
+        if !is_valid_handoff_id(handoff_id) {
+            return None;
+        }
+        let path = root_dir
+            .join("handoff")
+            .join(format!("{}.json", handoff_id));
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        serde_json::from_str::<TabHandoffPayload>(&raw).ok()
     }
 
     pub fn webview_engine_dir(&self) -> PathBuf {
@@ -754,9 +953,9 @@ impl RoamingSingularityStore {
         atomic_write(&self.vault_file_path(), encrypted_envelope.as_bytes())
     }
 
-    fn has_other_live_windows(&self) -> bool {
+    fn has_other_live_windows_at(root_dir: &Path, own_window_id: &str) -> bool {
         let current_pid = std::process::id();
-        let Ok(entries) = std::fs::read_dir(self.sessions_dir()) else {
+        let Ok(entries) = std::fs::read_dir(root_dir.join("sessions")) else {
             return false;
         };
         for ent in entries.flatten() {
@@ -765,7 +964,7 @@ impl RoamingSingularityStore {
                 continue;
             }
             if let Some(sess) = load_window_session_file(&p) {
-                if sess.window_id != self.window_id
+                if sess.window_id != own_window_id
                     && sess.pid != current_pid
                     && is_process_alive(sess.pid)
                 {
@@ -776,50 +975,81 @@ impl RoamingSingularityStore {
         false
     }
 
-    /// Atomically persists THIS window's own tabs, active tab, and tab groups to
-    /// `sessions/<window_id>.json` + `.bak` so multiple simultaneous windows never clash.
-    pub fn save_window_session(&self) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(self.sessions_dir());
+    fn write_window_session_snapshot(
+        root_dir: &Path,
+        window_id: &str,
+        profile: &UserProfile,
+        write_backup: bool,
+    ) -> Result<(), String> {
+        let sessions_dir = root_dir.join("sessions");
+        let _ = std::fs::create_dir_all(&sessions_dir);
         let sess = WindowSessionFile {
-            window_id: self.window_id.clone(),
+            window_id: window_id.to_string(),
             pid: std::process::id(),
             updated_unix: unix_now(),
-            active_tab_index: self.profile.active_tab_index,
-            tabs: self.profile.saved_tabs.clone(),
-            tab_groups: self.profile.saved_tab_groups.clone(),
+            active_tab_index: profile.active_tab_index,
+            tabs: profile.saved_tabs.clone(),
+            tab_groups: profile.saved_tab_groups.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&sess)
+        let bytes = serde_json::to_vec(&sess)
             .map_err(|e| format!("Window session serialization error: {}", e))?;
-        let path = self.window_session_file_path();
+        let path = sessions_dir.join(format!("{}.json", window_id));
         atomic_write(&path, &bytes)?;
-        if !sess.tabs.is_empty() {
+        if write_backup && !sess.tabs.is_empty() {
             let _ = atomic_write(&path.with_extension("json.bak"), &bytes);
         }
         Ok(())
     }
 
-    pub fn save_profile(&self) -> Result<(), String> {
-        let _ = self.save_window_session();
-        // When another Singularity window is simultaneously running, preserve its saved_tabs
-        // inside `profile.json` while still persisting shared prefs & this window's own session file!
-        let mut to_write = self.profile.clone();
-        if self.has_other_live_windows() {
-            let existing_disk = load_profile(&self.root_dir);
+    fn write_profile_snapshot(
+        root_dir: &Path,
+        window_id: &str,
+        profile: &UserProfile,
+        write_backup: bool,
+    ) -> Result<(), String> {
+        let _ = Self::write_window_session_snapshot(root_dir, window_id, profile, write_backup);
+        let mut to_write = profile.clone();
+        if Self::has_other_live_windows_at(root_dir, window_id) {
+            let existing_disk = load_profile(root_dir);
             if !existing_disk.saved_tabs.is_empty() {
                 to_write.saved_tabs = existing_disk.saved_tabs;
                 to_write.saved_tab_groups = existing_disk.saved_tab_groups;
                 to_write.active_tab_index = existing_disk.active_tab_index;
             }
         }
-        let json = serde_json::to_vec_pretty(&to_write)
+        let json = serde_json::to_vec(&to_write)
             .map_err(|e| format!("Profile serialization error: {}", e))?;
-        atomic_write(&self.profile_file_path(), &json)?;
-        // Crash/power-cut safety mirror: keep a second fsynced copy so an abrupt PC shutdown
-        // can never lose open tabs or saved video playback timestamps.
-        if !to_write.saved_tabs.is_empty() {
-            let _ = atomic_write(&self.profile_backup_file_path(), &json);
+        atomic_write(&root_dir.join("profile.json"), &json)?;
+        if write_backup && !to_write.saved_tabs.is_empty() {
+            let _ = atomic_write(&root_dir.join("profile.json.bak"), &json);
         }
         Ok(())
+    }
+
+    /// Atomically persists THIS window's own tabs, active tab, and tab groups to
+    /// `sessions/<window_id>.json` + `.bak` so multiple simultaneous windows never clash.
+    pub fn save_window_session(&self) -> Result<(), String> {
+        Self::write_window_session_snapshot(&self.root_dir, &self.window_id, &self.profile, true)
+    }
+
+    pub fn save_profile(&self) -> Result<(), String> {
+        Self::write_profile_snapshot(&self.root_dir, &self.window_id, &self.profile, true)
+    }
+
+    /// Zero-stall non-blocking persistence for hot UI / HTTP paths: clones the in-memory profile
+    /// in microseconds and coalesces disk flushes on a dedicated background Rust I/O thread
+    /// (writing `.bak` mirrors at most every 30s so NTFS `FlushFileBuffers` never stalls the UI).
+    pub fn schedule_save_profile(&self) {
+        profile_persist_worker().enqueue(
+            self.root_dir.clone(),
+            self.window_id.clone(),
+            self.profile.clone(),
+        );
+    }
+
+    /// Synchronously drains any pending background profile writes (called on clean shutdown).
+    pub fn flush_async_persistence(&self) {
+        profile_persist_worker().flush_now();
     }
 
     /// Updates the saved video playback timestamp & scroll offset of the matching saved tab
@@ -2115,6 +2345,125 @@ fn dpapi_unprotect(sealed: &[u8]) -> Result<Vec<u8>, String> {
         LocalFree(data_out.pb_data as *mut core::ffi::c_void);
     }
     Ok(result)
+}
+
+struct PersistQueueState {
+    pending: Option<(PathBuf, String, UserProfile)>,
+    flush_requested: bool,
+    generation: u64,
+    flushed_generation: u64,
+}
+
+struct ProfilePersistWorker {
+    state: Mutex<PersistQueueState>,
+    wake_cond: Condvar,
+    done_cond: Condvar,
+}
+
+impl ProfilePersistWorker {
+    fn spawn() -> &'static Self {
+        static INSTANCE: OnceLock<ProfilePersistWorker> = OnceLock::new();
+        INSTANCE.get_or_init(|| {
+            let worker = ProfilePersistWorker {
+                state: Mutex::new(PersistQueueState {
+                    pending: None,
+                    flush_requested: false,
+                    generation: 0,
+                    flushed_generation: 0,
+                }),
+                wake_cond: Condvar::new(),
+                done_cond: Condvar::new(),
+            };
+            let _ = std::thread::Builder::new()
+                .name("singularity-io-persist".into())
+                .spawn(|| {
+                    // Wait until OnceLock initialization completes, then loop forever coalescing writes.
+                    let w = profile_persist_worker();
+                    let mut last_backup_at = Instant::now()
+                        .checked_sub(Duration::from_secs(60))
+                        .unwrap_or_else(Instant::now);
+                    loop {
+                        let (job, gen_id, force_bak) = {
+                            let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while st.pending.is_none() {
+                                if st.flush_requested {
+                                    st.flush_requested = false;
+                                    st.flushed_generation = st.generation;
+                                    w.done_cond.notify_all();
+                                }
+                                st = w.wake_cond.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                            // Brief 220ms coalescing window so rapid tab switches / title ticks
+                            // collapse into ONE single atomic disk write instead of hammering NTFS!
+                            if !st.flush_requested {
+                                let (guard, _) = w
+                                    .wake_cond
+                                    .wait_timeout(st, Duration::from_millis(220))
+                                    .unwrap_or_else(|e| e.into_inner());
+                                st = guard;
+                            }
+                            let job = st.pending.take();
+                            let gen_id = st.generation;
+                            let force_bak = st.flush_requested;
+                            (job, gen_id, force_bak)
+                        };
+                        if let Some((root_dir, window_id, profile)) = job {
+                            let write_backup =
+                                force_bak || last_backup_at.elapsed() >= Duration::from_secs(30);
+                            let _ = RoamingSingularityStore::write_profile_snapshot(
+                                &root_dir,
+                                &window_id,
+                                &profile,
+                                write_backup,
+                            );
+                            if write_backup {
+                                last_backup_at = Instant::now();
+                            }
+                        }
+                        let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.flushed_generation = gen_id;
+                        if st.pending.is_none() {
+                            st.flush_requested = false;
+                        }
+                        w.done_cond.notify_all();
+                    }
+                });
+            worker
+        })
+    }
+
+    fn enqueue(&self, root_dir: PathBuf, window_id: String, profile: UserProfile) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending = Some((root_dir, window_id, profile));
+        st.generation = st.generation.wrapping_add(1);
+        self.wake_cond.notify_one();
+    }
+
+    fn flush_now(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let target = st.generation;
+        if st.pending.is_none() && st.flushed_generation == target {
+            return;
+        }
+        st.flush_requested = true;
+        self.wake_cond.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.flushed_generation != target || st.pending.is_some() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (guard, _) = self
+                .done_cond
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+        }
+    }
+}
+
+fn profile_persist_worker() -> &'static ProfilePersistWorker {
+    ProfilePersistWorker::spawn()
 }
 
 #[cfg(test)]

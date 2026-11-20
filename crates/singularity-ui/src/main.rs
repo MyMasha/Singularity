@@ -30,7 +30,17 @@ fn main() {
         return;
     }
 
-    let shell = match SingularityBrowserShell::launch() {
+    let args: Vec<String> = std::env::args().collect();
+    let force_new_window = args.iter().any(|a| a == "--new-window");
+    let detach_handoff_id = args
+        .windows(2)
+        .find(|w| w[0] == "--detach-handoff")
+        .map(|w| w[1].clone());
+
+    let shell = match SingularityBrowserShell::launch_with_options(
+        detach_handoff_id.as_deref(),
+        force_new_window,
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to boot Singularity Browser Engine: {}", e);

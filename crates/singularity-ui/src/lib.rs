@@ -766,11 +766,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.2");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.1"));
+        assert!(SINGULARITY_UI_HTML.contains("v1.0.2"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -875,5 +875,146 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("download_completed"));
         assert!(SINGULARITY_UI_HTML.contains("reveal_download"));
         assert!(!SINGULARITY_UI_HTML.contains("c.style.display = susp ? \"none\" : \"block\""));
+    }
+
+    #[test]
+    fn test_v102_tab_drag_detach_cross_window_and_rust_performance_optimizations() {
+        // 1. Cross-window tab detach handoff round-trip (one-time consume, isolated single-tab boot, validation)
+        let test_dir = std::env::temp_dir().join(format!(
+            "singularity_v102_detach_perf_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        assert!(!roaming_store::is_valid_handoff_id(""));
+        assert!(!roaming_store::is_valid_handoff_id("../escape"));
+        assert!(!roaming_store::is_valid_handoff_id("foo/bar"));
+        assert!(!roaming_store::is_valid_handoff_id("handoff-1234-abcdef"));
+        assert!(roaming_store::is_valid_handoff_id("0123456789abcdef0123456789abcdef"));
+
+        let mut win_a = RoamingSingularityStore::open_at(test_dir.clone()).expect("open win_a");
+        win_a.profile.saved_tabs = vec![
+            SavedTabEntry {
+                title: "Window A Tab 1".into(),
+                url: "https://rust-lang.org".into(),
+                media_time_sec: None,
+                scroll_y: None,
+                group_id: None,
+                favicon_url: None,
+            },
+            SavedTabEntry {
+                title: "Window A Tab 2".into(),
+                url: "https://github.com/MyMasha/Singularity".into(),
+                media_time_sec: None,
+                scroll_y: None,
+                group_id: None,
+                favicon_url: None,
+            },
+        ];
+        // Test background coalescing persistence worker (`schedule_save_profile` + `flush_async_persistence`)
+        win_a.schedule_save_profile();
+        win_a.profile.active_tab_index = 1;
+        win_a.schedule_save_profile();
+        win_a.flush_async_persistence();
+        assert!(win_a.profile_file_path().is_file());
+        let persisted_raw = std::fs::read_to_string(win_a.profile_file_path()).expect("read profile");
+        assert!(persisted_raw.contains("\"active_tab_index\":1"));
+
+        // Register a live window descriptor + verify dead-PID cleanup & unregister
+        win_a.register_live_window(55123, 0x1234, "deadbeef_token_001");
+        let dead_peer = roaming_store::LiveWindowDescriptor {
+            window_id: "win-dead-999999".into(),
+            pid: 999_999,
+            port: 55124,
+            hwnd: 0x5678,
+            transfer_token: "stale_token".into(),
+            updated_unix: 1,
+        };
+        let dead_path = win_a.windows_dir().join("win-dead-999999.json");
+        std::fs::write(&dead_path, serde_json::to_vec(&dead_peer).expect("ser dead"))
+            .expect("write dead peer");
+        let peers = win_a.list_other_live_windows();
+        assert!(peers.is_empty(), "dead peer windows must be pruned automatically");
+        assert!(!dead_path.exists());
+        win_a.unregister_live_window();
+
+        // Write detach handoff and boot a torn-off window
+        let handoff = roaming_store::TabHandoffPayload {
+            url: "https://www.youtube.com/watch?v=v102perf".into(),
+            title: "Detached Video".into(),
+            favicon_url: Some("https://www.youtube.com/favicon.ico".into()),
+            media_time_sec: Some(321),
+            scroll_y: Some(140),
+            pos_x: Some(320),
+            pos_y: Some(120),
+        };
+        let hid = win_a.write_detach_handoff(&handoff).expect("write handoff");
+        assert!(roaming_store::is_valid_handoff_id(&hid));
+
+        let detached = RoamingSingularityStore::open_at_with_options(
+            test_dir.clone(),
+            Some(&hid),
+            false,
+        )
+        .expect("open detached window");
+        assert!(detached.is_secondary_live_window);
+        let sh = detached.startup_handoff.as_ref().expect("startup_handoff");
+        assert_eq!(sh.pos_x, Some(320));
+        assert_eq!(sh.pos_y, Some(120));
+        // Must ONLY contain the detached tab — never duplicate Window A's tabs!
+        assert_eq!(detached.profile.saved_tabs.len(), 1);
+        assert_eq!(detached.profile.saved_tabs[0].url, "https://www.youtube.com/watch?v=v102perf");
+        assert_eq!(detached.profile.saved_tabs[0].media_time_sec, Some(321));
+        assert_eq!(detached.profile.saved_tabs[0].scroll_y, Some(140));
+        // Handoff file is strictly one-time consume
+        assert!(RoamingSingularityStore::consume_detach_handoff(&test_dir, &hid).is_none());
+
+        // Blank `--new-window` starts clean with zero stolen tabs
+        let blank_win = RoamingSingularityStore::open_at_with_options(test_dir.clone(), None, true)
+            .expect("open blank new window");
+        assert!(blank_win.is_secondary_live_window);
+        assert!(blank_win.profile.saved_tabs.is_empty());
+
+        // RAM extensions cache sanity check
+        extensions::invalidate_extensions_cache();
+        let exts_a = extensions::list_extensions_cached(&test_dir, &[]);
+        let exts_b = extensions::list_extensions_cached(&test_dir, &[]);
+        assert_eq!(exts_a.len(), exts_b.len());
+
+        // 2. Real-Rust HTTP, IPC, Win32 & WebView2 performance engine assertions
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("struct HttpThreadPool"));
+        assert!(server_src.contains("set_nodelay(true)"));
+        assert!(server_src.contains("MAX_KEEPALIVE_REQUESTS_PER_CONN"));
+        assert!(server_src.contains("Connection: keep-alive"));
+        assert!(server_src.contains("STATE_REVISION"));
+        assert!(server_src.contains("struct WebViewLayoutCache"));
+        assert!(server_src.contains("msEdgeTelemetry"));
+        assert!(server_src.contains("/api/window/adopt_tab"));
+        assert!(server_src.contains("find_peer_window_at_point"));
+        assert!(server_src.contains("send_adopt_tab_to_peer"));
+        assert!(server_src.contains("spawn_detached_singularity_window"));
+        assert!(server_src.contains("schedule_save_profile"));
+        assert!(server_src.contains("is_detached_handoff"));
+
+        // 3. UI Chrome-grade tab drag/tear-off, keyed DOM reconciliation & 60fps shader cap
+        assert!(SINGULARITY_UI_HTML.contains("detachTabToWindow"));
+        assert!(SINGULARITY_UI_HTML.contains("removeDetachedTabFromList"));
+        assert!(SINGULARITY_UI_HTML.contains("adopt_external_tab"));
+        assert!(SINGULARITY_UI_HTML.contains("tab_detached"));
+        assert!(SINGULARITY_UI_HTML.contains("move_tab_new_window"));
+        assert!(SINGULARITY_UI_HTML.contains("move_tab_to_window"));
+        assert!(SINGULARITY_UI_HTML.contains("open_new_window"));
+        assert!(SINGULARITY_UI_HTML.contains("updateSingleTabPill"));
+        assert!(SINGULARITY_UI_HTML.contains("syncTabPillElement"));
+        assert!(SINGULARITY_UI_HTML.contains("lastStateRev"));
+        assert!(SINGULARITY_UI_HTML.contains("MIN_FRAME_MS"));
+        assert!(SINGULARITY_UI_HTML.contains("visibilitychange"));
+        assert!(SINGULARITY_UI_HTML.contains("1280 / iw"));
+        assert!(SINGULARITY_UI_HTML.contains("for (int i = 0; i < 32; i++)"));
+        assert!(SINGULARITY_UI_HTML.contains("contain: layout style;"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

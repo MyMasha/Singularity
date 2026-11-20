@@ -460,6 +460,39 @@ pub fn list_extensions(roaming_root: &Path, pinned_ids: &[String]) -> Vec<Chrome
     out
 }
 
+static EXTENSIONS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, Vec<String>, Vec<ChromeExtensionInfo>)>>,
+> = std::sync::OnceLock::new();
+
+/// Returns installed extensions from RAM when unchanged (zero directory scans on `/api/state`).
+pub fn list_extensions_cached(
+    roaming_root: &Path,
+    pinned_ids: &[String],
+) -> Vec<ChromeExtensionInfo> {
+    let lock = EXTENSIONS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = lock.lock() {
+        if let Some((ref cached_root, ref cached_pinned, ref items)) = *guard {
+            if cached_root == roaming_root && cached_pinned.as_slice() == pinned_ids {
+                return items.clone();
+            }
+        }
+    }
+    let fresh = list_extensions(roaming_root, pinned_ids);
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some((roaming_root.to_path_buf(), pinned_ids.to_vec(), fresh.clone()));
+    }
+    fresh
+}
+
+/// Invalidates the cached extensions snapshot after any install, uninstall, toggle, or pin mutation.
+pub fn invalidate_extensions_cache() {
+    if let Some(lock) = EXTENSIONS_CACHE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+    }
+}
+
 /// Reads the real icon image bytes and MIME type for an installed Chrome extension.
 pub fn read_extension_icon(roaming_root: &Path, id: &str) -> Option<(Vec<u8>, &'static str)> {
     if !is_valid_extension_dir_id(id) {

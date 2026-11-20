@@ -20,8 +20,10 @@ use crate::roaming_store::{
 };
 use crate::roaming_store::{
     is_valid_language, is_valid_theme_id, unix_now, BookmarkEntry, EncryptedAuthTokenRecord,
-    SavedTabEntry, SavedTabGroup,
+    SavedTabEntry, SavedTabGroup, TabHandoffPayload,
 };
+#[cfg(target_os = "windows")]
+use crate::roaming_store::LiveWindowDescriptor;
 use crate::shell::SingularityBrowserShell;
 use crate::ui_app::SINGULARITY_UI_HTML;
 use rand_core::{OsRng, RngCore};
@@ -34,36 +36,49 @@ use singularity_core::{
 };
 use singularity_settings_registry::schema::{SettingCategory, SettingValue};
 use singularity_vault::{generate_totp_code, TotpAlgorithm, VaultCredentialEntry};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const BRAND_LOGO_128_PNG: &[u8] = include_bytes!("../assets/logo_128.png");
 const MAX_CONCURRENT_CONNECTIONS: usize = 96;
+const HTTP_WORKER_THREADS: usize = 12;
+const MAX_KEEPALIVE_REQUESTS_PER_CONN: usize = 64;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
 const MAX_PROXY_REDIRECTS: usize = 5;
 const MAX_PROXY_BODY_BYTES: usize = 5 * 1024 * 1024;
+
+static STATE_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn bump_state_revision() -> u64 {
+    STATE_REVISION.fetch_add(1, Ordering::AcqRel) + 1
+}
 
 #[cfg(target_os = "windows")]
 const WINDOW_ICON_64_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
 #[cfg(target_os = "windows")]
 const APPLE_BAR_LOGICAL_HEIGHT: f64 = 46.0;
 
+type AdoptTabCallback = Arc<Mutex<Option<Box<dyn Fn(TabHandoffPayload) + Send + Sync>>>>;
+
 #[derive(Clone)]
 struct ServerConfig {
     bind_port: u16,
     ipc_token: Arc<String>,
+    transfer_token: Arc<String>,
     bootstrap_nonce: Arc<String>,
     bootstrap_consumed: Arc<AtomicBool>,
+    rendered_html: Arc<Vec<u8>>,
+    adopt_tab_tx: AdoptTabCallback,
 }
 
 impl ServerConfig {
@@ -71,15 +86,44 @@ impl ServerConfig {
         let mut raw = [0u8; 32];
         OsRng.fill_bytes(&mut raw);
         let token = hex::encode(raw);
+        let mut xfer_raw = [0u8; 32];
+        OsRng.fill_bytes(&mut xfer_raw);
+        let transfer_token = hex::encode(xfer_raw);
         let mut boot_raw = [0u8; 24];
         OsRng.fill_bytes(&mut boot_raw);
         let bootstrap_nonce = hex::encode(boot_raw);
+        let rendered_html = SINGULARITY_UI_HTML
+            .replace("__SINGULARITY_IPC_TOKEN__", &token)
+            .into_bytes();
         Self {
             bind_port,
             ipc_token: Arc::new(token),
+            transfer_token: Arc::new(transfer_token),
             bootstrap_nonce: Arc::new(bootstrap_nonce),
             bootstrap_consumed: Arc::new(AtomicBool::new(false)),
+            rendered_html: Arc::new(rendered_html),
+            adopt_tab_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_adopt_tab_handler<F>(&self, handler: F)
+    where
+        F: Fn(TabHandoffPayload) + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.adopt_tab_tx.lock() {
+            *guard = Some(Box::new(handler));
+        }
+    }
+
+    fn dispatch_adopt_tab(&self, payload: TabHandoffPayload) -> bool {
+        if let Ok(guard) = self.adopt_tab_tx.lock() {
+            if let Some(ref f) = *guard {
+                f(payload);
+                return true;
+            }
+        }
+        false
     }
 
     fn consume_bootstrap_nonce(&self, provided: Option<&str>) -> bool {
@@ -113,6 +157,15 @@ impl ServerConfig {
         let actual = tok.trim().as_bytes();
         expected.len() == actual.len() && bool::from(expected.ct_eq(actual))
     }
+
+    fn verify_transfer_token(&self, provided: Option<&str>) -> bool {
+        let Some(tok) = provided else {
+            return false;
+        };
+        let expected = self.transfer_token.as_bytes();
+        let actual = tok.trim().as_bytes();
+        expected.len() == actual.len() && bool::from(expected.ct_eq(actual))
+    }
 }
 
 struct ConnGuard {
@@ -122,6 +175,68 @@ struct ConnGuard {
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Fixed-size warm Rust worker pool for loopback HTTP/IPC requests — eliminates per-request
+/// Windows OS thread creation overhead (`CreateThread` + 2 MiB stack + DLL_THREAD_ATTACH).
+struct HttpThreadPool {
+    queue: Arc<(Mutex<VecDeque<TcpStream>>, Condvar)>,
+}
+
+impl HttpThreadPool {
+    fn new(
+        workers: usize,
+        shell: Arc<Mutex<SingularityBrowserShell>>,
+        cfg: ServerConfig,
+        active_conns: Arc<AtomicUsize>,
+    ) -> Self {
+        let queue: Arc<(Mutex<VecDeque<TcpStream>>, Condvar)> =
+            Arc::new((Mutex::new(VecDeque::with_capacity(MAX_CONCURRENT_CONNECTIONS)), Condvar::new()));
+        for idx in 0..workers.max(2) {
+            let q = Arc::clone(&queue);
+            let s = Arc::clone(&shell);
+            let c = cfg.clone();
+            let conns = Arc::clone(&active_conns);
+            let _ = std::thread::Builder::new()
+                .name(format!("singularity-http-{}", idx))
+                .spawn(move || loop {
+                    let stream = {
+                        let (lock, cvar) = &*q;
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.is_empty() {
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        guard.pop_front()
+                    };
+                    if let Some(stream) = stream {
+                        let _guard = ConnGuard {
+                            counter: Arc::clone(&conns),
+                        };
+                        let _ = handle_ipc_connection(stream, Arc::clone(&s), &c);
+                    }
+                });
+        }
+        Self { queue }
+    }
+
+    fn submit(&self, stream: TcpStream, active_conns: &Arc<AtomicUsize>) {
+        let _ = stream.set_nodelay(true);
+        let prev = active_conns.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONCURRENT_CONNECTIONS {
+            active_conns.fetch_sub(1, Ordering::AcqRel);
+            let mut s = stream;
+            let _ = write_http_response(
+                &mut s,
+                &HttpResponse::text("503 Service Unavailable", "Too many concurrent requests"),
+                false,
+            );
+            return;
+        }
+        let (lock, cvar) = &*self.queue;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.push_back(stream);
+        cvar.notify_one();
     }
 }
 
@@ -182,46 +297,32 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
     let app_url = format!("http://{}/?boot={}", local_addr, cfg.bootstrap_nonce);
     let shared_shell = Arc::new(Mutex::new(shell));
     let active_conns = Arc::new(AtomicUsize::new(0));
-
-    let spawn_conn = |stream: TcpStream,
-                      shell_ref: Arc<Mutex<SingularityBrowserShell>>,
-                      cfg_ref: ServerConfig,
-                      conns: Arc<AtomicUsize>| {
-        let prev = conns.fetch_add(1, Ordering::AcqRel);
-        if prev >= MAX_CONCURRENT_CONNECTIONS {
-            conns.fetch_sub(1, Ordering::AcqRel);
-            let mut s = stream;
-            let _ = write_http_response(
-                &mut s,
-                &HttpResponse::text("503 Service Unavailable", "Too many concurrent requests"),
-            );
-            return;
-        }
-        let guard = ConnGuard { counter: conns };
-        std::thread::spawn(move || {
-            let _guard = guard;
-            let _ = handle_ipc_connection(stream, shell_ref, &cfg_ref);
-        });
-    };
+    let pool = HttpThreadPool::new(
+        HTTP_WORKER_THREADS,
+        Arc::clone(&shared_shell),
+        cfg.clone(),
+        Arc::clone(&active_conns),
+    );
 
     #[cfg(target_os = "windows")]
     {
-        let server_shell = Arc::clone(&shared_shell);
-        let server_cfg = cfg.clone();
-        let server_conns = Arc::clone(&active_conns);
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                spawn_conn(
-                    stream,
-                    Arc::clone(&server_shell),
-                    server_cfg.clone(),
-                    Arc::clone(&server_conns),
-                );
-            }
-        });
+        let accept_conns = Arc::clone(&active_conns);
+        std::thread::Builder::new()
+            .name("singularity-http-accept".into())
+            .spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    pool.submit(stream, &accept_conns);
+                }
+            })
+            .map_err(|e| format!("Failed spawning HTTP accept thread: {}", e))?;
 
-        if run_windows_frameless_browser(&app_url, local_addr.port(), Arc::clone(&shared_shell))
-            .is_err()
+        if run_windows_frameless_browser(
+            &app_url,
+            local_addr.port(),
+            &cfg,
+            Arc::clone(&shared_shell),
+        )
+        .is_err()
         {
             launch_native_chromium_window(&app_url);
             loop {
@@ -235,12 +336,7 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
     {
         launch_native_chromium_window(&app_url);
         for stream in listener.incoming().flatten() {
-            spawn_conn(
-                stream,
-                Arc::clone(&shared_shell),
-                cfg.clone(),
-                Arc::clone(&active_conns),
-            );
+            pool.submit(stream, &active_conns);
         }
         Ok(())
     }
@@ -250,6 +346,7 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
 fn run_windows_frameless_browser(
     app_url: &str,
     bind_port: u16,
+    server_cfg: &ServerConfig,
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
 ) -> Result<(), String> {
     use tao::dpi::{LogicalSize, PhysicalPosition as TaoPhysicalPosition, Size};
@@ -302,6 +399,7 @@ fn run_windows_frameless_browser(
             path: String,
             success: bool,
         },
+        AdoptExternalTab(TabHandoffPayload),
         CloseExtensionPopup,
     }
 
@@ -394,6 +492,26 @@ fn run_windows_frameless_browser(
         RevealDownload {
             path: String,
         },
+        OpenNewWindow,
+        DetachTab {
+            tab_id: u64,
+            #[serde(default)]
+            url: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            favicon_url: Option<String>,
+            #[serde(default)]
+            media_time_sec: Option<u64>,
+            #[serde(default)]
+            scroll_y: Option<u32>,
+            #[serde(default)]
+            force_new_window: bool,
+            #[serde(default)]
+            target_window_id: Option<String>,
+            #[serde(default)]
+            is_only_tab: bool,
+        },
         ShowTabContextMenu {
             kind: String,
             #[serde(default)]
@@ -413,6 +531,35 @@ fn run_windows_frameless_browser(
             #[serde(default)]
             lang: Option<String>,
         },
+    }
+
+    #[derive(Default)]
+    struct WebViewLayoutCache {
+        ui_visible: Option<bool>,
+        ui_bounds: Option<(i32, i32, u32, u32)>,
+        tab_visible: HashMap<u64, bool>,
+        tab_bounds: HashMap<u64, (i32, i32, u32, u32)>,
+        tab_low_mem: HashMap<u64, bool>,
+    }
+
+    thread_local! {
+        static LAYOUT_CACHE: std::cell::RefCell<WebViewLayoutCache> =
+            std::cell::RefCell::new(WebViewLayoutCache::default());
+    }
+
+    fn invalidate_tab_layout_cache(tab_id: Option<u64>) {
+        LAYOUT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if let Some(tid) = tab_id {
+                cache.tab_visible.remove(&tid);
+                cache.tab_bounds.remove(&tid);
+                cache.tab_low_mem.remove(&tid);
+            } else {
+                cache.tab_visible.clear();
+                cache.tab_bounds.clear();
+                cache.tab_low_mem.clear();
+            }
+        });
     }
 
     fn emit_ui_sync(ui_wv: &WebView, payload: &serde_json::Value) {
@@ -451,56 +598,94 @@ fn run_windows_frameless_browser(
         let show_active_web =
             web_visible && !overlay_open && tab_webviews.contains_key(&active_tab_id);
 
-        if show_active_web && in_fullscreen {
-            // True borderless fullscreen (HTML5 video or F11): hide the 46px chrome bar completely
-            // and stretch the active WebView edge-to-edge across the entire display!
-            for (&tid, wv) in tab_webviews {
-                if tid == active_tab_id {
-                    let _ = wv.set_bounds(Rect {
-                        position: PhysicalPosition::new(0, 0).into(),
-                        size: PhysicalSize::new(w, h).into(),
-                    });
-                    let _ = wv.set_visible(true);
-                    let _ = wv.set_memory_usage_level(MemoryUsageLevel::Normal);
-                } else {
-                    let _ = wv.set_visible(false);
-                    let _ = wv.set_memory_usage_level(MemoryUsageLevel::Low);
+        LAYOUT_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            cache.tab_visible.retain(|tid, _| tab_webviews.contains_key(tid));
+            cache.tab_bounds.retain(|tid, _| tab_webviews.contains_key(tid));
+            cache.tab_low_mem.retain(|tid, _| tab_webviews.contains_key(tid));
+
+            fn apply_ui_layout(
+                cache: &mut WebViewLayoutCache,
+                ui_wv: &WebView,
+                vis: bool,
+                rect: Option<(i32, i32, u32, u32)>,
+            ) {
+                if let Some(r) = rect {
+                    if cache.ui_bounds != Some(r) {
+                        let _ = ui_wv.set_bounds(Rect {
+                            position: PhysicalPosition::new(r.0, r.1).into(),
+                            size: PhysicalSize::new(r.2, r.3).into(),
+                        });
+                        cache.ui_bounds = Some(r);
+                    }
+                }
+                if cache.ui_visible != Some(vis) {
+                    let _ = ui_wv.set_visible(vis);
+                    cache.ui_visible = Some(vis);
                 }
             }
-            let _ = ui_wv.set_visible(false);
-        } else if show_active_web {
-            let _ = ui_wv.set_visible(true);
-            let _ = ui_wv.set_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(w, bar_h.max(1)).into(),
-            });
-            for (&tid, wv) in tab_webviews {
-                if tid == active_tab_id {
-                    let _ = wv.set_bounds(Rect {
-                        position: PhysicalPosition::new(0, bar_h as i32).into(),
-                        size: PhysicalSize::new(w, content_h).into(),
+
+            fn apply_tab_layout(
+                cache: &mut WebViewLayoutCache,
+                tid: u64,
+                wv: &WebView,
+                vis: bool,
+                rect: Option<(i32, i32, u32, u32)>,
+            ) {
+                if let Some(r) = rect {
+                    if cache.tab_bounds.get(&tid).copied() != Some(r) {
+                        let _ = wv.set_bounds(Rect {
+                            position: PhysicalPosition::new(r.0, r.1).into(),
+                            size: PhysicalSize::new(r.2, r.3).into(),
+                        });
+                        cache.tab_bounds.insert(tid, r);
+                    }
+                }
+                if cache.tab_visible.get(&tid).copied() != Some(vis) {
+                    let _ = wv.set_visible(vis);
+                    cache.tab_visible.insert(tid, vis);
+                }
+                let want_low = !vis;
+                if cache.tab_low_mem.get(&tid).copied() != Some(want_low) {
+                    let _ = wv.set_memory_usage_level(if want_low {
+                        MemoryUsageLevel::Low
+                    } else {
+                        MemoryUsageLevel::Normal
                     });
-                    let _ = wv.set_visible(true);
-                    let _ = wv.set_memory_usage_level(MemoryUsageLevel::Normal);
-                } else {
-                    let _ = wv.set_visible(false);
-                    let _ = wv.set_memory_usage_level(MemoryUsageLevel::Low);
+                    cache.tab_low_mem.insert(tid, want_low);
                 }
             }
-        } else {
-            // Expand and show the dark UI WebView BEFORE hiding content tabs so no blank/white
-            // parent surface frame is ever exposed during New Tab / Settings transitions.
-            let _ = ui_wv.set_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(w, h).into(),
-            });
-            let _ = ui_wv.set_visible(true);
-            for wv in tab_webviews.values() {
-                let _ = wv.set_visible(false);
-                let _ = wv.set_memory_usage_level(MemoryUsageLevel::Low);
+
+            if show_active_web && in_fullscreen {
+                // True borderless fullscreen (HTML5 video or F11): hide the 46px chrome bar
+                // and stretch the active WebView edge-to-edge across the entire display!
+                for (&tid, wv) in tab_webviews {
+                    if tid == active_tab_id {
+                        apply_tab_layout(&mut cache, tid, wv, true, Some((0, 0, w, h)));
+                    } else {
+                        apply_tab_layout(&mut cache, tid, wv, false, None);
+                    }
+                }
+                apply_ui_layout(&mut cache, ui_wv, false, None);
+            } else if show_active_web {
+                apply_ui_layout(&mut cache, ui_wv, true, Some((0, 0, w, bar_h.max(1))));
+                for (&tid, wv) in tab_webviews {
+                    if tid == active_tab_id {
+                        apply_tab_layout(&mut cache, tid, wv, true, Some((0, bar_h as i32, w, content_h)));
+                    } else {
+                        apply_tab_layout(&mut cache, tid, wv, false, None);
+                    }
+                }
+            } else {
+                // Expand and show the dark UI WebView BEFORE hiding content tabs so no blank/white
+                // parent surface frame is ever exposed during New Tab / Settings transitions.
+                apply_ui_layout(&mut cache, ui_wv, true, Some((0, 0, w, h)));
+                for (&tid, wv) in tab_webviews {
+                    apply_tab_layout(&mut cache, tid, wv, false, None);
+                }
+                let _ = ui_wv.focus();
             }
-            let _ = ui_wv.focus();
-        }
+        });
     }
 
     fn sync_maximized_state(
@@ -1060,6 +1245,148 @@ fn run_windows_frameless_browser(
         }
     }
 
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetWindowRect(hwnd: *mut core::ffi::c_void, lp_rect: *mut WinRect) -> i32;
+        fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
+        fn IsIconic(hwnd: *mut core::ffi::c_void) -> i32;
+        fn ShowWindow(hwnd: *mut core::ffi::c_void, n_cmd_show: i32) -> i32;
+        fn WindowFromPoint(pt: WinPoint) -> *mut core::ffi::c_void;
+        fn GetAncestor(hwnd: *mut core::ffi::c_void, ga_flags: u32) -> *mut core::ffi::c_void;
+    }
+
+    fn get_win32_cursor_pos() -> (i32, i32) {
+        let mut pt = WinPoint { x: 0, y: 0 };
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        (pt.x, pt.y)
+    }
+
+    fn bring_win32_window_to_front(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        const SW_RESTORE: i32 = 9;
+        let ptr = hwnd as *mut core::ffi::c_void;
+        unsafe {
+            if IsIconic(ptr) != 0 {
+                let _ = ShowWindow(ptr, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(ptr);
+        }
+    }
+
+    /// Detects whether screen point `(px, py)` lands on another visible live Singularity window
+    /// (preferring exact topmost Z-order match via `WindowFromPoint` + `GetAncestor(GA_ROOT)`,
+    /// with a generous 28px top-bar snap zone for effortless tab drops).
+    fn find_peer_window_at_point(
+        peers: &[LiveWindowDescriptor],
+        px: i32,
+        py: i32,
+    ) -> Option<LiveWindowDescriptor> {
+        if peers.is_empty() {
+            return None;
+        }
+        const GA_ROOT: u32 = 2;
+        let hit_root = unsafe {
+            let raw = WindowFromPoint(WinPoint { x: px, y: py });
+            if raw.is_null() {
+                0isize
+            } else {
+                let root = GetAncestor(raw, GA_ROOT);
+                (if root.is_null() { raw } else { root }) as isize
+            }
+        };
+        if hit_root != 0 {
+            if let Some(exact) = peers.iter().find(|p| p.hwnd == hit_root) {
+                return Some(exact.clone());
+            }
+        }
+        // Fallback: check bounding rects (with a 28px top grace strip) for visible peer windows.
+        for peer in peers.iter().rev() {
+            if peer.hwnd == 0 {
+                continue;
+            }
+            let ptr = peer.hwnd as *mut core::ffi::c_void;
+            let mut r = WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            let ok = unsafe {
+                IsWindowVisible(ptr) != 0
+                    && IsIconic(ptr) == 0
+                    && GetWindowRect(ptr, &mut r) != 0
+            };
+            if ok && px >= r.left - 8 && px <= r.right + 8 && py >= r.top - 28 && py <= r.bottom + 8
+            {
+                return Some(peer.clone());
+            }
+        }
+        None
+    }
+
+    /// Transfers a detached tab over `127.0.0.1:<peer.port>` (`TCP_NODELAY`) using the peer's
+    /// dedicated 256-bit CSPRNG `X-Singularity-Transfer` token.
+    fn send_adopt_tab_to_peer(peer: &LiveWindowDescriptor, payload: &TabHandoffPayload) -> bool {
+        let Ok(body) = serde_json::to_vec(payload) else {
+            return false;
+        };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], peer.port));
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(750)) else {
+            return false;
+        };
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(1200)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+        let req_hdr = format!(
+            "POST /api/window/adopt_tab HTTP/1.1\r\n\
+             Host: 127.0.0.1:{}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             X-Singularity-Transfer: {}\r\n\
+             Connection: close\r\n\r\n",
+            peer.port,
+            body.len(),
+            peer.transfer_token
+        );
+        let mut wire = Vec::with_capacity(req_hdr.len() + body.len());
+        wire.extend_from_slice(req_hdr.as_bytes());
+        wire.extend_from_slice(&body);
+        if stream.write_all(&wire).is_err() {
+            return false;
+        }
+        let mut resp_buf = [0u8; 256];
+        let n = stream.read(&mut resp_buf).unwrap_or(0);
+        let first_line = std::str::from_utf8(&resp_buf[..n]).unwrap_or("");
+        first_line.starts_with("HTTP/1.1 200")
+    }
+
+    /// Spawns a brand-new Singularity GUI window (zero console window) with either a detached
+    /// tab handoff ID (`--detach-handoff <id>`) or a clean New Tab (`--new-window`).
+    fn spawn_detached_singularity_window(handoff_id: Option<&str>) -> bool {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let mut cmd = Command::new(exe);
+        if let Some(id) = handoff_id {
+            cmd.arg("--detach-handoff").arg(id);
+        } else {
+            cmd.arg("--new-window");
+        }
+        cmd.spawn().is_ok()
+    }
+
     fn encode_menu_wide(label: &str) -> Vec<u16> {
         let clean: String = label
             .chars()
@@ -1089,7 +1416,7 @@ fn run_windows_frameless_browser(
 
     /// Displays a native Win32 dark-mode popup menu right at the cursor over the frameless
     /// window (never clipped by the 46px `ui_webview` top bar and never hides the active webpage).
-    /// Returns `(action_name, optional_target_group_id)`.
+    /// Returns `(action_name, optional_target_id)`.
     #[allow(clippy::too_many_arguments)]
     fn show_native_tab_context_menu(
         hwnd: *mut core::ffi::c_void,
@@ -1099,6 +1426,7 @@ fn run_windows_frameless_browser(
         is_unloaded: bool,
         group_collapsed: bool,
         groups: &[CtxGroupItem],
+        other_windows: &[LiveWindowDescriptor],
         is_fr: bool,
     ) -> Option<(&'static str, Option<String>)> {
         const MF_STRING: u32 = 0x0000;
@@ -1132,6 +1460,7 @@ fn run_windows_frameless_browser(
             };
 
             let mut group_id_map: Vec<(usize, String)> = Vec::new();
+            let mut win_id_map: Vec<(usize, String)> = Vec::new();
 
             match kind {
                 "tab" => {
@@ -1149,6 +1478,33 @@ fn run_windows_frameless_browser(
                         false,
                     );
                     add_sep(hmenu);
+
+                    add_item(
+                        hmenu,
+                        109,
+                        t("Move tab to new window", "Déplacer dans une nouvelle fenêtre"),
+                        false,
+                    );
+                    if !other_windows.is_empty() {
+                        let wsub = CreatePopupMenu();
+                        if !wsub.is_null() {
+                            for (idx, w) in other_windows.iter().take(12).enumerate() {
+                                let cmd_id = 601 + idx;
+                                let label = if is_fr {
+                                    format!("Fenêtre Singularity #{}", idx + 1)
+                                } else {
+                                    format!("Singularity Window #{}", idx + 1)
+                                };
+                                add_item(wsub, cmd_id, &label, false);
+                                win_id_map.push((cmd_id, w.window_id.clone()));
+                            }
+                            let wsub_label = encode_menu_wide(t(
+                                "Move tab to another window",
+                                "Déplacer vers une autre fenêtre",
+                            ));
+                            AppendMenuW(hmenu, MF_POPUP, wsub as usize, wsub_label.as_ptr());
+                        }
+                    }
 
                     let sub = CreatePopupMenu();
                     if !sub.is_null() {
@@ -1201,6 +1557,7 @@ fn run_windows_frameless_browser(
                 }
                 _ => {
                     add_item(hmenu, 401, t("New tab\tCtrl+T", "Nouvel onglet\tCtrl+T"), false);
+                    add_item(hmenu, 406, t("New window\tCtrl+N", "Nouvelle fenêtre\tCtrl+N"), false);
                     add_item(
                         hmenu,
                         402,
@@ -1235,6 +1592,9 @@ fn run_windows_frameless_browser(
             if let Some((_, gid)) = group_id_map.into_iter().find(|(id, _)| *id == selected) {
                 return Some(("add_to_group", Some(gid)));
             }
+            if let Some((_, wid)) = win_id_map.into_iter().find(|(id, _)| *id == selected) {
+                return Some(("move_tab_to_window", Some(wid)));
+            }
             let action = match selected {
                 101 => "new_tab_right",
                 102 => "duplicate_tab",
@@ -1244,6 +1604,7 @@ fn run_windows_frameless_browser(
                 106 => "close_tab",
                 107 => "close_other_tabs",
                 108 => "close_tabs_right",
+                109 => "move_tab_new_window",
                 200 => "add_to_new_group",
                 299 => "remove_from_group",
                 301 => "edit_group",
@@ -1256,6 +1617,7 @@ fn run_windows_frameless_browser(
                 403 => "new_group_empty",
                 404 => "unload_inactive",
                 405 => "open_settings",
+                406 => "new_window",
                 _ => return None,
             };
             Some((action, None))
@@ -1416,21 +1778,6 @@ fn run_windows_frameless_browser(
     report("context_link", e);
   }, true);
 
-  // True OS borderless fullscreen sync (YouTube, Twitch, HTML5 <video>, embedded players)
-  let lastFsState = null;
-  function reportFullscreen() {
-    if (window.top !== window) return;
-    try {
-      const fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-      if (fs !== lastFsState) {
-        lastFsState = fs;
-        postIpc(JSON.stringify({ k: "fullscreen", fs: fs }));
-      }
-    } catch (_) {}
-  }
-  document.addEventListener("fullscreenchange", reportFullscreen, true);
-  document.addEventListener("webkitfullscreenchange", reportFullscreen, true);
-
   // Global browser keyboard shortcuts inside web pages (never intercepts copy/paste/text editing)
   function sendShortcut(action, idx, e) {
     try {
@@ -1454,6 +1801,8 @@ fn run_windows_frameless_browser(
       sendShortcut("reopen_closed_tab", 0, e);
     } else if (ctrl && !e.shiftKey && (k === "t" || code === "KeyT")) {
       sendShortcut("new_tab", 0, e);
+    } else if (ctrl && !e.shiftKey && (k === "n" || code === "KeyN")) {
+      sendShortcut("new_window", 0, e);
     } else if (ctrl && !e.shiftKey && (k === "w" || code === "KeyW" || code === "F4")) {
       sendShortcut("close_active_tab", 0, e);
     } else if (ctrl && e.shiftKey && (k === "tab" || code === "Tab")) {
@@ -1483,10 +1832,26 @@ fn run_windows_frameless_browser(
     }
   }, true);
 
+  // Never attach fullscreen, favicon, or media polling timers inside sub-iframes!
+  if (window.top !== window) return;
+
+  // True OS borderless fullscreen sync (YouTube, Twitch, HTML5 <video>, embedded players)
+  let lastFsState = null;
+  function reportFullscreen() {
+    try {
+      const fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      if (fs !== lastFsState) {
+        lastFsState = fs;
+        postIpc(JSON.stringify({ k: "fullscreen", fs: fs }));
+      }
+    } catch (_) {}
+  }
+  document.addEventListener("fullscreenchange", reportFullscreen, true);
+  document.addEventListener("webkitfullscreenchange", reportFullscreen, true);
+
   // Live top-frame favicon discovery for crisp Chrome/Brave-style tab icons
   let lastFaviconSent = "";
   function reportFavicon() {
-    if (window.top !== window) return;
     try {
       const sel = "link[rel='icon'][sizes*='32'], link[rel='icon'][sizes*='64'], link[rel~='icon'], link[rel='shortcut icon'], link[rel='apple-touch-icon']";
       const el = document.querySelector(sel);
@@ -1511,7 +1876,7 @@ fn run_windows_frameless_browser(
   }
   window.addEventListener("load", function() { setTimeout(reportFavicon, 250); }, { once: true });
 
-  // Continuous crash-proof video timestamp & scroll tracker (skips YouTube ad overlays)
+  // Zero-reflow crash-proof video timestamp & scroll tracker (skips YouTube ad overlays)
   let lastSentSec = -1;
   let lastSentScroll = -1;
   let lastSentUrl = "";
@@ -1520,14 +1885,18 @@ fn run_windows_frameless_browser(
   }
   function findPrimaryMedia() {
     const vids = document.querySelectorAll("video, audio");
+    if (vids.length === 0) return null;
+    if (vids.length === 1) {
+      const m = vids[0];
+      return (m && isFinite(m.duration) && m.duration >= 15 && isFinite(m.currentTime) && m.currentTime >= 1) ? m : null;
+    }
     let best = null;
     let bestScore = -1;
     for (let i = 0; i < vids.length; i++) {
       const m = vids[i];
       if (!m || !isFinite(m.duration) || m.duration < 15) continue;
       if (!isFinite(m.currentTime) || m.currentTime < 1) continue;
-      const rect = m.tagName === "VIDEO" ? m.getBoundingClientRect() : { width: 100, height: 100 };
-      const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+      const area = (m.videoWidth || 320) * (m.videoHeight || 180);
       const score = (m.paused ? 0 : 1e9) + area + m.duration;
       if (score > bestScore) {
         bestScore = score;
@@ -1537,7 +1906,7 @@ fn run_windows_frameless_browser(
     return best;
   }
   function reportMediaProgress(force) {
-    if (window.top !== window) return;
+    if (!force && document.hidden) return;
     const href = String(location.href || "");
     if (!/^https?:\/\//i.test(href)) return;
     let sec = 0;
@@ -1547,8 +1916,8 @@ fn run_windows_frameless_browser(
     }
     const sy = Math.max(0, Math.floor(window.scrollY || document.documentElement.scrollTop || 0));
     const urlChanged = href !== lastSentUrl;
-    const secChanged = sec >= 2 && (force || urlChanged || Math.abs(sec - lastSentSec) >= 3);
-    const scrollChanged = sy >= 80 && (force || Math.abs(sy - lastSentScroll) >= 240);
+    const secChanged = sec >= 2 && (force || urlChanged || Math.abs(sec - lastSentSec) >= 4);
+    const scrollChanged = sy >= 80 && (force || Math.abs(sy - lastSentScroll) >= 280);
     if (!secChanged && !scrollChanged) return;
     lastSentUrl = href;
     if (sec >= 2) lastSentSec = sec;
@@ -1557,7 +1926,7 @@ fn run_windows_frameless_browser(
       postIpc(JSON.stringify({ k: "media_state", s: sec, sy: sy }));
     } catch (_) {}
   }
-  setInterval(function() { reportMediaProgress(false); }, 4000);
+  setInterval(function() { reportMediaProgress(false); }, 6000);
   document.addEventListener("pause", function() { reportMediaProgress(true); }, true);
   document.addEventListener("seeked", function() { reportMediaProgress(true); }, true);
   document.addEventListener("visibilitychange", function() {
@@ -1732,7 +2101,7 @@ fn run_windows_frameless_browser(
                 .with_incognito(incognito)
                 .with_browser_extensions_enabled(true)
                 .with_additional_browser_args(
-                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections \
                      --safebrowsing-disable-download-protection \
                      --autoplay-policy=no-user-gesture-required",
                 )
@@ -2022,9 +2391,25 @@ fn run_windows_frameless_browser(
     let event_loop = EventLoopBuilder::<WinEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let win_icon = Icon::from_rgba(WINDOW_ICON_64_RGBA.to_vec(), 64, 64).ok();
+    let adopt_proxy = proxy.clone();
+    server_cfg.set_adopt_tab_handler(move |payload| {
+        let _ = adopt_proxy.send_event(WinEvent::AdoptExternalTab(payload));
+    });
 
-    let window = WindowBuilder::new()
+    let win_icon = Icon::from_rgba(WINDOW_ICON_64_RGBA.to_vec(), 64, 64).ok();
+    let startup_pos = {
+        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+        shell
+            .roaming
+            .startup_handoff
+            .as_ref()
+            .and_then(|h| match (h.pos_x, h.pos_y) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            })
+    };
+
+    let mut win_builder = WindowBuilder::new()
         .with_title("Singularity")
         .with_window_icon(win_icon)
         .with_decorations(false)
@@ -2033,16 +2418,34 @@ fn run_windows_frameless_browser(
         .with_inner_size(Size::Logical(LogicalSize::new(1440.0, 880.0)))
         // Minimum width <= 500 logical px is required by Windows 11 Snap Bar / Snap Layouts
         // so the window fits half, third, and quarter zones across 100%-200% DPI scaling.
-        .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)))
+        .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)));
+    if let Some((px, py)) = startup_pos {
+        win_builder = win_builder.with_position(TaoPhysicalPosition::new(px.max(-32000), py.max(0)));
+    }
+    let window = win_builder
         .build(&event_loop)
         .map_err(|e| format!("Window creation error: {}", e))?;
     enable_win32_immersive_dark_window(window.hwnd() as *mut core::ffi::c_void);
+    // Clamp detached window cleanly inside its current monitor if it landed near a screen edge
+    if let (Some((px, py)), Some(mon)) = (startup_pos, window.current_monitor()) {
+        let mpos = mon.position();
+        let msize = mon.size();
+        let wsize = window.outer_size();
+        let max_x = (mpos.x + msize.width as i32 - 360).max(mpos.x);
+        let max_y = (mpos.y + msize.height as i32 - 200).max(mpos.y);
+        let cx = px.clamp(mpos.x - (wsize.width as i32 / 3), max_x);
+        let cy = py.clamp(mpos.y, max_y);
+        window.set_outer_position(TaoPhysicalPosition::new(cx, cy));
+    }
 
     // Separate WebView2 contexts:
     // - `browser-ui`     : privileged Singularity UI shell (Chrome extensions strictly disabled)
     // - `browser-engine` : shared browsing tabs profile (Chrome extensions natively enabled)
     let (ui_data_dir, content_data_dir, extensions_dir) = {
         let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+        shell
+            .roaming
+            .register_live_window(bind_port, window.hwnd(), &server_cfg.transfer_token);
         (
             shell.roaming.ui_webview_dir(),
             shell.roaming.webview_engine_dir(),
@@ -2068,6 +2471,9 @@ fn run_windows_frameless_browser(
         .with_autoplay(true)
         .with_devtools(false)
         .with_default_context_menus(false)
+        .with_additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections",
+        )
         .with_url(app_url)
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let _ = ui_proxy.send_event(WinEvent::UiIpc(req.body().clone()));
@@ -2208,6 +2614,11 @@ fn run_windows_frameless_browser(
                         let _ =
                             run_combined_cookie_hygiene_and_snapshot(any_wv, &shared_shell, true);
                     }
+                }
+                {
+                    let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                    shell.roaming.unregister_live_window();
+                    shell.roaming.flush_async_persistence();
                 }
                 *control_flow = ControlFlow::Exit;
             }
@@ -2425,6 +2836,12 @@ fn run_windows_frameless_browser(
                                             true,
                                         );
                                     }
+                                }
+                                {
+                                    let shell =
+                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                    shell.roaming.unregister_live_window();
+                                    shell.roaming.flush_async_persistence();
                                 }
                                 *control_flow = ControlFlow::Exit;
                             }
@@ -3105,6 +3522,7 @@ fn run_windows_frameless_browser(
                                 let active_sec = tab_media_times.get(&active_tab_id).copied();
                                 let active_sy = tab_scroll_ys.get(&active_tab_id).copied();
                                 tab_webviews.clear();
+                                invalidate_tab_layout_cache(None);
                                 if web_visible {
                                     if let Some(u) = active_url.filter(|u| parse_http_url_authority(u).is_ok()) {
                                         if let Ok(new_wv) = spawn_tab_webview_with_env(
@@ -3167,6 +3585,7 @@ fn run_windows_frameless_browser(
                                     .next()
                                     .map(|wv| snapshot_and_encrypt_auth_cookies(wv, &shared_shell))
                                     .unwrap_or(0);
+                                bump_state_revision();
                                 emit_ui_sync(
                                     &ui_webview,
                                     &serde_json::json!({ "tokens_synced": updated }),
@@ -3195,6 +3614,7 @@ fn run_windows_frameless_browser(
                                         shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                                     let _ = shell.roaming.remove_tokens_by_provider_or_id(&target);
                                 }
+                                bump_state_revision();
                                 emit_ui_sync(
                                     &ui_webview,
                                     &serde_json::json!({ "tokens_purged": true }),
@@ -3241,6 +3661,7 @@ fn run_windows_frameless_browser(
                                     }
                                     history_dirty = false;
                                     last_history_disk_flush = std::time::Instant::now();
+                                    bump_state_revision();
                                     emit_ui_sync(
                                         &ui_webview,
                                         &serde_json::json!({
@@ -3304,6 +3725,149 @@ fn run_windows_frameless_browser(
                             UiIpcCmd::RevealDownload { path } => {
                                 reveal_download_in_explorer(&path);
                             }
+                            UiIpcCmd::OpenNewWindow => {
+                                let _ = spawn_detached_singularity_window(None);
+                            }
+                            UiIpcCmd::DetachTab {
+                                tab_id,
+                                url,
+                                title,
+                                favicon_url,
+                                media_time_sec,
+                                scroll_y,
+                                force_new_window,
+                                target_window_id,
+                                is_only_tab,
+                            } => {
+                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
+                                // Prefer live exact SPA URL & video timestamp from WebView2 when loaded
+                                let live_url = tab_webviews
+                                    .get(&tab_id)
+                                    .and_then(read_live_http_url)
+                                    .or_else(|| {
+                                        let trimmed = url.trim();
+                                        let is_settings = trimmed == "singularity://settings"
+                                            || (trimmed.starts_with("singularity://settings/")
+                                                && trimmed.len() <= 64
+                                                && trimmed["singularity://settings/".len()..]
+                                                    .bytes()
+                                                    .all(|b| {
+                                                        b.is_ascii_alphanumeric()
+                                                            || b == b'-'
+                                                            || b == b'_'
+                                                    }));
+                                        if parse_http_url_authority(trimmed).is_ok() || is_settings
+                                        {
+                                            Some(trimmed.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_default();
+                                let live_sec = tab_media_times
+                                    .get(&tab_id)
+                                    .copied()
+                                    .or(media_time_sec)
+                                    .filter(|&s| s >= 2);
+                                let live_sy = tab_scroll_ys
+                                    .get(&tab_id)
+                                    .copied()
+                                    .or(scroll_y)
+                                    .filter(|&y| y > 0);
+                                let clean_favicon = favicon_url.and_then(|u| {
+                                    let t = u.trim();
+                                    if t.len() <= 512 && parse_http_url_authority(t).is_ok() {
+                                        Some(t.to_string())
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                                let (cur_x, cur_y) = get_win32_cursor_pos();
+                                let peers = {
+                                    let shell =
+                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                    shell.roaming.list_other_live_windows()
+                                };
+
+                                // 1. Check if explicitly moving to a chosen peer window or dropped on one!
+                                let target_peer = if let Some(ref wanted_id) = target_window_id {
+                                    peers.iter().find(|p| &p.window_id == wanted_id).cloned()
+                                } else if !force_new_window {
+                                    find_peer_window_at_point(&peers, cur_x, cur_y)
+                                } else {
+                                    None
+                                };
+
+                                let payload = TabHandoffPayload {
+                                    url: live_url,
+                                    title: title.chars().take(180).collect(),
+                                    favicon_url: clean_favicon,
+                                    media_time_sec: live_sec,
+                                    scroll_y: live_sy,
+                                    pos_x: if force_new_window {
+                                        window.outer_position().ok().map(|p| p.x + 36)
+                                    } else {
+                                        Some(cur_x.saturating_sub(180))
+                                    },
+                                    pos_y: if force_new_window {
+                                        window.outer_position().ok().map(|p| p.y + 36)
+                                    } else {
+                                        Some(cur_y.saturating_sub(24).max(0))
+                                    },
+                                };
+
+                                let transferred = if let Some(peer) = target_peer {
+                                    send_adopt_tab_to_peer(&peer, &payload)
+                                } else if is_only_tab && !force_new_window {
+                                    // Dragging the only tab onto desktop smoothly repositions this window!
+                                    if window.is_maximized() {
+                                        window.set_maximized(false);
+                                    }
+                                    window.set_outer_position(TaoPhysicalPosition::new(
+                                        cur_x.saturating_sub(180),
+                                        cur_y.saturating_sub(24).max(0),
+                                    ));
+                                    false
+                                } else {
+                                    let handoff_res = {
+                                        let shell =
+                                            shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                        shell.roaming.write_detach_handoff(&payload)
+                                    };
+                                    match handoff_res {
+                                        Ok(hid) => spawn_detached_singularity_window(Some(&hid)),
+                                        Err(_) => false,
+                                    }
+                                };
+
+                                if transferred {
+                                    if let Some(wv) = tab_webviews.remove(&tab_id) {
+                                        let _ = snapshot_and_encrypt_auth_cookies(&wv, &shared_shell);
+                                        drop(wv);
+                                    }
+                                    invalidate_tab_layout_cache(Some(tab_id));
+                                    tab_last_urls.remove(&tab_id);
+                                    tab_media_times.remove(&tab_id);
+                                    tab_scroll_ys.remove(&tab_id);
+                                    last_favicon_at.remove(&tab_id);
+                                    if is_only_tab {
+                                        let shell =
+                                            shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                        shell.roaming.unregister_live_window();
+                                        shell.roaming.flush_async_persistence();
+                                        *control_flow = ControlFlow::Exit;
+                                    } else {
+                                        emit_ui_sync(
+                                            &ui_webview,
+                                            &serde_json::json!({
+                                                "tab_detached": tab_id,
+                                                "ram_active_count": tab_webviews.len()
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
                             UiIpcCmd::ShowTabContextMenu {
                                 kind,
                                 tab_id,
@@ -3316,14 +3880,22 @@ fn run_windows_frameless_browser(
                                 lang,
                             } => {
                                 close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                let is_fr = lang.as_deref().map(|l| l == "fr").unwrap_or_else(|| {
-                                    shared_shell
-                                        .lock()
-                                        .map(|s| s.roaming.profile.language == "fr")
-                                        .unwrap_or(false)
-                                });
+                                let (is_fr, other_windows) = {
+                                    let shell =
+                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                    let fr = lang
+                                        .as_deref()
+                                        .map(|l| l == "fr")
+                                        .unwrap_or_else(|| shell.roaming.profile.language == "fr");
+                                    let peers = if kind == "tab" {
+                                        shell.roaming.list_other_live_windows()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    (fr, peers)
+                                };
                                 let hwnd = window.hwnd() as *mut core::ffi::c_void;
-                                if let Some((action, target_gid)) = show_native_tab_context_menu(
+                                if let Some((action, target_id)) = show_native_tab_context_menu(
                                     hwnd,
                                     &kind,
                                     tab_in_group,
@@ -3331,8 +3903,13 @@ fn run_windows_frameless_browser(
                                     is_unloaded,
                                     group_collapsed,
                                     &groups,
+                                    &other_windows,
                                     is_fr,
                                 ) {
+                                    if action == "new_window" {
+                                        let _ = spawn_detached_singularity_window(None);
+                                        return;
+                                    }
                                     if matches!(
                                         action,
                                         "edit_group"
@@ -3351,7 +3928,8 @@ fn run_windows_frameless_browser(
                                             "ctx_action": action,
                                             "ctx_tab_id": tab_id,
                                             "ctx_group_id": group_id,
-                                            "ctx_target_group_id": target_gid
+                                            "ctx_target_group_id": if action == "add_to_group" { target_id.as_deref() } else { None },
+                                            "ctx_target_window_id": if action == "move_tab_to_window" { target_id.as_deref() } else { None }
                                         }),
                                     );
                                 }
@@ -3425,8 +4003,6 @@ fn run_windows_frameless_browser(
                     let synced = if cookie_hygiene_due {
                         if let Some(wv) = tab_webviews.get(&tab_id) {
                             last_cookie_hygiene_at = Some(std::time::Instant::now());
-                            // Single-pass cookie dump: purges trackers/ads/malicious cookies and
-                            // snapshots encrypted auth tokens without blocking every navigation!
                             run_combined_cookie_hygiene_and_snapshot(wv, &shared_shell, !is_private)
                         } else {
                             0
@@ -3434,12 +4010,15 @@ fn run_windows_frameless_browser(
                     } else {
                         0
                     };
+                    if synced > 0 {
+                        bump_state_revision();
+                    }
                     if !is_private {
                         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                         shell.roaming.record_history_in_memory("", &final_url);
                         history_dirty = true;
                         if last_history_disk_flush.elapsed() >= std::time::Duration::from_secs(10) {
-                            let _ = shell.roaming.save_profile();
+                            shell.roaming.schedule_save_profile();
                             history_dirty = false;
                             last_history_disk_flush = std::time::Instant::now();
                         }
@@ -3483,7 +4062,7 @@ fn run_windows_frameless_browser(
                             if last_history_disk_flush.elapsed()
                                 >= std::time::Duration::from_secs(10)
                             {
-                                let _ = shell.roaming.save_profile();
+                                shell.roaming.schedule_save_profile();
                                 history_dirty = false;
                                 last_history_disk_flush = std::time::Instant::now();
                             }
@@ -3537,6 +4116,10 @@ fn run_windows_frameless_browser(
                     last_shortcut_at = now;
 
                     match action.as_str() {
+                        "new_window" => {
+                            let _ = spawn_detached_singularity_window(None);
+                            return;
+                        }
                         "toggle_fullscreen" => {
                             close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
                             let prev_fs = html_fullscreen || user_f11_fullscreen;
@@ -3645,9 +4228,9 @@ fn run_windows_frameless_browser(
                             "scroll_y": scroll_y
                         }),
                     );
-                    // Direct crash-proof atomic disk flush every >= 5s so turning off the PC
-                    // abruptly without closing Singularity still saves the exact video second!
-                    if last_media_disk_flush.elapsed() >= std::time::Duration::from_secs(5) {
+                    // Zero-stall background persistence every >= 6s so abrupt power-off never loses
+                    // video playback timestamps without ever stalling the UI thread!
+                    if last_media_disk_flush.elapsed() >= std::time::Duration::from_secs(6) {
                         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                         if !shell.private_browsing_active
                             && shell.roaming.profile.restore_session
@@ -3657,7 +4240,7 @@ fn run_windows_frameless_browser(
                                 scroll_y,
                             )
                         {
-                            let _ = shell.roaming.save_profile();
+                            shell.roaming.schedule_save_profile();
                             history_dirty = false;
                             last_history_disk_flush = std::time::Instant::now();
                             last_media_disk_flush = std::time::Instant::now();
@@ -3677,6 +4260,21 @@ fn run_windows_frameless_browser(
                         payload["new_tab_title"] = serde_json::Value::String(t);
                     }
                     emit_ui_sync(&ui_webview, &payload);
+                }
+                WinEvent::AdoptExternalTab(handoff) => {
+                    bring_win32_window_to_front(window.hwnd());
+                    emit_ui_sync(
+                        &ui_webview,
+                        &serde_json::json!({
+                            "adopt_external_tab": {
+                                "url": handoff.url,
+                                "title": handoff.title,
+                                "favicon_url": handoff.favicon_url,
+                                "media_time_sec": handoff.media_time_sec,
+                                "scroll_y": handoff.scroll_y
+                            }
+                        }),
+                    );
                 }
                 WinEvent::DownloadStarted { filename, path } => {
                     emit_ui_sync(
@@ -3831,8 +4429,11 @@ pub fn launch_native_chromium_window(app_url: &str) {
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedHttpRequest>, HttpResponse> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+fn read_http_request(
+    stream: &mut TcpStream,
+    idle_timeout: Duration,
+) -> Result<Option<ParsedHttpRequest>, HttpResponse> {
+    let _ = stream.set_read_timeout(Some(idle_timeout));
     let mut raw = Zeroizing::new(Vec::with_capacity(4096));
     let mut chunk = Zeroizing::new([0u8; 4096]);
     let mut header_end: Option<usize> = None;
@@ -3847,9 +4448,15 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedHttpRequest>
             }
             Ok(n) => n,
             Err(_) => {
+                if raw.is_empty() {
+                    return Ok(None);
+                }
                 return Err(HttpResponse::text("400 Bad Request", "Malformed HTTP request"));
             }
         };
+        if raw.is_empty() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        }
         raw.extend_from_slice(&chunk[..n]);
         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
             header_end = Some(pos + 4);
@@ -3936,14 +4543,36 @@ fn handle_ipc_connection(
     shell_mutex: Arc<Mutex<SingularityBrowserShell>>,
     cfg: &ServerConfig,
 ) -> std::io::Result<()> {
-    match read_http_request(&mut stream) {
-        Ok(Some(req)) => {
-            let resp = dispatch_http_request(&req, cfg, &shell_mutex);
-            write_http_response(&mut stream, &resp)
+    let _ = stream.set_nodelay(true);
+    for req_idx in 0..MAX_KEEPALIVE_REQUESTS_PER_CONN {
+        let timeout = if req_idx == 0 {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
+        match read_http_request(&mut stream, timeout) {
+            Ok(Some(req)) => {
+                let client_wants_close = req
+                    .headers
+                    .get("connection")
+                    .map(|c| c.to_ascii_lowercase().contains("close"))
+                    .unwrap_or(false);
+                let keep_alive =
+                    !client_wants_close && (req_idx + 1 < MAX_KEEPALIVE_REQUESTS_PER_CONN);
+                let resp = dispatch_http_request(&req, cfg, &shell_mutex);
+                write_http_response(&mut stream, &resp, keep_alive)?;
+                if !keep_alive {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err_resp) => {
+                let _ = write_http_response(&mut stream, &err_resp, false);
+                break;
+            }
         }
-        Ok(None) => Ok(()),
-        Err(err_resp) => write_http_response(&mut stream, &err_resp),
     }
+    Ok(())
 }
 
 fn parse_json_body(req: &ParsedHttpRequest) -> serde_json::Value {
@@ -3986,7 +4615,7 @@ fn dispatch_http_request(
         }
     }
 
-    // 3. Static shell HTML & public logo & sandboxed web proxy
+    // 3. Static shell HTML, public icons, cross-window tab transfer & sandboxed web proxy
     match req.path.as_str() {
         "/" | "/index.html" => {
             if req.method != "GET" {
@@ -4001,12 +4630,10 @@ fn dispatch_http_request(
                     "Missing, invalid, or already-consumed Singularity bootstrap nonce.",
                 );
             }
-            let rendered_html =
-                SINGULARITY_UI_HTML.replace("__SINGULARITY_IPC_TOKEN__", &cfg.ipc_token);
             return HttpResponse::new(
                 "200 OK",
                 "text/html; charset=utf-8",
-                rendered_html.into_bytes(),
+                cfg.rendered_html.as_ref().clone(),
             )
             .with_header("X-Frame-Options", "DENY")
             .with_header(
@@ -4054,6 +4681,63 @@ fn dispatch_http_request(
             }
             return handle_web_proxy(req, shell_mutex);
         }
+        "/api/window/adopt_tab" => {
+            if req.method != "POST" {
+                return HttpResponse::text("405 Method Not Allowed", "POST required");
+            }
+            // Dedicated least-privilege 256-bit CSPRNG transfer token (separate from ipc_token)
+            if !cfg.verify_transfer_token(
+                req.headers
+                    .get("x-singularity-transfer")
+                    .map(String::as_str),
+            ) {
+                return HttpResponse::json(
+                    "403 Forbidden",
+                    &serde_json::json!({ "error": "Invalid cross-window transfer token." }),
+                );
+            }
+            let Ok(mut payload) = serde_json::from_slice::<TabHandoffPayload>(&req.body) else {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "error": "Invalid tab handoff payload." }),
+                );
+            };
+            let trimmed_url = payload.url.trim().to_string();
+            let is_valid_settings = trimmed_url == "singularity://settings"
+                || (trimmed_url.starts_with("singularity://settings/")
+                    && trimmed_url.len() <= 64
+                    && trimmed_url["singularity://settings/".len()..]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+            if !trimmed_url.is_empty()
+                && parse_http_url_authority(&trimmed_url).is_err()
+                && !is_valid_settings
+            {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "error": "Unsupported URL scheme." }),
+                );
+            }
+            payload.url = trimmed_url;
+            payload.title = payload.title.chars().take(180).collect();
+            payload.favicon_url = payload.favicon_url.and_then(|u| {
+                let t = u.trim();
+                if t.len() <= 512 && parse_http_url_authority(t).is_ok() {
+                    Some(t.to_string())
+                } else {
+                    None
+                }
+            });
+            payload.media_time_sec = payload.media_time_sec.filter(|&s| s >= 2).map(|s| s.min(864_000));
+            payload.scroll_y = payload.scroll_y.filter(|&y| y > 0).map(|y| y.min(10_000_000));
+            if cfg.dispatch_adopt_tab(payload) {
+                return HttpResponse::json_bytes("200 OK", b"{\"ok\":true}");
+            }
+            return HttpResponse::json(
+                "503 Service Unavailable",
+                &serde_json::json!({ "error": "Window event loop unavailable." }),
+            );
+        }
         _ => {}
     }
 
@@ -4066,6 +4750,16 @@ fn dispatch_http_request(
     }
 
     let params = parse_query_params(&req.query);
+
+    // Automatically invalidate cached extension list & bump state rev on mutating POSTs
+    if req.method == "POST" {
+        if req.path.starts_with("/api/extensions/") {
+            extensions::invalidate_extensions_cache();
+        }
+        if req.path != "/api/profile/save_tabs" && req.path != "/api/preconnect" {
+            bump_state_revision();
+        }
+    }
 
     // Helper for strict POST enforcement on mutating / secret-handling endpoints
     let require_post = || -> Result<serde_json::Value, HttpResponse> {
@@ -4080,6 +4774,15 @@ fn dispatch_http_request(
 
     match req.path.as_str() {
         "/api/state" => {
+            let cur_rev = STATE_REVISION.load(Ordering::Acquire);
+            if let Some(client_rev) = params.get("rev").and_then(|s| s.parse::<u64>().ok()) {
+                if client_rev == cur_rev {
+                    return HttpResponse::json(
+                        "200 OK",
+                        &serde_json::json!({ "unchanged": true, "rev": cur_rev }),
+                    );
+                }
+            }
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             shell.enforce_vault_auto_lock();
             let ks = shell.core.mullvad_vpn.kill_switch();
@@ -4092,12 +4795,13 @@ fn dispatch_http_request(
             for s in &shell.roaming.tokens.sessions {
                 *provider_counts.entry(s.provider.clone()).or_insert(0) += 1;
             }
-            let installed_exts = extensions::list_extensions(
+            let installed_exts = extensions::list_extensions_cached(
                 shell.roaming.root_dir(),
                 &shell.roaming.profile.pinned_extensions,
             );
 
             let dto = serde_json::json!({
+                "rev": cur_rev,
                 "version": env!("CARGO_PKG_VERSION"),
                 "roaming_dir": shell.roaming.root_dir().to_string_lossy(),
                 "onboarding_completed": shell.roaming.profile.onboarding_completed,
@@ -4114,6 +4818,7 @@ fn dispatch_http_request(
                 "saved_tab_groups": shell.roaming.profile.saved_tab_groups,
                 "merged_windows_count": shell.roaming.merged_windows_count,
                 "is_secondary_live_window": shell.roaming.is_secondary_live_window,
+                "is_detached_handoff": shell.roaming.startup_handoff.is_some(),
                 "active_tab_index": shell.roaming.profile.active_tab_index,
                 "private_browsing": shell.private_browsing_active,
                 "bookmarks": shell.roaming.profile.bookmarks,
@@ -4585,7 +5290,7 @@ fn dispatch_http_request(
                     shell.roaming.profile.saved_tabs = clean_tabs;
                     shell.roaming.profile.saved_tab_groups = clean_groups;
                     shell.roaming.profile.active_tab_index = active_idx;
-                    let _ = shell.roaming.save_profile();
+                    shell.roaming.schedule_save_profile();
                 }
             }
             HttpResponse::json_bytes("200 OK", b"{\"ok\":true}")
@@ -6289,15 +6994,25 @@ fn handle_favicon_request(
         .with_header("Cache-Control", "private, max-age=600")
 }
 
-fn write_http_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::Result<()> {
+fn write_http_response(
+    stream: &mut TcpStream,
+    resp: &HttpResponse,
+    keep_alive: bool,
+) -> std::io::Result<()> {
     let has_cache_ctrl = resp
         .extra_headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("cache-control"));
-    let mut header = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n",
+    let conn_hdr = if keep_alive {
+        "Connection: keep-alive\r\nKeep-Alive: timeout=2, max=64\r\n"
+    } else {
+        "Connection: close\r\n"
+    };
+    let mut header = String::with_capacity(256 + resp.extra_headers.len() * 48);
+    use std::fmt::Write as _;
+    let _ = write!(
+        header,
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
         resp.status,
         resp.content_type,
         resp.body.len()
@@ -6305,11 +7020,8 @@ fn write_http_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::
     if !has_cache_ctrl {
         header.push_str("Cache-Control: no-store\r\n");
     }
-    header.push_str(
-        "X-Content-Type-Options: nosniff\r\n\
-         Referrer-Policy: no-referrer\r\n\
-         Connection: close\r\n",
-    );
+    header.push_str("X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n");
+    header.push_str(conn_hdr);
     for (k, v) in &resp.extra_headers {
         header.push_str(k);
         header.push_str(": ");
@@ -6318,9 +7030,11 @@ fn write_http_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::
     }
     header.push_str("\r\n");
 
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(&resp.body)?;
-    stream.flush()
+    // Single contiguous write avoids Nagle / Delayed-ACK 200ms stalls on Windows loopback!
+    let mut wire = Vec::with_capacity(header.len() + resp.body.len());
+    wire.extend_from_slice(header.as_bytes());
+    wire.extend_from_slice(&resp.body);
+    stream.write_all(&wire)
 }
 
 fn parse_query_params(q: &str) -> HashMap<String, String> {
