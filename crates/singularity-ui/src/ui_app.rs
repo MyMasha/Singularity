@@ -1583,6 +1583,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     flex-shrink: 0;
   }
   #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.show.clickable { pointer-events: auto; cursor: pointer; }
+  #toast.show.clickable:hover { border-color: var(--gold-bright); }
 
   /* When browsing a web page (`body.bar-only`), ui_webview is 46px tall:
      render a crisp centered 32px pill strictly within y=7..39px so it is NEVER cut off! */
@@ -2054,7 +2056,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.0</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.1</div>
         </div>
       </aside>
 
@@ -2447,12 +2449,26 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     return false;
   }
 
-  function showToast(msg) {
+  function showToast(msg, onClick, durationMs) {
     const el = document.getElementById("toast");
     el.textContent = msg;
+    if (typeof onClick === "function") {
+      el.classList.add("clickable");
+      el.onclick = () => {
+        el.classList.remove("show", "clickable");
+        el.onclick = null;
+        try { onClick(); } catch (_) {}
+      };
+    } else {
+      el.classList.remove("clickable");
+      el.onclick = null;
+    }
     el.classList.add("show");
     clearTimeout(window.__toastTimer);
-    window.__toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
+    window.__toastTimer = setTimeout(() => {
+      el.classList.remove("show", "clickable");
+      el.onclick = null;
+    }, typeof durationMs === "number" && durationMs > 0 ? durationMs : 2600);
   }
 
   /* ============================================================================
@@ -3430,6 +3446,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           const img = document.createElement("img");
           img.className = "tab-favicon" + (cached === "ok" ? " loaded" : "");
           img.alt = "";
+          img.loading = "lazy";
           img.decoding = "async";
           if (cached === "ok") fb.style.opacity = "0";
           img.addEventListener("load", () => {
@@ -3904,9 +3921,20 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     bhSuspended = susp;
     const c = document.getElementById("singularity-canvas");
     const v = document.getElementById("cinema-vignette");
-    if (c) c.style.display = susp ? "none" : "block";
-    if (v) v.style.display = susp ? "none" : "block";
-    if (!susp && typeof bhResumeFn === "function") bhResumeFn();
+    if (susp) {
+      // Never set display:none on the WebGL2 canvas — destroying and recreating its D3D11
+      // compositor surface causes a bright white flash when opening New Tabs on Windows.
+      if (c) { c.style.opacity = "0"; c.style.visibility = "hidden"; }
+      if (v) { v.style.opacity = "0"; v.style.visibility = "hidden"; }
+    } else {
+      if (v) { v.style.visibility = "visible"; v.style.opacity = "1"; }
+      if (typeof bhResumeFn === "function") {
+        bhResumeFn();
+      } else if (c) {
+        c.style.visibility = "visible";
+        c.style.opacity = "1";
+      }
+    }
   }
 
   function anyModalOpen() {
@@ -5177,6 +5205,25 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       } else {
         showToast(L("Full reset completed", "Réinitialisation complète effectuée"));
       }
+    }
+    if (msg.download_started && msg.download_started.filename) {
+      const fn = String(msg.download_started.filename);
+      showToast(L(`Downloading ${fn}...`, `Téléchargement de ${fn}...`), null, 3400);
+      return;
+    }
+    if (msg.download_completed && msg.download_completed.filename) {
+      const fn = String(msg.download_completed.filename);
+      const dlPath = String(msg.download_completed.path || "");
+      if (msg.download_completed.success) {
+        showToast(
+          L(`Downloaded ${fn} — click to open folder`, `${fn} téléchargé — cliquer pour ouvrir le dossier`),
+          dlPath ? () => sendNativeIpc({ cmd: "reveal_download", path: dlPath }) : null,
+          6500
+        );
+      } else {
+        showToast(L(`Download failed: ${fn}`, `Échec du téléchargement : ${fn}`), null, 4500);
+      }
+      return;
     }
     if (msg.new_tab_url && /^https?:\/\//i.test(msg.new_tab_url)) {
       if (msg.new_tab_background) {
@@ -6831,9 +6878,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   function initBlackHoleRenderer() {
     const canvas = document.getElementById("singularity-canvas");
-    const ctxOpts = { antialias: false, depth: false, stencil: false, alpha: false, powerPreference: "high-performance" };
+    const ctxOpts = {
+      antialias: false,
+      depth: false,
+      stencil: false,
+      alpha: true,
+      premultipliedAlpha: true,
+      powerPreference: "high-performance"
+    };
     const gl = canvas.getContext("webgl2", ctxOpts) || canvas.getContext("webgl", ctxOpts);
     if (!gl) { initCanvas2DFallback(canvas); return; }
+    gl.clearColor(0.0, 0.0, 0.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
 
     const vsSource = `attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
     const fsSource = `
@@ -7102,7 +7158,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { initCanvas2DFallback(canvas); return; }
 
-    const NOISE_DIM = 256;
+    const NOISE_DIM = 128;
     const noiseTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, noiseTex);
     gl.texImage2D(
@@ -7114,14 +7170,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
 
-    // Build tileable FBM/ridge noise off the initial paint critical path to prevent startup jank
+    // Build tileable 128x128 FBM/ridge noise off the initial paint critical path (4x faster boot)
     setTimeout(() => {
       try {
         const data = buildTileableNoiseRGBA(NOISE_DIM);
         gl.bindTexture(gl.TEXTURE_2D, noiseTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, NOISE_DIM, NOISE_DIM, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
       } catch (_) {}
-    }, 0);
+    }, 80);
 
     const quadBuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
@@ -7141,36 +7197,34 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const uBgTint = gl.getUniformLocation(prog, "u_bgTint");
     const uNoise = gl.getUniformLocation(prog, "u_noise");
 
-    function resize() {
-      const iw = Math.max(1, window.innerWidth);
-      const ih = Math.max(1, window.innerHeight);
-      const dpr = Math.min(window.devicePixelRatio || 1, 1.0, 1600 / iw, 900 / ih);
-      const w = Math.max(1, Math.floor(iw * dpr));
-      const h = Math.max(1, Math.floor(ih * dpr));
-      if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-    }
-    window.addEventListener("resize", resize);
-    resize();
-
     const bootMs = performance.now();
     let lastFrameMs = bootMs;
     let rafPending = false;
     let lensOffsetCurrentX = 0.14;
 
-    function scheduleNextFrame() {
-      if (!rafPending && !bhSuspended) { rafPending = true; requestAnimationFrame(frame); }
+    function syncCanvasSize() {
+      const iw = Math.max(1, window.innerWidth);
+      const ih = Math.max(1, window.innerHeight);
+      // Do not shrink the WebGL2 backing buffer while ui_webview is collapsed to the 46px top bar!
+      if (ih < 120) return false;
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.0, 1600 / iw, 900 / ih);
+      const w = Math.max(1, Math.floor(iw * dpr));
+      const h = Math.max(1, Math.floor(ih * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        gl.viewport(0, 0, w, h);
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        return true;
+      }
+      return false;
     }
 
-    bhResumeFn = function() { lastFrameMs = performance.now(); scheduleNextFrame(); };
-
-    function frame(nowMs) {
-      rafPending = false;
-      if (bhSuspended) return;
-
+    function drawScene(nowMs) {
       const rawDtMs = Math.max(0.0, nowMs - lastFrameMs);
       const clampedDtMs = Math.min(rawDtMs, 33.34);
       lastFrameMs = nowMs;
-      resize();
 
       const smoothFactor = 1.0 - Math.exp(-clampedDtMs * 0.0045);
       mouseSmoothX += (mouseTargetX - mouseSmoothX) * smoothFactor;
@@ -7205,9 +7259,54 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       gl.uniform3fv(uBgTint, th.bgTint);
 
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    function revealCanvasAfterDraw() {
+      if (window.innerHeight < 120) return;
+      syncCanvasSize();
+      drawScene(performance.now());
+      canvas.style.visibility = "visible";
+      canvas.style.opacity = "1";
+    }
+
+    function scheduleNextFrame() {
+      if (!rafPending && !bhSuspended) { rafPending = true; requestAnimationFrame(frame); }
+    }
+
+    window.addEventListener("resize", () => {
+      if (window.innerHeight < 120) return;
+      syncCanvasSize();
+      if (!bhSuspended) {
+        revealCanvasAfterDraw();
+        scheduleNextFrame();
+      }
+    });
+
+    bhResumeFn = function() {
+      lastFrameMs = performance.now();
+      if (window.innerHeight >= 120) {
+        revealCanvasAfterDraw();
+      }
+      scheduleNextFrame();
+    };
+
+    function frame(nowMs) {
+      rafPending = false;
+      if (bhSuspended) return;
+      if (window.innerHeight < 120) {
+        scheduleNextFrame();
+        return;
+      }
+      syncCanvasSize();
+      drawScene(nowMs);
+      if (canvas.style.visibility === "hidden" || canvas.style.opacity === "0") {
+        canvas.style.visibility = "visible";
+        canvas.style.opacity = "1";
+      }
       scheduleNextFrame();
     }
 
+    syncCanvasSize();
     frame(bootMs);
   }
 

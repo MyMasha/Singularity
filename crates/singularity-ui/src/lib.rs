@@ -14,6 +14,7 @@ pub mod updater;
 pub mod vim;
 #[cfg(all(target_os = "windows", not(target_env = "msvc")))]
 pub mod webview2_gnu_shim;
+pub mod winhttp_client;
 
 pub use browser_import::{
     parse_chromium_bookmarks, parse_chromium_snss_session, parse_firefox_bookmarks_lz4,
@@ -698,10 +699,10 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("toggle_fullscreen"));
         assert!(SINGULARITY_UI_HTML.contains("toggleNativeFullscreen"));
 
-        // 4. Verify source-level regressions never return (silent curl, System32 DLL, public GitHub Releases)
+        // 4. Verify source-level regressions never return (native WinHTTP on Windows, System32 DLL, public GitHub Releases)
         let server_src = include_str!("server.rs");
-        assert!(server_src.contains("CREATE_NO_WINDOW"));
-        assert!(server_src.contains("system_curl_command"));
+        assert!(server_src.contains("winhttp_get_no_redirect"));
+        assert!(!server_src.contains("Command::new(\"curl.exe\")"));
         assert!(server_src.contains("LOAD_LIBRARY_SEARCH_SYSTEM32"));
         assert!(server_src.contains("Fullscreen::Borderless(None)"));
         assert!(server_src.contains("fullscreenchange"));
@@ -709,7 +710,8 @@ mod tests {
 
         let updater_src = include_str!("updater.rs");
         assert!(updater_src.contains("https://github.com/MyMasha/Singularity"));
-        assert!(updater_src.contains("system_powershell_path"));
+        assert!(updater_src.contains("winhttp_get_https_bytes"));
+        assert!(updater_src.contains("winhttp_download_https_to_file"));
         assert!(!updater_src.contains("/contents/dist/"));
     }
 
@@ -764,11 +766,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.1");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.0"));
+        assert!(SINGULARITY_UI_HTML.contains("v1.0.1"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -797,5 +799,81 @@ mod tests {
             !has_hardcoded_16digit_account,
             "SINGULARITY_UI_HTML must not contain any hardcoded real 16-digit Mullvad account number"
         );
+    }
+
+    #[test]
+    fn test_v101_exe_downloads_zero_terminal_winhttp_fast_boot_and_no_white_flash() {
+        // 1. WinHTTP URL parser & redirect resolution unit tests
+        let parsed = winhttp_client::parse_http_url_parts(
+            "https://github.com/MyMasha/Singularity/releases/download/v1.0.1/Singularity-setup.exe?dl=1#frag",
+        )
+        .expect("parse https url");
+        assert!(parsed.is_https);
+        assert_eq!(parsed.host, "github.com");
+        assert_eq!(parsed.port, 443);
+        assert_eq!(
+            parsed.path_and_query,
+            "/MyMasha/Singularity/releases/download/v1.0.1/Singularity-setup.exe?dl=1"
+        );
+
+        let ipv6 = winhttp_client::parse_http_url_parts("http://[::1]:8080/health")
+            .expect("parse ipv6 url");
+        assert!(!ipv6.is_https);
+        assert_eq!(ipv6.host, "::1");
+        assert_eq!(ipv6.port, 8080);
+        assert_eq!(ipv6.path_and_query, "/health");
+
+        assert!(winhttp_client::parse_http_url_parts("javascript:alert(1)").is_err());
+        assert!(winhttp_client::parse_http_url_parts("https://user:pass@evil.example/x").is_err());
+        assert!(winhttp_client::parse_http_url_parts("https://example.com/\r\nInject: 1").is_err());
+
+        assert_eq!(
+            winhttp_client::resolve_http_redirect(
+                "https://github.com/MyMasha/Singularity/releases/latest",
+                "/MyMasha/Singularity/releases/tag/v1.0.1"
+            ),
+            Some("https://github.com/MyMasha/Singularity/releases/tag/v1.0.1".to_string())
+        );
+        assert_eq!(
+            winhttp_client::resolve_http_redirect(
+                "https://github.com/a/b",
+                "//objects.githubusercontent.com/file.exe"
+            ),
+            Some("https://objects.githubusercontent.com/file.exe".to_string())
+        );
+        assert_eq!(
+            winhttp_client::resolve_http_redirect("https://github.com/a/b", "file:///C:/Windows"),
+            None
+        );
+
+        // 2. Native .exe download handling, dark Win32 background & shared WebView2 environment
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("with_download_started_handler"));
+        assert!(server_src.contains("with_download_completed_handler"));
+        assert!(server_src.contains("safebrowsing-disable-download-protection"));
+        assert!(server_src.contains("SHGetKnownFolderPath"));
+        assert!(server_src.contains("reveal_download_in_explorer"));
+        assert!(server_src.contains("apply_win32_black_class_brush"));
+        assert!(server_src.contains("enable_win32_immersive_dark_window"));
+        assert!(server_src.contains("with_background_color((0, 0, 0, 255))"));
+        assert!(server_src.contains("with_environment(Clone::clone(env))"));
+        assert!(server_src.contains("run_combined_cookie_hygiene_and_snapshot"));
+        assert!(server_src.contains("favicon_ram_cache"));
+        assert!(server_src.contains("try_acquire_favicon_fetch_slot"));
+        assert!(server_src.contains("record_history_in_memory"));
+
+        // 3. Zero runtime PowerShell/curl subprocesses on Windows across extensions & updater
+        let ext_src = include_str!("extensions.rs");
+        assert!(ext_src.contains("winhttp_download_https_to_file"));
+        assert!(!ext_src.contains("powershell.exe"));
+
+        // 4. UI flicker-free New Tab WebGL lifecycle, lazy favicons & download toasts
+        assert!(SINGULARITY_UI_HTML.contains("revealCanvasAfterDraw"));
+        assert!(SINGULARITY_UI_HTML.contains("syncCanvasSize"));
+        assert!(SINGULARITY_UI_HTML.contains("img.loading = \"lazy\""));
+        assert!(SINGULARITY_UI_HTML.contains("download_started"));
+        assert!(SINGULARITY_UI_HTML.contains("download_completed"));
+        assert!(SINGULARITY_UI_HTML.contains("reveal_download"));
+        assert!(!SINGULARITY_UI_HTML.contains("c.style.display = susp ? \"none\" : \"block\""));
     }
 }

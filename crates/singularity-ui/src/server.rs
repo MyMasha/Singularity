@@ -6,10 +6,10 @@
 //! - Strict `Host`, `Origin`, and `Sec-Fetch-Site` validation (blocks DNS rebinding & cross-origin CSRF;
 //!   zero `Access-Control-Allow-Origin: *`).
 //! - All mutating and secret-handling endpoints require `POST` with JSON bodies (never query strings),
-//!   bounded request sizes (`<= 512 KiB`), zeroized request buffers, and bounded concurrency (`<= 32`).
+//!   bounded request sizes (`<= 512 KiB`), zeroized request buffers, and bounded concurrency (`<= 96`).
 //! - Server-side web proxy enforces strict URL authority parsing, DNS-validated SSRF/kill-switch checks
-//!   pinned via `curl --resolve`, manual hop-by-hop redirect validation, opaque `sandbox` CSP isolation,
-//!   UTF-8-safe `<head>` injection, and full HTML escaping.
+//!   (native WinHTTP on Windows with zero console spawns; `curl --resolve` on Unix), manual hop-by-hop
+//!   redirect validation, opaque `sandbox` CSP isolation, UTF-8-safe `<head>` injection, and HTML escaping.
 
 use crate::browser_import;
 use crate::extensions;
@@ -41,13 +41,13 @@ use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const BRAND_LOGO_128_PNG: &[u8] = include_bytes!("../assets/logo_128.png");
-const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+const MAX_CONCURRENT_CONNECTIONS: usize = 96;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
 const MAX_PROXY_REDIRECTS: usize = 5;
@@ -293,6 +293,15 @@ fn run_windows_frameless_browser(
             title: Option<String>,
             background: bool,
         },
+        DownloadStarted {
+            filename: String,
+            path: String,
+        },
+        DownloadCompleted {
+            filename: String,
+            path: String,
+            success: bool,
+        },
         CloseExtensionPopup,
     }
 
@@ -382,6 +391,9 @@ fn run_windows_frameless_browser(
             #[serde(default)]
             clear_tokens: bool,
         },
+        RevealDownload {
+            path: String,
+        },
         ShowTabContextMenu {
             kind: String,
             #[serde(default)]
@@ -442,7 +454,6 @@ fn run_windows_frameless_browser(
         if show_active_web && in_fullscreen {
             // True borderless fullscreen (HTML5 video or F11): hide the 46px chrome bar completely
             // and stretch the active WebView edge-to-edge across the entire display!
-            let _ = ui_wv.set_visible(false);
             for (&tid, wv) in tab_webviews {
                 if tid == active_tab_id {
                     let _ = wv.set_bounds(Rect {
@@ -456,6 +467,7 @@ fn run_windows_frameless_browser(
                     let _ = wv.set_memory_usage_level(MemoryUsageLevel::Low);
                 }
             }
+            let _ = ui_wv.set_visible(false);
         } else if show_active_web {
             let _ = ui_wv.set_visible(true);
             let _ = ui_wv.set_bounds(Rect {
@@ -476,15 +488,17 @@ fn run_windows_frameless_browser(
                 }
             }
         } else {
-            for wv in tab_webviews.values() {
-                let _ = wv.set_visible(false);
-                let _ = wv.set_memory_usage_level(MemoryUsageLevel::Low);
-            }
-            let _ = ui_wv.set_visible(true);
+            // Expand and show the dark UI WebView BEFORE hiding content tabs so no blank/white
+            // parent surface frame is ever exposed during New Tab / Settings transitions.
             let _ = ui_wv.set_bounds(Rect {
                 position: PhysicalPosition::new(0, 0).into(),
                 size: PhysicalSize::new(w, h).into(),
             });
+            let _ = ui_wv.set_visible(true);
+            for wv in tab_webviews.values() {
+                let _ = wv.set_visible(false);
+                let _ = wv.set_memory_usage_level(MemoryUsageLevel::Low);
+            }
             let _ = ui_wv.focus();
         }
     }
@@ -583,26 +597,30 @@ fn run_windows_frameless_browser(
         let Ok(cookies) = content_wv.cookies() else {
             return (0, 0, 0);
         };
+        purge_cookie_slice(content_wv, &cookies, shared_shell)
+    }
 
-        let mut trackers = 0usize;
-        let mut ads = 0usize;
-        let mut malicious = 0usize;
+    fn purge_cookie_slice(
+        content_wv: &WebView,
+        cookies: &[Cookie<'static>],
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+    ) -> (usize, usize, usize) {
+        let mut to_delete: Vec<(&Cookie<'static>, CookieThreatKind)> = Vec::new();
+        {
+            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+            for c in cookies {
+                let domain = c.domain().unwrap_or("");
+                let name = c.name();
+                let value = c.value();
 
-        for c in cookies {
-            let domain = c.domain().unwrap_or("");
-            let name = c.name();
-            let value = c.value();
-
-            let mut threat = classify_tracker_or_malicious_cookie(domain, name, value);
-            if threat.is_none()
-                && !domain.is_empty()
-                && !is_protected_session_or_functional_cookie(domain, name)
-            {
-                let clean_dom = domain.trim_start_matches('.');
-                let probe_url = format!("https://{}/", clean_dom);
-                let blocked_by_ublock = {
-                    let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                    matches!(
+                let mut threat = classify_tracker_or_malicious_cookie(domain, name, value);
+                if threat.is_none()
+                    && !domain.is_empty()
+                    && !is_protected_session_or_functional_cookie(domain, name)
+                {
+                    let clean_dom = domain.trim_start_matches('.');
+                    let probe_url = format!("https://{}/", clean_dom);
+                    let blocked_by_ublock = matches!(
                         shell.core.adblocker.evaluate_request(
                             &probe_url,
                             clean_dom,
@@ -610,29 +628,35 @@ fn run_windows_frameless_browser(
                             NetworkResourceType::Image,
                         ),
                         FilterDecision::BlockedByDomainRule(_)
-                    )
-                };
-                if blocked_by_ublock {
-                    threat = Some(CookieThreatKind::Tracker);
-                }
-            }
-
-            if let Some(kind) = threat {
-                if content_wv.delete_cookie(&c).is_ok() {
-                    match kind {
-                        CookieThreatKind::Tracker => trackers += 1,
-                        CookieThreatKind::Advertising => ads += 1,
-                        CookieThreatKind::Malicious => malicious += 1,
+                    );
+                    if blocked_by_ublock {
+                        threat = Some(CookieThreatKind::Tracker);
                     }
+                }
+
+                if let Some(kind) = threat {
+                    to_delete.push((c, kind));
                 }
             }
         }
 
+        let mut trackers = 0usize;
+        let mut ads = 0usize;
+        let mut malicious = 0usize;
+        for (c, kind) in to_delete {
+            if content_wv.delete_cookie(c).is_ok() {
+                match kind {
+                    CookieThreatKind::Tracker => trackers += 1,
+                    CookieThreatKind::Advertising => ads += 1,
+                    CookieThreatKind::Malicious => malicious += 1,
+                }
+            }
+        }
         (trackers, ads, malicious)
     }
 
-    fn snapshot_and_encrypt_auth_cookies(
-        content_wv: &WebView,
+    fn snapshot_cookie_slice(
+        cookies: &[Cookie<'static>],
         shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
     ) -> usize {
         {
@@ -641,10 +665,6 @@ fn run_windows_frameless_browser(
                 return 0;
             }
         }
-
-        let Ok(cookies) = content_wv.cookies() else {
-            return 0;
-        };
 
         let now = unix_now();
         let mut captured = Vec::new();
@@ -685,6 +705,39 @@ fn run_windows_frameless_browser(
 
         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
         shell.roaming.upsert_tokens_batch(captured).unwrap_or(0)
+    }
+
+    /// Single-pass cookie purge + encrypted auth token snapshot (calls `wv.cookies()` ONCE).
+    fn run_combined_cookie_hygiene_and_snapshot(
+        content_wv: &WebView,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        save_tokens: bool,
+    ) -> usize {
+        let Ok(cookies) = content_wv.cookies() else {
+            return 0;
+        };
+        let _ = purge_cookie_slice(content_wv, &cookies, shared_shell);
+        if save_tokens {
+            snapshot_cookie_slice(&cookies, shared_shell)
+        } else {
+            0
+        }
+    }
+
+    fn snapshot_and_encrypt_auth_cookies(
+        content_wv: &WebView,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+    ) -> usize {
+        {
+            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+            if shell.private_browsing_active {
+                return 0;
+            }
+        }
+        let Ok(cookies) = content_wv.cookies() else {
+            return 0;
+        };
+        snapshot_cookie_slice(&cookies, shared_shell)
     }
 
     fn has_installed_extensions(dir: &Path) -> bool {
@@ -774,6 +827,235 @@ fn run_windows_frameless_browser(
             if !p136.is_null() {
                 let flush: extern "system" fn() = core::mem::transmute(p136);
                 flush();
+            }
+        }
+    }
+
+    /// Forces the Win32 window class background brush to pure `#000000` (`BLACK_BRUSH`)
+    /// so `WM_ERASEBKGND` on the main window or `WRY_WEBVIEW` child containers NEVER flashes white.
+    fn apply_win32_black_class_brush(hwnd: *mut core::ffi::c_void) {
+        if hwnd.is_null() {
+            return;
+        }
+        #[link(name = "gdi32")]
+        extern "system" {
+            fn GetStockObject(i: i32) -> *mut core::ffi::c_void;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetClassLongPtrW(
+                hwnd: *mut core::ffi::c_void,
+                n_index: i32,
+                dw_new_long: isize,
+            ) -> usize;
+        }
+        const BLACK_BRUSH: i32 = 4;
+        const GCLP_HBRBACKGROUND: i32 = -10;
+        unsafe {
+            let black = GetStockObject(BLACK_BRUSH);
+            if !black.is_null() {
+                let _ = SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, black as isize);
+            }
+        }
+    }
+
+    /// Enables Windows 10/11 DWM immersive dark mode and black background brush on a window HWND.
+    fn enable_win32_immersive_dark_window(hwnd: *mut core::ffi::c_void) {
+        apply_win32_black_class_brush(hwnd);
+        if hwnd.is_null() {
+            return;
+        }
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: *mut core::ffi::c_void,
+                dw_attribute: u32,
+                pv_attribute: *const core::ffi::c_void,
+                cb_attribute: u32,
+            ) -> i32;
+        }
+        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        let dark: u32 = 1;
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const u32 as *const core::ffi::c_void,
+                core::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+
+    /// Resolves the user's real Windows Downloads folder via `SHGetKnownFolderPath(FOLDERID_Downloads)`
+    /// with `%USERPROFILE%\Downloads` fallback.
+    fn resolve_user_downloads_dir() -> std::path::PathBuf {
+        #[repr(C)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
+        }
+        // FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+        const FOLDERID_DOWNLOADS: Guid = Guid {
+            data1: 0x374D_E290,
+            data2: 0x123F,
+            data3: 0x4565,
+            data4: [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
+        };
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SHGetKnownFolderPath(
+                rfid: *const Guid,
+                dw_flags: u32,
+                h_token: *mut core::ffi::c_void,
+                ppsz_path: *mut *mut u16,
+            ) -> i32;
+        }
+        #[link(name = "ole32")]
+        extern "system" {
+            fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+        }
+        unsafe {
+            let mut ptr: *mut u16 = core::ptr::null_mut();
+            let hr = SHGetKnownFolderPath(&FOLDERID_DOWNLOADS, 0, core::ptr::null_mut(), &mut ptr);
+            if hr == 0 && !ptr.is_null() {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 4096 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(ptr, len);
+                let s = String::from_utf16_lossy(slice);
+                CoTaskMemFree(ptr as *mut core::ffi::c_void);
+                if !s.trim().is_empty() {
+                    let p = std::path::PathBuf::from(s.trim());
+                    let _ = std::fs::create_dir_all(&p);
+                    return p;
+                }
+            }
+        }
+        let fallback = std::env::var("USERPROFILE")
+            .map(|u| std::path::PathBuf::from(u).join("Downloads"))
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    }
+
+    /// Sanitizes a download filename and deduplicates (`name (1).exe`) so saving any `.exe`/`.zip`
+    /// never fails due to illegal Windows chars or existing locked files.
+    fn choose_unique_download_path(
+        downloads_dir: &Path,
+        suggested_path: &Path,
+        uri: &str,
+    ) -> (std::path::PathBuf, String) {
+        let raw_name = suggested_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                uri.split('?')
+                    .next()
+                    .and_then(|base| base.rsplit('/').next())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(url_decode)
+            })
+            .unwrap_or_else(|| "download.bin".to_string());
+
+        let clean: String = raw_name
+            .chars()
+            .filter(|c| {
+                !c.is_control()
+                    && !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            })
+            .take(180)
+            .collect();
+        let trimmed = clean.trim().trim_matches('.');
+        let safe_base = if trimmed.is_empty() {
+            "download.bin".to_string()
+        } else {
+            trimmed.to_string()
+        };
+
+        let candidate = downloads_dir.join(&safe_base);
+        if !candidate.exists() {
+            return (candidate, safe_base);
+        }
+
+        let (stem, ext) = match safe_base.rsplit_once('.') {
+            Some((s, e)) if !s.is_empty() && e.len() <= 16 => (s.to_string(), format!(".{}", e)),
+            _ => (safe_base.clone(), String::new()),
+        };
+        for i in 1..=999u32 {
+            let numbered = format!("{} ({}){}", stem, i, ext);
+            let p = downloads_dir.join(&numbered);
+            if !p.exists() {
+                return (p, numbered);
+            }
+        }
+        (candidate, safe_base)
+    }
+
+    /// Safely opens Windows Explorer highlighting a downloaded file (zero `cmd.exe` / zero console).
+    fn reveal_download_in_explorer(raw_path: &str) {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f || b == b'"') {
+            return;
+        }
+        let target = std::path::Path::new(trimmed);
+        let downloads_dir = resolve_user_downloads_dir();
+        let valid_target = if target.exists() {
+            target.to_path_buf()
+        } else if let Some(parent) = target.parent().filter(|p| p.is_dir()) {
+            parent.to_path_buf()
+        } else {
+            downloads_dir
+        };
+
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut core::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+        let op: Vec<u16> = std::ffi::OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        if valid_target.is_file() {
+            let exe: Vec<u16> = std::ffi::OsStr::new("explorer.exe")
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let params_str = format!("/select,\"{}\"", valid_target.display());
+            let params: Vec<u16> = std::ffi::OsStr::new(&params_str)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            unsafe {
+                let _ = ShellExecuteW(
+                    core::ptr::null_mut(),
+                    op.as_ptr(),
+                    exe.as_ptr(),
+                    params.as_ptr(),
+                    core::ptr::null(),
+                    1,
+                );
+            }
+        } else {
+            let dir_w: Vec<u16> = valid_target.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                let _ = ShellExecuteW(
+                    core::ptr::null_mut(),
+                    op.as_ptr(),
+                    dir_w.as_ptr(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    1,
+                );
             }
         }
     }
@@ -1394,7 +1676,7 @@ fn run_windows_frameless_browser(
     /// numeric playback progress (`media_state`) for crash-proof session resume. Navigation to
     /// Singularity's own loopback IPC port and `file:` URIs is blocked at the WebView2 layer.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_tab_webview(
+    fn spawn_tab_webview_with_env<F>(
         tab_id: u64,
         url: &str,
         bind_port: u16,
@@ -1408,7 +1690,11 @@ fn run_windows_frameless_browser(
         proxy: &EventLoopProxy<WinEvent>,
         shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
         cookies_hydrated: &mut bool,
-    ) -> Result<WebView, String> {
+        attach_shared_env: F,
+    ) -> Result<WebView, String>
+    where
+        F: Fn(WebViewBuilder<'_>) -> WebViewBuilder<'_>,
+    {
         let phys = window.inner_size();
         let scale = window.scale_factor();
         let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(phys.height.max(1));
@@ -1432,6 +1718,8 @@ fn run_windows_frameless_browser(
             let title_proxy = proxy.clone();
             let newwin_proxy = proxy.clone();
             let media_proxy = proxy.clone();
+            let dl_start_proxy = proxy.clone();
+            let dl_done_proxy = proxy.clone();
             let bg_intent: Arc<Mutex<Option<BgLinkIntent>>> = Arc::new(Mutex::new(None));
             let bg_intent_ipc = Arc::clone(&bg_intent);
             let bg_intent_newwin = Arc::clone(&bg_intent);
@@ -1443,6 +1731,47 @@ fn run_windows_frameless_browser(
                 .with_autoplay(true)
                 .with_incognito(incognito)
                 .with_browser_extensions_enabled(true)
+                .with_additional_browser_args(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                     --safebrowsing-disable-download-protection \
+                     --autoplay-policy=no-user-gesture-required",
+                )
+                .with_download_started_handler(move |uri, path| {
+                    let downloads_dir = resolve_user_downloads_dir();
+                    let (dest_path, filename) =
+                        choose_unique_download_path(&downloads_dir, path.as_path(), &uri);
+                    let dest_str = dest_path.to_string_lossy().to_string();
+                    *path = dest_path;
+                    let _ = dl_start_proxy.send_event(WinEvent::DownloadStarted {
+                        filename,
+                        path: dest_str,
+                    });
+                    true
+                })
+                .with_download_completed_handler(move |uri, path_opt, success| {
+                    let (filename, path_str) = if let Some(p) = path_opt {
+                        let name = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("download")
+                            .to_string();
+                        (name, p.to_string_lossy().to_string())
+                    } else {
+                        let name = uri
+                            .split('?')
+                            .next()
+                            .and_then(|b| b.rsplit('/').next())
+                            .filter(|s| !s.is_empty())
+                            .map(url_decode)
+                            .unwrap_or_else(|| "download".to_string());
+                        (name, String::new())
+                    };
+                    let _ = dl_done_proxy.send_event(WinEvent::DownloadCompleted {
+                        filename,
+                        path: path_str,
+                        success,
+                    });
+                })
                 .with_navigation_handler(move |nav_url| {
                     let lower = nav_url.trim().to_ascii_lowercase();
                     if lower.starts_with("file:") {
@@ -1663,6 +1992,7 @@ fn run_windows_frameless_browser(
                     }
                     NewWindowResponse::Deny
                 });
+            builder = attach_shared_env(builder);
             if let Some(ref script) = resume_script {
                 builder = builder.with_initialization_script(script);
             }
@@ -1699,12 +2029,14 @@ fn run_windows_frameless_browser(
         .with_window_icon(win_icon)
         .with_decorations(false)
         .with_undecorated_shadow(true)
+        .with_background_color((0, 0, 0, 255))
         .with_inner_size(Size::Logical(LogicalSize::new(1440.0, 880.0)))
         // Minimum width <= 500 logical px is required by Windows 11 Snap Bar / Snap Layouts
         // so the window fits half, third, and quarter zones across 100%-200% DPI scaling.
         .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)))
         .build(&event_loop)
         .map_err(|e| format!("Window creation error: {}", e))?;
+    enable_win32_immersive_dark_window(window.hwnd() as *mut core::ffi::c_void);
 
     // Separate WebView2 contexts:
     // - `browser-ui`     : privileged Singularity UI shell (Chrome extensions strictly disabled)
@@ -1743,17 +2075,23 @@ fn run_windows_frameless_browser(
         .build_as_child(&window)
         .map_err(|e| format!("UI WebView error: {}", e))?;
     let _ = ui_webview.set_theme(Theme::Dark);
+    apply_win32_black_class_brush(ui_webview.hwnd().0 as *mut core::ffi::c_void);
 
     let main_win_id: WindowId = window.id();
 
     // Per-tab WebView2 pool: preserves exact DOM, YouTube playback, SPA state, and enables real RAM unloading.
     let mut tab_webviews: HashMap<u64, WebView> = HashMap::new();
+    // Reuse a single ICoreWebView2Environment across all content tabs for instant tab creation!
+    let mut shared_content_env = None;
     let mut tab_last_urls: HashMap<u64, String> = HashMap::new();
     let mut tab_media_times: HashMap<u64, u64> = HashMap::new();
     let mut tab_scroll_ys: HashMap<u64, u32> = HashMap::new();
     let mut last_media_disk_flush = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(10))
         .unwrap_or_else(std::time::Instant::now);
+    let mut last_history_disk_flush = std::time::Instant::now();
+    let mut history_dirty = false;
+    let mut last_cookie_hygiene_at: Option<std::time::Instant> = None;
     let mut last_shortcut_at = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
@@ -1861,9 +2199,14 @@ fn run_windows_frameless_browser(
                         &tab_media_times,
                         &tab_scroll_ys,
                     );
+                    if history_dirty {
+                        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = shell.roaming.save_profile();
+                        history_dirty = false;
+                    }
                     if let Some(any_wv) = tab_webviews.values().next() {
-                        let _ = purge_tracker_and_malicious_cookies(any_wv, &shared_shell);
-                        let _ = snapshot_and_encrypt_auth_cookies(any_wv, &shared_shell);
+                        let _ =
+                            run_combined_cookie_hygiene_and_snapshot(any_wv, &shared_shell, true);
                     }
                 }
                 *control_flow = ControlFlow::Exit;
@@ -2069,14 +2412,17 @@ fn run_windows_frameless_browser(
                                         &tab_media_times,
                                         &tab_scroll_ys,
                                     );
+                                    if history_dirty {
+                                        let shell =
+                                            shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                        let _ = shell.roaming.save_profile();
+                                        history_dirty = false;
+                                    }
                                     if let Some(any_wv) = tab_webviews.values().next() {
-                                        let _ = purge_tracker_and_malicious_cookies(
+                                        let _ = run_combined_cookie_hygiene_and_snapshot(
                                             any_wv,
                                             &shared_shell,
-                                        );
-                                        let _ = snapshot_and_encrypt_auth_cookies(
-                                            any_wv,
-                                            &shared_shell,
+                                            true,
                                         );
                                     }
                                 }
@@ -2148,7 +2494,7 @@ fn run_windows_frameless_browser(
 
                                 if let Some(existing) = tab_webviews.get(&tid) {
                                     let _ = existing.load_url(&url);
-                                } else if let Ok(new_wv) = spawn_tab_webview(
+                                } else if let Ok(new_wv) = spawn_tab_webview_with_env(
                                     tid,
                                     &url,
                                     bind_port,
@@ -2162,7 +2508,16 @@ fn run_windows_frameless_browser(
                                     &proxy,
                                     &shared_shell,
                                     &mut cookies_hydrated,
+                                    |mut b| {
+                                        if let Some(ref env) = shared_content_env {
+                                            b = b.with_environment(Clone::clone(env));
+                                        }
+                                        b
+                                    },
                                 ) {
+                                    if shared_content_env.is_none() {
+                                        shared_content_env = Some(new_wv.environment());
+                                    }
                                     extensions_need_load = false;
                                     tab_webviews.insert(tid, new_wv);
                                 }
@@ -2260,7 +2615,7 @@ fn run_windows_frameless_browser(
                                         if let Some(sy) = target_scroll {
                                             tab_scroll_ys.insert(tab_id, sy);
                                         }
-                                        if let Ok(new_wv) = spawn_tab_webview(
+                                        if let Ok(new_wv) = spawn_tab_webview_with_env(
                                             tab_id,
                                             &url,
                                             bind_port,
@@ -2274,7 +2629,16 @@ fn run_windows_frameless_browser(
                                             &proxy,
                                             &shared_shell,
                                             &mut cookies_hydrated,
+                                            |mut b| {
+                                                if let Some(ref env) = shared_content_env {
+                                                    b = b.with_environment(Clone::clone(env));
+                                                }
+                                                b
+                                            },
                                         ) {
+                                            if shared_content_env.is_none() {
+                                                shared_content_env = Some(new_wv.environment());
+                                            }
                                             extensions_need_load = false;
                                             tab_webviews.insert(tab_id, new_wv);
                                         }
@@ -2389,7 +2753,7 @@ fn run_windows_frameless_browser(
                                 // Load newly installed extensions into the shared WebView2 profile immediately
                                 // by instantiating a transient helper WebView when extensions are present.
                                 if has_installed_extensions(&extensions_dir) {
-                                    if let Ok(helper_wv) = spawn_tab_webview(
+                                    if let Ok(helper_wv) = spawn_tab_webview_with_env(
                                         0,
                                         "about:blank",
                                         bind_port,
@@ -2403,7 +2767,16 @@ fn run_windows_frameless_browser(
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
+                                        |mut b| {
+                                            if let Some(ref env) = shared_content_env {
+                                                b = b.with_environment(Clone::clone(env));
+                                            }
+                                            b
+                                        },
                                     ) {
+                                        if shared_content_env.is_none() {
+                                            shared_content_env = Some(helper_wv.environment());
+                                        }
                                         extensions_need_load = false;
                                         drop(helper_wv);
                                     }
@@ -2446,7 +2819,7 @@ fn run_windows_frameless_browser(
                                 // opening `chrome-extension://<id>/<popup>` (even on New Tab before any page loads).
                                 if extensions_need_load && has_installed_extensions(&extensions_dir)
                                 {
-                                    if let Ok(helper_wv) = spawn_tab_webview(
+                                    if let Ok(helper_wv) = spawn_tab_webview_with_env(
                                         0,
                                         "about:blank",
                                         bind_port,
@@ -2460,7 +2833,16 @@ fn run_windows_frameless_browser(
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
+                                        |mut b| {
+                                            if let Some(ref env) = shared_content_env {
+                                                b = b.with_environment(Clone::clone(env));
+                                            }
+                                            b
+                                        },
                                     ) {
+                                        if shared_content_env.is_none() {
+                                            shared_content_env = Some(helper_wv.environment());
+                                        }
                                         extensions_need_load = false;
                                         drop(helper_wv);
                                     }
@@ -2534,6 +2916,7 @@ fn run_windows_frameless_browser(
                                     .with_undecorated_shadow(true)
                                     .with_skip_taskbar(true)
                                     .with_resizable(true)
+                                    .with_background_color((16, 17, 22, 255))
                                     .with_inner_size(Size::Logical(LogicalSize::new(pop_w, pop_h)))
                                     .with_position(TaoPhysicalPosition::new(px, py))
                                     .build(elwt)
@@ -2544,11 +2927,14 @@ fn run_windows_frameless_browser(
                                     );
                                     return;
                                 };
+                                enable_win32_immersive_dark_window(
+                                    popup_win.hwnd() as *mut core::ffi::c_void,
+                                );
 
                                 let pphys = popup_win.inner_size();
                                 let close_proxy = proxy.clone();
                                 let newwin_proxy = proxy.clone();
-                                let build_popup_wv = WebViewBuilder::new_with_web_context(
+                                let mut popup_builder = WebViewBuilder::new_with_web_context(
                                     &mut content_web_context,
                                 )
                                 .with_bounds(Rect {
@@ -2581,10 +2967,16 @@ fn run_windows_frameless_browser(
                                     }
                                     NewWindowResponse::Deny
                                 })
-                                .with_url(&popup_url)
-                                .build_as_child(&popup_win);
+                                .with_url(&popup_url);
+                                if let Some(ref env) = shared_content_env {
+                                    popup_builder = popup_builder.with_environment(Clone::clone(env));
+                                }
+                                let build_popup_wv = popup_builder.build_as_child(&popup_win);
 
                                 if let Ok(popup_wv) = build_popup_wv {
+                                    if shared_content_env.is_none() {
+                                        shared_content_env = Some(popup_wv.environment());
+                                    }
                                     let _ = popup_wv.set_theme(Theme::Dark);
                                     let _ = popup_wv.focus();
                                     let pid = popup_win.id();
@@ -2715,7 +3107,7 @@ fn run_windows_frameless_browser(
                                 tab_webviews.clear();
                                 if web_visible {
                                     if let Some(u) = active_url.filter(|u| parse_http_url_authority(u).is_ok()) {
-                                        if let Ok(new_wv) = spawn_tab_webview(
+                                        if let Ok(new_wv) = spawn_tab_webview_with_env(
                                             active_tab_id,
                                             &u,
                                             bind_port,
@@ -2729,7 +3121,16 @@ fn run_windows_frameless_browser(
                                             &proxy,
                                             &shared_shell,
                                             &mut cookies_hydrated,
+                                            |mut b| {
+                                                if let Some(ref env) = shared_content_env {
+                                                    b = b.with_environment(Clone::clone(env));
+                                                }
+                                                b
+                                            },
                                         ) {
+                                            if shared_content_env.is_none() {
+                                                shared_content_env = Some(new_wv.environment());
+                                            }
                                             extensions_need_load = false;
                                             tab_webviews.insert(active_tab_id, new_wv);
                                         }
@@ -2804,7 +3205,7 @@ fn run_windows_frameless_browser(
                                     // Explicit full logout / reset requested by user.
                                     if let Some(any_wv) = tab_webviews.values().next() {
                                         let _ = any_wv.clear_all_browsing_data();
-                                    } else if let Ok(helper_wv) = spawn_tab_webview(
+                                    } else if let Ok(helper_wv) = spawn_tab_webview_with_env(
                                         0,
                                         "about:blank",
                                         bind_port,
@@ -2818,7 +3219,16 @@ fn run_windows_frameless_browser(
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
+                                        |mut b| {
+                                            if let Some(ref env) = shared_content_env {
+                                                b = b.with_environment(Clone::clone(env));
+                                            }
+                                            b
+                                        },
                                     ) {
+                                        if shared_content_env.is_none() {
+                                            shared_content_env = Some(helper_wv.environment());
+                                        }
                                         let _ = helper_wv.clear_all_browsing_data();
                                         drop(helper_wv);
                                     }
@@ -2829,6 +3239,8 @@ fn run_windows_frameless_browser(
                                         let _ = shell.roaming.save_profile();
                                         let _ = shell.roaming.clear_all_tokens();
                                     }
+                                    history_dirty = false;
+                                    last_history_disk_flush = std::time::Instant::now();
                                     emit_ui_sync(
                                         &ui_webview,
                                         &serde_json::json!({
@@ -2844,7 +3256,7 @@ fn run_windows_frameless_browser(
                                         tab_webviews.values().next()
                                     {
                                         purge_tracker_and_malicious_cookies(any_wv, &shared_shell)
-                                    } else if let Ok(helper_wv) = spawn_tab_webview(
+                                    } else if let Ok(helper_wv) = spawn_tab_webview_with_env(
                                         0,
                                         "about:blank",
                                         bind_port,
@@ -2858,7 +3270,16 @@ fn run_windows_frameless_browser(
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
+                                        |mut b| {
+                                            if let Some(ref env) = shared_content_env {
+                                                b = b.with_environment(Clone::clone(env));
+                                            }
+                                            b
+                                        },
                                     ) {
+                                        if shared_content_env.is_none() {
+                                            shared_content_env = Some(helper_wv.environment());
+                                        }
                                         let res = purge_tracker_and_malicious_cookies(
                                             &helper_wv,
                                             &shared_shell,
@@ -2879,6 +3300,9 @@ fn run_windows_frameless_browser(
                                         }),
                                     );
                                 }
+                            }
+                            UiIpcCmd::RevealDownload { path } => {
+                                reveal_download_in_explorer(&path);
                             }
                             UiIpcCmd::ShowTabContextMenu {
                                 kind,
@@ -2995,12 +3419,15 @@ fn run_windows_frameless_browser(
                         .lock()
                         .map(|s| s.private_browsing_active)
                         .unwrap_or(false);
-                    let synced = if let Some(wv) = tab_webviews.get(&tab_id) {
-                        // Automatically purge ONLY tracker, advertising, and malicious cookies
-                        // while preserving 100% of user login tokens & functional cookies!
-                        let _ = purge_tracker_and_malicious_cookies(wv, &shared_shell);
-                        if !is_private {
-                            snapshot_and_encrypt_auth_cookies(wv, &shared_shell)
+                    let cookie_hygiene_due = last_cookie_hygiene_at
+                        .map(|t| t.elapsed() >= std::time::Duration::from_secs(90))
+                        .unwrap_or(true);
+                    let synced = if cookie_hygiene_due {
+                        if let Some(wv) = tab_webviews.get(&tab_id) {
+                            last_cookie_hygiene_at = Some(std::time::Instant::now());
+                            // Single-pass cookie dump: purges trackers/ads/malicious cookies and
+                            // snapshots encrypted auth tokens without blocking every navigation!
+                            run_combined_cookie_hygiene_and_snapshot(wv, &shared_shell, !is_private)
                         } else {
                             0
                         }
@@ -3009,7 +3436,13 @@ fn run_windows_frameless_browser(
                     };
                     if !is_private {
                         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                        shell.roaming.record_history("", &final_url);
+                        shell.roaming.record_history_in_memory("", &final_url);
+                        history_dirty = true;
+                        if last_history_disk_flush.elapsed() >= std::time::Duration::from_secs(10) {
+                            let _ = shell.roaming.save_profile();
+                            history_dirty = false;
+                            last_history_disk_flush = std::time::Instant::now();
+                        }
                     }
                     emit_ui_sync(
                         &ui_webview,
@@ -3045,7 +3478,15 @@ fn run_windows_frameless_browser(
                         tab_last_urls.insert(tab_id, u.clone());
                         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                         if !shell.private_browsing_active {
-                            shell.roaming.record_history(&title, u);
+                            shell.roaming.record_history_in_memory(&title, u);
+                            history_dirty = true;
+                            if last_history_disk_flush.elapsed()
+                                >= std::time::Duration::from_secs(10)
+                            {
+                                let _ = shell.roaming.save_profile();
+                                history_dirty = false;
+                                last_history_disk_flush = std::time::Instant::now();
+                            }
                         }
                     }
                     let mut payload = serde_json::json!({
@@ -3217,6 +3658,8 @@ fn run_windows_frameless_browser(
                             )
                         {
                             let _ = shell.roaming.save_profile();
+                            history_dirty = false;
+                            last_history_disk_flush = std::time::Instant::now();
                             last_media_disk_flush = std::time::Instant::now();
                         }
                     }
@@ -3234,6 +3677,33 @@ fn run_windows_frameless_browser(
                         payload["new_tab_title"] = serde_json::Value::String(t);
                     }
                     emit_ui_sync(&ui_webview, &payload);
+                }
+                WinEvent::DownloadStarted { filename, path } => {
+                    emit_ui_sync(
+                        &ui_webview,
+                        &serde_json::json!({
+                            "download_started": {
+                                "filename": filename,
+                                "path": path
+                            }
+                        }),
+                    );
+                }
+                WinEvent::DownloadCompleted {
+                    filename,
+                    path,
+                    success,
+                } => {
+                    emit_ui_sync(
+                        &ui_webview,
+                        &serde_json::json!({
+                            "download_completed": {
+                                "filename": filename,
+                                "path": path,
+                                "success": success
+                            }
+                        }),
+                    );
                 }
             },
             _ => {}
@@ -5076,30 +5546,31 @@ fn handle_web_proxy(
         }
     };
 
-    let initial_ips = {
-        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        let ips = match shell
-            .core
-            .mullvad_vpn
-            .kill_switch()
-            .authorize_outbound_host_and_dns(&host, port)
-        {
-            Ok(ips) => ips,
-            Err(ks_err) => {
-                let blocked_html = render_proxy_error_page(
-                    &scrubbed_url,
-                    "SSRF / NETWORK KILL-SWITCH ACTIVE",
-                    &ks_err.to_string(),
-                );
-                return HttpResponse::new(
-                    "200 OK",
-                    "text/html; charset=utf-8",
-                    blocked_html.into_bytes(),
-                )
-                .with_header("Content-Security-Policy", PROXY_SANDBOX_CSP);
-            }
-        };
+    // Clone the lock-free Arc<AtomicSocketKillSwitch> and DROP `shell_mutex` before running
+    // blocking DNS so slow DNS never stalls the main UI event loop!
+    let kill_switch = {
+        let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        shell.core.mullvad_vpn.kill_switch().clone()
+    };
+    let initial_ips = match kill_switch.authorize_outbound_host_and_dns(&host, port) {
+        Ok(ips) => ips,
+        Err(ks_err) => {
+            let blocked_html = render_proxy_error_page(
+                &scrubbed_url,
+                "SSRF / NETWORK KILL-SWITCH ACTIVE",
+                &ks_err.to_string(),
+            );
+            return HttpResponse::new(
+                "200 OK",
+                "text/html; charset=utf-8",
+                blocked_html.into_bytes(),
+            )
+            .with_header("Content-Security-Policy", PROXY_SANDBOX_CSP);
+        }
+    };
 
+    {
+        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let decision = shell.core.adblocker.evaluate_request(
             &scrubbed_url,
             &host,
@@ -5125,37 +5596,18 @@ fn handle_web_proxy(
         if !shell.private_browsing_active {
             shell.roaming.record_history(&host, &scrubbed_url);
         }
-        ips
-    };
+    }
 
     let html = fetch_and_rewrite_external_page(&scrubbed_url, initial_ips, shell_mutex);
     HttpResponse::new("200 OK", "text/html; charset=utf-8", html.into_bytes())
         .with_header("Content-Security-Policy", PROXY_SANDBOX_CSP)
 }
 
-/// Spawns `curl` completely silently (`CREATE_NO_WINDOW`) from `%SystemRoot%\System32\curl.exe`
-/// on Windows to prevent flashing console windows and working-directory binary planting.
+/// Spawns `curl` on non-Windows platforms. On Windows, Singularity uses native `winhttp.dll`
+/// (`crate::winhttp_client`) so ZERO `curl.exe` child processes are ever spawned at runtime.
+#[cfg(not(target_os = "windows"))]
 fn system_curl_command() -> Command {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let full_curl = std::path::PathBuf::from(&sys_root)
-            .join("System32")
-            .join("curl.exe");
-        let mut cmd = if full_curl.is_file() {
-            Command::new(full_curl)
-        } else {
-            Command::new("curl.exe")
-        };
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("curl")
-    }
+    Command::new("curl")
 }
 
 fn fetch_and_rewrite_external_page(
@@ -5188,16 +5640,15 @@ fn fetch_and_rewrite_external_page(
             }
         };
 
-        let resolved_ips = match pinned_ips.take() {
+        let _resolved_ips = match pinned_ips.take() {
             Some(ips) if !ips.is_empty() => ips,
             _ => {
-                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                let ips = match shell
-                    .core
-                    .mullvad_vpn
-                    .kill_switch()
-                    .authorize_outbound_host_and_dns(&host, port)
-                {
+                // Drop `shell_mutex` BEFORE DNS resolution to avoid stalling the UI thread!
+                let ks = {
+                    let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    shell.core.mullvad_vpn.kill_switch().clone()
+                };
+                let ips = match ks.authorize_outbound_host_and_dns(&host, port) {
                     Ok(ips) => ips,
                     Err(e) => {
                         return render_proxy_error_page(
@@ -5207,12 +5658,15 @@ fn fetch_and_rewrite_external_page(
                         );
                     }
                 };
-                let decision = shell.core.adblocker.evaluate_request(
-                    &current_url,
-                    &host,
-                    &host,
-                    NetworkResourceType::MainFrameDocument,
-                );
+                let decision = {
+                    let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    shell.core.adblocker.evaluate_request(
+                        &current_url,
+                        &host,
+                        &host,
+                        NetworkResourceType::MainFrameDocument,
+                    )
+                };
                 if let FilterDecision::BlockedByDomainRule(rule)
                 | FilterDecision::BlockedByPatternRule(rule) = decision
                 {
@@ -5226,56 +5680,81 @@ fn fetch_and_rewrite_external_page(
             }
         };
 
-        let mut cmd = system_curl_command();
-        cmd.args([
-            "-sS",
-            "-i",
-            "-g",
-            "--proto",
-            "=http,https",
-            "--proto-redir",
-            "=http,https",
-            "--max-filesize",
-            &MAX_PROXY_BODY_BYTES.to_string(),
-            "--connect-timeout",
-            "6",
-            "--max-time",
-            "10",
-            "--compressed",
-            "-A",
-            uniform_ua,
-            "-H",
-            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "-H",
-            "Accept-Language: en-US,en;q=0.9",
-        ]);
-
-        // Pin curl to the already-validated global IP to defeat TOCTOU DNS rebinding
-        let bare_host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim_end_matches('.');
-        if !bare_host.is_empty() && bare_host.parse::<IpAddr>().is_err() {
-            if let Some(ip) = resolved_ips.first() {
-                let ip_str = match ip {
-                    IpAddr::V4(v4) => v4.to_string(),
-                    IpAddr::V6(v6) => format!("[{}]", v6),
-                };
-                cmd.arg("--resolve")
-                    .arg(format!("{}:{}:{}", bare_host, port, ip_str));
-            }
-        }
-        cmd.arg("--").arg(&current_url);
-
-        let Ok(out) = cmd.output() else {
-            break;
+        #[cfg(target_os = "windows")]
+        let (status_code, location, body_vec) = {
+            let Ok(resp) = crate::winhttp_client::winhttp_get_no_redirect(
+                &current_url,
+                uniform_ua,
+                &[
+                    (
+                        "Accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    ),
+                    ("Accept-Language", "en-US,en;q=0.9"),
+                ],
+                5_000,
+                10_000,
+                MAX_PROXY_BODY_BYTES,
+            ) else {
+                break;
+            };
+            (resp.status_code, resp.location, resp.body)
         };
-        if !out.status.success() || out.stdout.is_empty() {
-            break;
-        }
 
-        let Some((status_code, location, body_bytes)) = parse_curl_http_response(&out.stdout) else {
-            break;
+        #[cfg(not(target_os = "windows"))]
+        let (status_code, location, body_vec) = {
+            let mut cmd = system_curl_command();
+            cmd.args([
+                "-sS",
+                "-i",
+                "-g",
+                "--proto",
+                "=http,https",
+                "--proto-redir",
+                "=http,https",
+                "--max-filesize",
+                &MAX_PROXY_BODY_BYTES.to_string(),
+                "--connect-timeout",
+                "6",
+                "--max-time",
+                "10",
+                "--compressed",
+                "-A",
+                uniform_ua,
+                "-H",
+                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "-H",
+                "Accept-Language: en-US,en;q=0.9",
+            ]);
+
+            // Pin curl to the already-validated global IP to defeat TOCTOU DNS rebinding
+            let bare_host = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_end_matches('.');
+            if !bare_host.is_empty() && bare_host.parse::<IpAddr>().is_err() {
+                if let Some(ip) = _resolved_ips.first() {
+                    let ip_str = match ip {
+                        IpAddr::V4(v4) => v4.to_string(),
+                        IpAddr::V6(v6) => format!("[{}]", v6),
+                    };
+                    cmd.arg("--resolve")
+                        .arg(format!("{}:{}:{}", bare_host, port, ip_str));
+                }
+            }
+            cmd.arg("--").arg(&current_url);
+
+            let Ok(out) = cmd.output() else {
+                break;
+            };
+            if !out.status.success() || out.stdout.is_empty() {
+                break;
+            }
+
+            let Some((code, loc, body_slice)) = parse_curl_http_response(&out.stdout) else {
+                break;
+            };
+            (code, loc, body_slice.to_vec())
         };
 
         if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
@@ -5293,7 +5772,7 @@ fn fetch_and_rewrite_external_page(
             continue;
         }
 
-        let capped = &body_bytes[..body_bytes.len().min(MAX_PROXY_BODY_BYTES)];
+        let capped = &body_vec[..body_vec.len().min(MAX_PROXY_BODY_BYTES)];
         let raw_html = String::from_utf8_lossy(capped).into_owned();
         let origin_base = escape_html_str(&extract_origin_base(&current_url));
 
@@ -5330,6 +5809,7 @@ fn fetch_and_rewrite_external_page(
 
 /// Parses `curl -i` output (skipping intermediate `1xx` / proxy `CONNECT` headers)
 /// into `(status_code, optional Location header, body_slice)`.
+#[cfg(not(target_os = "windows"))]
 fn parse_curl_http_response(raw: &[u8]) -> Option<(u16, Option<String>, &[u8])> {
     let mut slice = raw;
     loop {
@@ -5521,6 +6001,38 @@ fn is_valid_favicon_host(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
+fn favicon_ram_cache() -> &'static Mutex<HashMap<String, (Vec<u8>, &'static str)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Vec<u8>, &'static str)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static ACTIVE_FAVICON_FETCHES: AtomicUsize = AtomicUsize::new(0);
+const MAX_CONCURRENT_FAVICON_FETCHES: usize = 6;
+
+struct FaviconFetchGuard;
+impl Drop for FaviconFetchGuard {
+    fn drop(&mut self) {
+        ACTIVE_FAVICON_FETCHES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_favicon_fetch_slot() -> Option<FaviconFetchGuard> {
+    for attempt in 0..8 {
+        let cur = ACTIVE_FAVICON_FETCHES.load(Ordering::Acquire);
+        if cur < MAX_CONCURRENT_FAVICON_FETCHES
+            && ACTIVE_FAVICON_FETCHES
+                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Some(FaviconFetchGuard);
+        }
+        if attempt < 7 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    None
+}
+
 fn fetch_favicon_bytes_safe(
     start_url: &str,
     shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
@@ -5531,7 +6043,9 @@ fn fetch_favicon_bytes_safe(
 
     for _hop in 0..=3 {
         let (host, port) = parse_http_url_authority(&current_url).ok()?;
-        let resolved_ips = {
+        // Lock `shell_mutex` ONLY for fast in-memory adblocker + Arc<KillSwitch> clone,
+        // then DROP it BEFORE blocking DNS so slow DNS never freezes the UI thread!
+        let kill_switch = {
             let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             let decision = shell.core.adblocker.evaluate_request(
                 &current_url,
@@ -5545,66 +6059,86 @@ fn fetch_favicon_bytes_safe(
             ) {
                 return None;
             }
-            shell
-                .core
-                .mullvad_vpn
-                .kill_switch()
-                .authorize_outbound_host_and_dns(&host, port)
-                .ok()?
+            shell.core.mullvad_vpn.kill_switch().clone()
+        };
+        let _resolved_ips = kill_switch
+            .authorize_outbound_host_and_dns(&host, port)
+            .ok()?;
+
+        #[cfg(target_os = "windows")]
+        let (status_code, location, body_vec) = {
+            let resp = crate::winhttp_client::winhttp_get_no_redirect(
+                &current_url,
+                uniform_ua,
+                &[(
+                    "Accept",
+                    "image/avif,image/webp,image/png,image/svg+xml,image/x-icon,image/*;q=0.8,*/*;q=0.5",
+                )],
+                1_500,
+                2_500,
+                MAX_FAVICON_BYTES,
+            )
+            .ok()?;
+            (resp.status_code, resp.location, resp.body)
         };
 
-        let mut cmd = system_curl_command();
-        cmd.args([
-            "-sS",
-            "-i",
-            "-g",
-            "--proto",
-            "=http,https",
-            "--proto-redir",
-            "=http,https",
-            "--max-filesize",
-            &MAX_FAVICON_BYTES.to_string(),
-            "--connect-timeout",
-            "3",
-            "--max-time",
-            "5",
-            "--compressed",
-            "-A",
-            uniform_ua,
-            "-H",
-            "Accept: image/avif,image/webp,image/png,image/svg+xml,image/x-icon,image/*;q=0.8,*/*;q=0.5",
-        ]);
-        let bare_host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim_end_matches('.');
-        if !bare_host.is_empty() && bare_host.parse::<IpAddr>().is_err() {
-            if let Some(ip) = resolved_ips.first() {
-                let ip_str = match ip {
-                    IpAddr::V4(v4) => v4.to_string(),
-                    IpAddr::V6(v6) => format!("[{}]", v6),
-                };
-                cmd.arg("--resolve")
-                    .arg(format!("{}:{}:{}", bare_host, port, ip_str));
+        #[cfg(not(target_os = "windows"))]
+        let (status_code, location, body_vec) = {
+            let mut cmd = system_curl_command();
+            cmd.args([
+                "-sS",
+                "-i",
+                "-g",
+                "--proto",
+                "=http,https",
+                "--proto-redir",
+                "=http,https",
+                "--max-filesize",
+                &MAX_FAVICON_BYTES.to_string(),
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "4",
+                "--compressed",
+                "-A",
+                uniform_ua,
+                "-H",
+                "Accept: image/avif,image/webp,image/png,image/svg+xml,image/x-icon,image/*;q=0.8,*/*;q=0.5",
+            ]);
+            let bare_host = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_end_matches('.');
+            if !bare_host.is_empty() && bare_host.parse::<IpAddr>().is_err() {
+                if let Some(ip) = _resolved_ips.first() {
+                    let ip_str = match ip {
+                        IpAddr::V4(v4) => v4.to_string(),
+                        IpAddr::V6(v6) => format!("[{}]", v6),
+                    };
+                    cmd.arg("--resolve")
+                        .arg(format!("{}:{}:{}", bare_host, port, ip_str));
+                }
             }
-        }
-        cmd.arg("--").arg(&current_url);
+            cmd.arg("--").arg(&current_url);
 
-        let out = cmd.output().ok()?;
-        if !out.status.success() || out.stdout.is_empty() {
-            return None;
-        }
-        let (status_code, location, body_bytes) = parse_curl_http_response(&out.stdout)?;
+            let out = cmd.output().ok()?;
+            if !out.status.success() || out.stdout.is_empty() {
+                return None;
+            }
+            let (code, loc, body_slice) = parse_curl_http_response(&out.stdout)?;
+            (code, loc, body_slice.to_vec())
+        };
+
         if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
             let loc = location?;
             current_url = resolve_redirect_url(&current_url, &loc)?;
             continue;
         }
-        if status_code != 200 || body_bytes.is_empty() || body_bytes.len() > MAX_FAVICON_BYTES {
+        if status_code != 200 || body_vec.is_empty() || body_vec.len() > MAX_FAVICON_BYTES {
             return None;
         }
-        let mime = detect_favicon_mime(body_bytes)?;
-        return Some((body_bytes.to_vec(), mime));
+        let mime = detect_favicon_mime(&body_vec)?;
+        return Some((body_vec, mime));
     }
     None
 }
@@ -5637,6 +6171,15 @@ fn prune_favicon_cache_if_needed(favicons_dir: &std::path::Path) {
     }
 }
 
+fn cache_favicon_in_ram(key: &str, bytes: &[u8], mime: &'static str) {
+    if let Ok(mut ram) = favicon_ram_cache().lock() {
+        if ram.len() >= 400 {
+            ram.clear();
+        }
+        ram.insert(key.to_string(), (bytes.to_vec(), mime));
+    }
+}
+
 fn handle_favicon_request(
     req: &ParsedHttpRequest,
     shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
@@ -5662,15 +6205,29 @@ fn handle_favicon_request(
         return HttpResponse::text("400 Bad Request", "Invalid favicon target");
     }
 
+    let mut hasher = Sha256::new();
+    hasher.update(candidates[0].as_bytes());
+    let key_full = hex::encode(hasher.finalize());
+    let key = &key_full[..32];
+
+    // Fast path 1: zero-disk, zero-lock-on-shell RAM cache hit (microseconds across 38+ tabs!)
+    if let Ok(ram) = favicon_ram_cache().lock() {
+        if let Some((bytes, ct)) = ram.get(key) {
+            return HttpResponse::new("200 OK", ct, bytes.clone())
+                .with_header("Cache-Control", "private, max-age=86400")
+                .with_header(
+                    "Content-Security-Policy",
+                    "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+                );
+        }
+    }
+
     let favicons_dir = {
         let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
         shell.roaming.favicons_dir()
     };
     let _ = std::fs::create_dir_all(&favicons_dir);
 
-    let mut hasher = Sha256::new();
-    hasher.update(candidates[0].as_bytes());
-    let key = &hex::encode(hasher.finalize())[..32];
     let bin_path = favicons_dir.join(format!("{}.bin", key));
     let mime_path = favicons_dir.join(format!("{}.mime", key));
     let miss_path = favicons_dir.join(format!("{}.miss", key));
@@ -5687,6 +6244,7 @@ fn handle_favicon_request(
                 "image/svg+xml" => "image/svg+xml",
                 _ => verified_mime,
             };
+            cache_favicon_in_ram(key, &bytes, ct);
             return HttpResponse::new("200 OK", ct, bytes)
                 .with_header("Cache-Control", "private, max-age=86400")
                 .with_header(
@@ -5705,12 +6263,18 @@ fn handle_favicon_request(
         }
     }
 
+    let Some(_slot_guard) = try_acquire_favicon_fetch_slot() else {
+        return HttpResponse::text("503 Service Unavailable", "Favicon fetcher busy")
+            .with_header("Cache-Control", "no-store");
+    };
+
     for cand in &candidates {
         if let Some((bytes, mime)) = fetch_favicon_bytes_safe(cand, shell_mutex) {
             prune_favicon_cache_if_needed(&favicons_dir);
             let _ = std::fs::write(&bin_path, &bytes);
             let _ = std::fs::write(&mime_path, mime);
             let _ = std::fs::remove_file(&miss_path);
+            cache_favicon_in_ram(key, &bytes, mime);
             return HttpResponse::new("200 OK", mime, bytes)
                 .with_header("Cache-Control", "private, max-age=86400")
                 .with_header(

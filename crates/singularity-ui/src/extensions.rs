@@ -16,6 +16,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::{Command, Stdio};
 
 const MAX_CRX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB compressed package cap
@@ -750,21 +751,6 @@ pub fn resolve_extension_runtime_url(
     ))
 }
 
-#[cfg(target_os = "windows")]
-fn system_powershell_path() -> PathBuf {
-    if let Ok(sysroot) = std::env::var("SystemRoot") {
-        let p = PathBuf::from(sysroot)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        if p.is_file() {
-            return p;
-        }
-    }
-    PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-}
-
 fn random_hex_nonce() -> String {
     let mut b = [0u8; 8];
     OsRng.fill_bytes(&mut b);
@@ -793,32 +779,16 @@ pub fn install_from_chrome_web_store(
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const PS_DL_CRX: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$h = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' }
-Invoke-WebRequest -Uri $env:SINGULARITY_CRX_URL -Headers $h -OutFile $env:SINGULARITY_CRX_OUT -UseBasicParsing -TimeoutSec 25
-"#;
-        let status = Command::new(system_powershell_path())
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                PS_DL_CRX,
-            ])
-            .env("SINGULARITY_CRX_URL", &crx_url)
-            .env("SINGULARITY_CRX_OUT", &tmp_crx)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|e| format!("Failed downloading extension: {}", e))?;
-        if !status.success() || !tmp_crx.is_file() {
+        let dl = crate::winhttp_client::winhttp_download_https_to_file(
+            &crx_url,
+            &tmp_crx,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            &[],
+            10_000,
+            25_000,
+            MAX_CRX_BYTES,
+        );
+        if dl.is_err() || !tmp_crx.is_file() {
             let _ = std::fs::remove_file(&tmp_crx);
             return Err("Failed downloading package from the Chrome Web Store.".into());
         }

@@ -945,7 +945,9 @@ impl RoamingSingularityStore {
         self.save_tokens()
     }
 
-    pub fn record_history(&mut self, title: &str, url: &str) {
+    /// Records a history item in RAM without forcing an immediate disk `fsync`.
+    /// Call `save_profile()` periodically or on shutdown to persist coalesced updates.
+    pub fn record_history_in_memory(&mut self, title: &str, url: &str) {
         if !url.starts_with("https://") && !url.starts_with("http://") {
             return;
         }
@@ -966,6 +968,10 @@ impl RoamingSingularityStore {
         if self.profile.history.len() > 400 {
             self.profile.history.truncate(400);
         }
+    }
+
+    pub fn record_history(&mut self, title: &str, url: &str) {
+        self.record_history_in_memory(title, url);
         let _ = self.save_profile();
     }
 

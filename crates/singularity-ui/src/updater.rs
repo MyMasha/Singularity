@@ -122,48 +122,29 @@ pub fn check_for_updates() -> Result<UpdateCheckInfo, String> {
 
     #[cfg(target_os = "windows")]
     let raw_json = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        const PS_CHECK_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$pubH = @{ 'User-Agent' = $env:SINGULARITY_UA; 'Accept' = 'application/vnd.github+json' }
-$r = $null
-if ($env:SINGULARITY_GH_TOK -and $env:SINGULARITY_GH_TOK.Length -gt 0) {
-    $authH = @{ 'User-Agent' = $env:SINGULARITY_UA; 'Accept' = 'application/vnd.github+json'; 'Authorization' = 'Bearer ' + $env:SINGULARITY_GH_TOK }
-    try {
-        $r = Invoke-RestMethod -Uri $env:SINGULARITY_API_URL -Headers $authH -UseBasicParsing -TimeoutSec 8
-    } catch {
-        $r = Invoke-RestMethod -Uri $env:SINGULARITY_API_URL -Headers $pubH -UseBasicParsing -TimeoutSec 8
-    }
-} else {
-    $r = Invoke-RestMethod -Uri $env:SINGULARITY_API_URL -Headers $pubH -UseBasicParsing -TimeoutSec 8
-}
-@{ tag_name = $r.tag_name; html_url = $r.html_url } | ConvertTo-Json -Compress
-"#;
-        let mut cmd = Command::new(system_powershell_path());
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            PS_CHECK_SCRIPT,
-        ])
-        .env("SINGULARITY_UA", format!("Singularity-Browser/{}", CURRENT_VERSION))
-        .env("SINGULARITY_API_URL", RELEASES_API_URL)
-        .env("SINGULARITY_GH_TOK", opt_token.as_deref().unwrap_or(""))
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW);
-
-        let out = cmd
-            .output()
-            .map_err(|e| format!("Unable to reach GitHub Releases: {}", e))?;
-        if !out.status.success() {
-            return Err("Unable to check for updates (offline or GitHub API unreachable).".into());
+        let ua = format!("Singularity-Browser/{}", CURRENT_VERSION);
+        let fetch_rel = |tok: Option<&str>| -> Result<String, String> {
+            let mut headers = vec![("Accept", "application/vnd.github+json")];
+            let auth_val;
+            if let Some(t) = tok {
+                auth_val = format!("Bearer {}", t);
+                headers.push(("Authorization", auth_val.as_str()));
+            }
+            let bytes = crate::winhttp_client::winhttp_get_https_bytes(
+                RELEASES_API_URL,
+                &ua,
+                &headers,
+                6_000,
+                10_000,
+                512 * 1024,
+            )?;
+            Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+        };
+        match opt_token.as_deref() {
+            Some(tok) => fetch_rel(Some(tok)).or_else(|_| fetch_rel(None)),
+            None => fetch_rel(None),
         }
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        .map_err(|_| "Unable to check for updates (offline or GitHub API unreachable).".to_string())?
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -344,85 +325,98 @@ pub fn execute_self_update() -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
         let old_exe = target_dir.join("singularity.exe.old");
         let opt_token = resolve_github_token();
+        let ua = format!("Singularity-Updater/{}", CURRENT_VERSION);
 
-        const PS_DOWNLOAD_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$pubH = @{ 'User-Agent' = $env:SINGULARITY_UA }
-$apiPubH = @{ 'User-Agent' = $env:SINGULARITY_UA; 'Accept' = 'application/vnd.github+json' }
-$rel = $null
-if ($env:SINGULARITY_GH_TOK -and $env:SINGULARITY_GH_TOK.Length -gt 0) {
-    $apiAuthH = @{
-        'User-Agent' = $env:SINGULARITY_UA
-        'Accept' = 'application/vnd.github+json'
-        'Authorization' = 'Bearer ' + $env:SINGULARITY_GH_TOK
-    }
-    try {
-        $rel = Invoke-RestMethod -Uri $env:SINGULARITY_API_URL -Headers $apiAuthH -UseBasicParsing -TimeoutSec 15
-    } catch {
-        $rel = Invoke-RestMethod -Uri $env:SINGULARITY_API_URL -Headers $apiPubH -UseBasicParsing -TimeoutSec 15
-    }
-} else {
-    $rel = Invoke-RestMethod -Uri $env:SINGULARITY_API_URL -Headers $apiPubH -UseBasicParsing -TimeoutSec 15
-}
+        let fetch_api = |tok: Option<&str>| -> Result<serde_json::Value, String> {
+            let mut headers = vec![("Accept", "application/vnd.github+json")];
+            let auth_val;
+            if let Some(t) = tok {
+                auth_val = format!("Bearer {}", t);
+                headers.push(("Authorization", auth_val.as_str()));
+            }
+            let bytes = crate::winhttp_client::winhttp_get_https_bytes(
+                RELEASES_API_URL,
+                &ua,
+                &headers,
+                8_000,
+                15_000,
+                512 * 1024,
+            )?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| "Invalid GitHub Releases API response.".to_string())
+        };
 
-$binAsset = $rel.assets | Where-Object { $_.name -eq 'singularity.exe' } | Select-Object -First 1
-$sumAsset = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1
-$sigAsset = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt.sig' } | Select-Object -First 1
+        let rel = match opt_token.as_deref() {
+            Some(tok) => fetch_api(Some(tok)).or_else(|_| fetch_api(None)),
+            None => fetch_api(None),
+        }?;
 
-if ($null -ne $binAsset -and $null -ne $sumAsset) {
-    if (-not $binAsset.browser_download_url.StartsWith('https://')) { throw 'Non-HTTPS asset URL blocked' }
-    if (-not $sumAsset.browser_download_url.StartsWith('https://')) { throw 'Non-HTTPS sums URL blocked' }
-    Invoke-WebRequest -Uri $binAsset.browser_download_url -Headers $pubH -OutFile $env:SINGULARITY_OUT_BIN -UseBasicParsing -TimeoutSec 60
-    Invoke-WebRequest -Uri $sumAsset.browser_download_url -Headers $pubH -OutFile $env:SINGULARITY_OUT_SUMS -UseBasicParsing -TimeoutSec 30
-    if ($null -ne $sigAsset -and $sigAsset.browser_download_url.StartsWith('https://')) {
-        try {
-            Invoke-WebRequest -Uri $sigAsset.browser_download_url -Headers $pubH -OutFile $env:SINGULARITY_OUT_SIG -UseBasicParsing -TimeoutSec 20
-        } catch {}
-    }
-} elseif ($rel.tag_name -and ($rel.tag_name -match '^[A-Za-z0-9._-]+$')) {
-    $tag = $rel.tag_name
-    $rawBin = "https://raw.githubusercontent.com/MyMasha/Singularity/$tag/dist/singularity.exe"
-    $rawSum = "https://raw.githubusercontent.com/MyMasha/Singularity/$tag/dist/SHA256SUMS.txt"
-    Invoke-WebRequest -Uri $rawBin -Headers $pubH -OutFile $env:SINGULARITY_OUT_BIN -UseBasicParsing -TimeoutSec 60
-    Invoke-WebRequest -Uri $rawSum -Headers $pubH -OutFile $env:SINGULARITY_OUT_SUMS -UseBasicParsing -TimeoutSec 30
-} else {
-    throw 'Release assets unavailable'
-}
-"#;
+        let assets = rel
+            .get("assets")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let find_asset_url = |name: &str| -> Option<String> {
+            assets.iter().find_map(|a| {
+                if a.get("name").and_then(|n| n.as_str()) == Some(name) {
+                    a.get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                        .filter(|u| u.starts_with("https://"))
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+        };
 
-        let status = Command::new(system_powershell_path())
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                PS_DOWNLOAD_SCRIPT,
-            ])
-            .env("SINGULARITY_UA", format!("Singularity-Updater/{}", CURRENT_VERSION))
-            .env("SINGULARITY_API_URL", RELEASES_API_URL)
-            .env("SINGULARITY_OUT_BIN", &new_exe)
-            .env("SINGULARITY_OUT_SUMS", &sums_file)
-            .env("SINGULARITY_OUT_SIG", &sig_file)
-            .env("SINGULARITY_GH_TOK", opt_token.as_deref().unwrap_or(""))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|e| format!("Failed launching updater process: {}", e))?;
+        let Some(bin_url) = find_asset_url("singularity.exe") else {
+            return Err("Release asset 'singularity.exe' is unavailable for the latest release.".into());
+        };
+        let Some(sums_url) = find_asset_url("SHA256SUMS.txt") else {
+            return Err("Release asset 'SHA256SUMS.txt' is unavailable for the latest release.".into());
+        };
+        let sig_url = find_asset_url("SHA256SUMS.txt.sig");
 
-        if !status.success() || !new_exe.exists() || !sums_file.exists() {
+        let dl_bin = crate::winhttp_client::winhttp_download_https_to_file(
+            &bin_url,
+            &new_exe,
+            &ua,
+            &[],
+            10_000,
+            60_000,
+            128 * 1024 * 1024,
+        );
+        let dl_sums = if dl_bin.is_ok() {
+            crate::winhttp_client::winhttp_download_https_to_file(
+                &sums_url,
+                &sums_file,
+                &ua,
+                &[],
+                10_000,
+                25_000,
+                512 * 1024,
+            )
+        } else {
+            Err("Skipped sums".into())
+        };
+        if dl_bin.is_err() || dl_sums.is_err() || !new_exe.exists() || !sums_file.exists() {
             let _ = std::fs::remove_file(&new_exe);
             let _ = std::fs::remove_file(&sums_file);
             let _ = std::fs::remove_file(&sig_file);
             return Err("Failed downloading update binary or SHA256SUMS.txt from GitHub Releases.".into());
+        }
+        if let Some(s_url) = sig_url {
+            let _ = crate::winhttp_client::winhttp_download_https_to_file(
+                &s_url,
+                &sig_file,
+                &ua,
+                &[],
+                8_000,
+                15_000,
+                64 * 1024,
+            );
         }
 
         let sums_bytes = std::fs::read(&sums_file)
