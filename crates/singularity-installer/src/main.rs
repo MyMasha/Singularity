@@ -120,6 +120,112 @@ fn roaming_singularity_dir() -> PathBuf {
     std::env::temp_dir().join(".singularity")
 }
 
+fn open_self_sfx_zip() -> Option<(zip::ZipArchive<std::fs::File>, u64)> {
+    let exe_path = std::env::current_exe().ok()?;
+    let file = std::fs::File::open(&exe_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let archive = zip::ZipArchive::new(file).ok()?;
+    let payload_len = file_len.saturating_sub(archive.offset());
+    if archive.is_empty() || payload_len < 1024 {
+        return None;
+    }
+    Some((archive, payload_len))
+}
+
+fn detect_payload_size_bytes() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if let Some((_, sz)) = open_self_sfx_zip() {
+            return sz;
+        }
+        EMBEDDED_SINGULARITY_EXE.len() as u64
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn detect_installed_uncompressed_kb() -> u32 {
+    if let Some((mut archive, _)) = open_self_sfx_zip() {
+        let mut total: u64 = 0;
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index(i) {
+                total = total.saturating_add(entry.size());
+            }
+        }
+        return ((total / 1024).max(1024)) as u32;
+    }
+    ((EMBEDDED_SINGULARITY_EXE.len() / 1024).max(1024)) as u32
+}
+
+fn extract_zip_archive_to_dir<R: std::io::Read + std::io::Seek, F: Fn()>(
+    archive: &mut zip::ZipArchive<R>,
+    target_dir: &std::path::Path,
+    progress: &Arc<Mutex<SharedProgress>>,
+    notify: &F,
+) -> Result<(), String> {
+    set_step(
+        progress,
+        24.0,
+        "Extracting Singularity + Pure Chromium runtime...",
+        notify,
+    );
+    let mut total_uncompressed: u64 = 0;
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            total_uncompressed = total_uncompressed.saturating_add(entry.size());
+        }
+    }
+    let total_uncompressed = total_uncompressed.max(1);
+    let mut written_total: u64 = 0;
+    let mut buf = vec![0u8; 131_072];
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed reading bundle entry #{i}: {e}"))?;
+        let Some(rel_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let out_path = target_dir.join(&rel_path);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| {
+                format!("Failed to create directory '{}': {e}", out_path.display())
+            })?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("Failed to create directory '{}': {e}", parent.display())
+            })?;
+        }
+        let display_name = rel_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("runtime");
+        let step_lbl = format!("Extracting Pure Chromium ({display_name})...");
+        let mut out_file = std::fs::File::create(&out_path).map_err(|e| {
+            format!(
+                "Failed to write '{}' (close Singularity if it is open): {e}",
+                out_path.display()
+            )
+        })?;
+        loop {
+            let n = std::io::Read::read(&mut entry, &mut buf)
+                .map_err(|e| format!("Decompression error on '{display_name}': {e}"))?;
+            if n == 0 {
+                break;
+            }
+            out_file
+                .write_all(&buf[..n])
+                .map_err(|e| format!("Disk write error on '{display_name}': {e}"))?;
+            written_total = written_total.saturating_add(n as u64);
+            let pct = 24.0 + (written_total as f32 / total_uncompressed as f32).min(1.0) * 48.0;
+            set_step(progress, pct, &step_lbl, notify);
+        }
+        let _ = out_file.flush();
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -127,21 +233,45 @@ fn main() {
         println!(
             "Singularity-Setup v{} (native Win32 installer, payload: {} bytes)",
             APP_VERSION,
-            EMBEDDED_SINGULARITY_EXE.len()
+            detect_payload_size_bytes()
         );
         return;
     }
 
     if args.iter().any(|a| a == "--verify-only") {
         assert!(
-            EMBEDDED_SINGULARITY_EXE.len() > 512 * 1024,
-            "Embedded singularity payload looks truncated"
-        );
-        assert!(
             EMBEDDED_SINGULARITY_ICO.len() > 4096,
             "Embedded singularity.ico looks truncated"
         );
-        if EMBEDDED_SINGULARITY_EXE.starts_with(b"PK\x03\x04") {
+        if let Some((mut archive, payload_len)) = open_self_sfx_zip() {
+            assert!(
+                payload_len > 10 * 1024 * 1024,
+                "SFX Pure Chromium CEF bundle looks truncated ({payload_len} bytes)"
+            );
+            assert!(
+                archive.by_name("singularity.exe").is_ok(),
+                "SFX bundle missing singularity.exe"
+            );
+            assert!(
+                archive.by_name("libcef.dll").is_ok(),
+                "SFX bundle missing libcef.dll"
+            );
+            assert!(
+                archive.by_name("icudtl.dat").is_ok(),
+                "SFX bundle missing icudtl.dat"
+            );
+            assert!(
+                archive.by_name("resources.pak").is_ok(),
+                "SFX bundle missing resources.pak"
+            );
+            println!(
+                "[OK] Singularity-Setup v{} (Pure Native Win32 + Pure Chromium CEF SFX) verified — bundle = {:.2} MB ({} files), icon = {} KB",
+                APP_VERSION,
+                payload_len as f64 / (1024.0 * 1024.0),
+                archive.len(),
+                EMBEDDED_SINGULARITY_ICO.len() / 1024
+            );
+        } else if EMBEDDED_SINGULARITY_EXE.starts_with(b"PK\x03\x04") {
             let mut archive = zip::ZipArchive::new(std::io::Cursor::new(EMBEDDED_SINGULARITY_EXE))
                 .expect("Embedded ZIP bundle is corrupted");
             assert!(
@@ -160,6 +290,10 @@ fn main() {
                 EMBEDDED_SINGULARITY_ICO.len() / 1024
             );
         } else {
+            assert!(
+                EMBEDDED_SINGULARITY_EXE.len() > 512 * 1024,
+                "Embedded singularity payload looks truncated (no SFX ZIP overlay attached)"
+            );
             println!(
                 "[OK] Singularity-Setup v{} (Pure Native Win32) verified — payload = {:.2} MB, icon = {} KB",
                 APP_VERSION,
@@ -239,7 +373,8 @@ fn perform_installation<F: Fn()>(
     progress: &Arc<Mutex<SharedProgress>>,
     notify: F,
 ) -> Result<PathBuf, String> {
-    if EMBEDDED_SINGULARITY_EXE.is_empty() {
+    let sfx_opt = open_self_sfx_zip();
+    if sfx_opt.is_none() && EMBEDDED_SINGULARITY_EXE.is_empty() {
         return Err("Installer binary was built without an embedded singularity payload.".into());
     }
     let target_dir = PathBuf::from(opts.install_dir.trim());
@@ -279,71 +414,13 @@ fn perform_installation<F: Fn()>(
     // Remove legacy v1.0.x WebView2Loader.dll if upgrading in-place
     let _ = std::fs::remove_file(target_dir.join("WebView2Loader.dll"));
 
-    // Extract Pure Chromium CEF ZIP bundle or fallback single binary with real-time progress
-    if EMBEDDED_SINGULARITY_EXE.starts_with(b"PK\x03\x04") {
-        set_step(
-            progress,
-            24.0,
-            "Extracting Singularity + Pure Chromium runtime...",
-            &notify,
-        );
+    // Extract Pure Chromium CEF ZIP bundle (SFX overlay preferred) or fallback single binary
+    if let Some((mut archive, _)) = sfx_opt {
+        extract_zip_archive_to_dir(&mut archive, &target_dir, progress, &notify)?;
+    } else if EMBEDDED_SINGULARITY_EXE.starts_with(b"PK\x03\x04") {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(EMBEDDED_SINGULARITY_EXE))
             .map_err(|e| format!("Corrupted embedded Chromium bundle: {e}"))?;
-        let mut total_uncompressed: u64 = 0;
-        for i in 0..archive.len() {
-            if let Ok(entry) = archive.by_index(i) {
-                total_uncompressed = total_uncompressed.saturating_add(entry.size());
-            }
-        }
-        let total_uncompressed = total_uncompressed.max(1);
-        let mut written_total: u64 = 0;
-        let mut buf = vec![0u8; 131_072];
-
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| format!("Failed reading bundle entry #{i}: {e}"))?;
-            let Some(rel_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            let out_path = target_dir.join(&rel_path);
-            if entry.is_dir() {
-                std::fs::create_dir_all(&out_path).map_err(|e| {
-                    format!("Failed to create directory '{}': {e}", out_path.display())
-                })?;
-                continue;
-            }
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!("Failed to create directory '{}': {e}", parent.display())
-                })?;
-            }
-            let display_name = rel_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("runtime");
-            let step_lbl = format!("Extracting Pure Chromium ({display_name})...");
-            let mut out_file = std::fs::File::create(&out_path).map_err(|e| {
-                format!(
-                    "Failed to write '{}' (close Singularity if it is open): {e}",
-                    out_path.display()
-                )
-            })?;
-            loop {
-                let n = std::io::Read::read(&mut entry, &mut buf)
-                    .map_err(|e| format!("Decompression error on '{display_name}': {e}"))?;
-                if n == 0 {
-                    break;
-                }
-                out_file
-                    .write_all(&buf[..n])
-                    .map_err(|e| format!("Disk write error on '{display_name}': {e}"))?;
-                written_total = written_total.saturating_add(n as u64);
-                let pct = 24.0 + (written_total as f32 / total_uncompressed as f32).min(1.0) * 48.0;
-                set_step(progress, pct, &step_lbl, &notify);
-            }
-            let _ = out_file.flush();
-        }
+        extract_zip_archive_to_dir(&mut archive, &target_dir, progress, &notify)?;
     } else {
         let extract_label = format!("Extracting native browser {}...", exe_name);
         set_step(progress, 24.0, &extract_label, &notify);
@@ -459,8 +536,7 @@ fn perform_installation<F: Fn()>(
 
 #[cfg(target_os = "windows")]
 mod win32_ops {
-    use super::APP_VERSION;
-    use super::EMBEDDED_SINGULARITY_EXE;
+    use super::{detect_installed_uncompressed_kb, APP_VERSION};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -607,7 +683,7 @@ mod win32_ops {
             let uninst_cmd = format!("\"{}\" --uninstall", exe_path.display());
             let quiet_uninst_cmd = format!("\"{}\" --uninstall --silent", exe_path.display());
             let icon_loc = format!("{},0", ico_path.display());
-            let est_kb = ((EMBEDDED_SINGULARITY_EXE.len() / 1024).max(1024)) as u32;
+            let est_kb = detect_installed_uncompressed_kb();
 
             set_sz("DisplayName", "Singularity");
             set_sz("DisplayVersion", APP_VERSION);
@@ -714,9 +790,9 @@ mod win32_ops {
 mod win32_gui {
     use super::win32_ops::{launch_exe_detached, to_wide};
     use super::{
-        default_install_dir, perform_installation, roaming_singularity_dir, InstallOptions,
-        InstallPhase, SharedProgress, APP_VERSION, EMBEDDED_LOGO_128_RGBA,
-        EMBEDDED_SINGULARITY_EXE,
+        default_install_dir, detect_payload_size_bytes, perform_installation,
+        roaming_singularity_dir, InstallOptions, InstallPhase, SharedProgress, APP_VERSION,
+        EMBEDDED_LOGO_128_RGBA,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2315,7 +2391,7 @@ mod win32_gui {
         );
 
         // Card header labels
-        let payload_mb = EMBEDDED_SINGULARITY_EXE.len() as f64 / (1024.0 * 1024.0);
+        let payload_mb = detect_payload_size_bytes() as f64 / (1024.0 * 1024.0);
         draw_str(
             mem_dc,
             f_label,
@@ -2513,5 +2589,72 @@ mod win32_gui {
         let _ = DeleteObject(dib.into());
         let _ = DeleteDC(mem_dc);
         let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sfx_zip_overlay_extraction_preserves_nested_locales_and_rejects_zip_slip() {
+        // Build a synthetic PE stub (64 KiB) + appended ZIP overlay in memory
+        let stub_prefix = vec![0x4Du8; 65_536];
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut zip_buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("singularity.exe", opts).expect("start exe");
+            zw.write_all(b"MZ-singularity-test").expect("write exe");
+            zw.start_file("libcef.dll", opts).expect("start dll");
+            zw.write_all(b"MZ-libcef-test").expect("write dll");
+            zw.start_file("locales/fr.pak", opts).expect("start locale");
+            zw.write_all(b"PAK-fr").expect("write locale");
+            zw.start_file("../escape.txt", opts).expect("start evil");
+            zw.write_all(b"evil").expect("write evil");
+            zw.finish().expect("finish zip");
+        }
+        let mut sfx_bytes = stub_prefix.clone();
+        sfx_bytes.extend_from_slice(&zip_buf.into_inner());
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(sfx_bytes))
+            .expect("open appended SFX ZIP");
+        assert_eq!(archive.offset(), stub_prefix.len() as u64);
+
+        let out_dir = std::env::temp_dir().join(format!(
+            "singularity_sfx_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).expect("mkdir");
+
+        let prog = Arc::new(Mutex::new(SharedProgress {
+            phase: InstallPhase::Idle,
+            target_pct: 0.0,
+            step_label: String::new(),
+            installed_exe: String::new(),
+            error_msg: String::new(),
+        }));
+        extract_zip_archive_to_dir(&mut archive, &out_dir, &prog, &|| {})
+            .expect("extract SFX zip");
+
+        assert_eq!(
+            std::fs::read(out_dir.join("singularity.exe")).expect("read exe"),
+            b"MZ-singularity-test"
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("libcef.dll")).expect("read dll"),
+            b"MZ-libcef-test"
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("locales").join("fr.pak")).expect("read fr.pak"),
+            b"PAK-fr"
+        );
+        assert!(
+            !out_dir.parent().unwrap().join("escape.txt").exists(),
+            "zip-slip entry must never escape target_dir"
+        );
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }
