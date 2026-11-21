@@ -788,11 +788,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.3");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.4");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.4"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.4"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1337,7 +1337,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.3"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.4"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1422,7 +1422,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.3"));
+        assert!(txt.contains("v2.0.4"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1456,6 +1456,63 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.4"));
+    }
+
+    #[test]
+    fn test_v204_proprietary_codecs_obs_cef_and_tiktok_media() {
+        // 1. Expanded EU/US TikTok & ByteDance CDN domains keep first-party session cookies protected
+        for (dom, name, val) in [
+            (".tiktokv.eu", "_ttp", "eu_tok"),
+            (".tiktokv.us", "ttwid", "us_tok"),
+            (".tiktokw.eu", "msToken", "eu_ms"),
+            (".muscdn.com", "tt_chain_token", "cdn_tok"),
+            (".ttlivecdn.com", "odin_tt", "live_tok"),
+            (".byteimg.com", "s_v_web_id", "img_tok"),
+            (".bytedance.com", "tt_csrf_token", "bd_tok"),
+        ] {
+            assert_eq!(
+                classify_tracker_or_malicious_cookie(dom, name, val),
+                None,
+                "Expanded TikTok ecosystem cookie ({}, {}) must NEVER be scrubbed",
+                dom,
+                name
+            );
+        }
+
+        // 2. Cargo.toml pins cef = "=150.2.1" matching OBS Studio 33's proprietary-codec CEF 150/7871
+        let ui_cargo = include_str!("../Cargo.toml");
+        assert!(ui_cargo.contains(r#"cef = { version = "=150.2.1""#));
+
+        // 3. Staging script pins OBS CEF 7871 archive by exact SHA-256 and produces download-cef archive.json
+        let prep_py = include_str!("../../../scripts/prepare-cef-win64.py");
+        assert!(prep_py.contains("cef_binary_7871_windows_x64.zip"));
+        assert!(prep_py.contains("54cd191a3f56bb1f05be22b95e1fa8041061b38bd5fe94e0776fb34dd599f341"));
+        assert!(prep_py.contains("archive.json"));
+        assert!(prep_py.contains("EXPECTED_CEF_MAJOR = 150"));
+
+        // 4. CEF runtime enables hardware HEVC support, suppresses webdriver flag, and allows regional TikTok CDNs
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("PlatformHEVCDecoderSupport"));
+        assert!(cef_src.contains("AutomationControlled"));
+        assert!(cef_src.contains("\"tiktokv.eu\""));
+        assert!(cef_src.contains("\"tiktokw.eu\""));
+        assert!(cef_src.contains("\"muscdn.com\""));
+        assert!(cef_src.contains("\"ttlivecdn.com\""));
+
+        // 5. Real Windows CEF smoke test hard-gates on H.264, AAC, combined MP4 AVC+AAC, MSE MP4, and !webdriver
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("h264_ok"));
+        assert!(server_src.contains("aac_ok"));
+        assert!(server_src.contains("mp4_avc_aac_ok"));
+        assert!(server_src.contains("mse_avc_aac_ok"));
+        assert!(server_src.contains("MediaSource.isTypeSupported"));
+        assert!(server_src.contains("&& !webdriver"));
+
+        // 6. Release workflow stages OBS CEF 7871 and blocks silent Spotify CDN fallback
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+        assert!(workflow.contains("prepare-cef-win64.py"));
+        assert!(workflow.contains("CEF_DOWNLOAD_URL=http://127.0.0.1:1/forbidden-spotify-fallback"));
+        assert!(workflow.contains("cef-win64-obs-7871-54cd191a"));
     }
 }

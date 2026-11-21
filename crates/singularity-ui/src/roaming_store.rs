@@ -1712,13 +1712,26 @@ fn is_tiktok_domain(d: &str) -> bool {
     const TIKTOK_DOMAINS: &[&str] = &[
         "tiktok.com",
         "tiktokv.com",
+        "tiktokv.eu",
+        "tiktokv.us",
         "tiktokw.us",
+        "tiktokw.eu",
         "byteoversea.com",
+        "bytedance.com",
+        "byteimg.com",
+        "bytescm.com",
         "tiktokcdn.com",
         "tiktokcdn-us.com",
         "tiktokcdn-eu.com",
+        "tiktokcdn-in.com",
         "ttwstatic.com",
+        "ttlivecdn.com",
+        "tiktokstaticb.com",
+        "ibytedtos.com",
+        "ibyteimg.com",
+        "muscdn.com",
         "musical.ly",
+        "tiktokglobalshop.com",
     ];
     TIKTOK_DOMAINS.iter().any(|t| matches_domain_or_sub(d, t))
 }

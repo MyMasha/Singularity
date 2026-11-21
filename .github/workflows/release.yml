@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v2.0.3)"
+        description: "Release tag to build and publish assets for (e.g. v2.0.4)"
         required: false
-        default: "v2.0.3"
+        default: "v2.0.4"
+      publish:
+        description: "Whether to publish assets to GitHub Releases (set false for CI verification dry-runs)"
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -60,18 +65,22 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - name: Cache Pure Chromium (CEF) SDK
+      - name: Cache Pure Chromium (CEF 150 / OBS 7871 with proprietary H.264/AAC) SDK
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ~/.local/share/cef
-          key: cef-win64-156.7.0+156.0.31
+          key: cef-win64-obs-7871-54cd191a
 
-      - name: Configure CEF_PATH and Ninja build tool
+      - name: Configure CEF_PATH, stage proprietary-codec CEF 150 SDK, and setup Ninja
         shell: pwsh
         run: |
           $cefPath = Join-Path $env:USERPROFILE ".local\share\cef"
           "CEF_PATH=$cefPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Prevent silent fallback to Spotify's non-H.264 CDN if CEF_PATH validation ever fails.
+          "CEF_DOWNLOAD_URL=http://127.0.0.1:1/forbidden-spotify-fallback" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "CEF_PATH=$cefPath"
+          python scripts/prepare-cef-win64.py $cefPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
             $vsNinja = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "ninja.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($vsNinja) {
@@ -126,7 +135,7 @@ jobs:
           }
           Write-Host "[OK] Silent SFX extraction verified all Pure Chromium CEF runtime files"
 
-          # End-to-end REAL Pure Chromium (CEF) launch, V8 IPC, DOM/rAF & non-black pixel smoke test!
+          # End-to-end REAL Pure Chromium (CEF) launch, V8 IPC, H.264/AAC/MSE codecs, DOM/rAF & non-black pixel smoke test!
           $smokeLog = Join-Path $env:RUNNER_TEMP "singularity-cef-smoke.log"
           $smokeCefLog = Join-Path $env:RUNNER_TEMP "singularity-cef-runtime.log"
           $smokeProf = Join-Path $env:RUNNER_TEMP "singularity-cef-profile"
@@ -151,7 +160,7 @@ jobs:
             Write-Error "Real CEF UI launch smoke test FAILED with exit code $($pLaunch.ExitCode)"
             exit 1
           }
-          Write-Host "[OK] Real Windows Pure Chromium (CEF) UI launch, V8 IPC, DOM/rAF & pixel check PASSED!"
+          Write-Host "[OK] Real Windows Pure Chromium (CEF) UI launch, H.264/AAC/MSE codecs, V8 IPC, DOM/rAF & pixel check PASSED!"
           Remove-Item -Recurse -Force $smokeDir, $smokeProf -ErrorAction SilentlyContinue
           Remove-Item -Force $smokeLog, $smokeCefLog -ErrorAction SilentlyContinue
 
@@ -179,7 +188,7 @@ jobs:
 
   publish-release:
     needs: [build-linux, build-windows]
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -223,7 +232,7 @@ jobs:
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v2.0.2"
+            TARGET_TAG="v2.0.4"
           fi
           if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes

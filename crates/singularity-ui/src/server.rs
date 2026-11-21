@@ -469,6 +469,18 @@ fn run_windows_frameless_browser(
             tab_count: i32,
             #[serde(default)]
             codecs: String,
+            #[serde(default)]
+            h264_ok: bool,
+            #[serde(default)]
+            aac_ok: bool,
+            #[serde(default)]
+            mp4_avc_aac_ok: bool,
+            #[serde(default)]
+            mse_avc_aac_ok: bool,
+            #[serde(default)]
+            ua: String,
+            #[serde(default)]
+            webdriver: bool,
         },
         DragWindow,
         DragResize {
@@ -4106,9 +4118,22 @@ fn run_windows_frameless_browser(
                                                             var br = bar ? bar.getBoundingClientRect() : {width:0,height:0};
                                                             var tabs = document.querySelectorAll('.tab-pill').length;
                                                             var vid = document.createElement('video');
-                                                            var codecs = 'h264=' + (vid.canPlayType('video/mp4; codecs="avc1.42E01E"') || 'no')
-                                                                + ',vp9=' + (vid.canPlayType('video/webm; codecs="vp9"') || 'no')
-                                                                + ',av1=' + (vid.canPlayType('video/mp4; codecs="av01.0.04M.08"') || 'no');
+                                                            var h264 = vid.canPlayType('video/mp4; codecs="avc1.42E01E"') || 'no';
+                                                            var aac = vid.canPlayType('audio/mp4; codecs="mp4a.40.2"') || 'no';
+                                                            var mp4AvcAac = vid.canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"') || 'no';
+                                                            var mseAvcAac = (typeof MediaSource !== 'undefined' && typeof MediaSource.isTypeSupported === 'function')
+                                                                ? !!MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E, mp4a.40.2"')
+                                                                : false;
+                                                            var vp9 = vid.canPlayType('video/webm; codecs="vp9"') || 'no';
+                                                            var av1 = vid.canPlayType('video/mp4; codecs="av01.0.04M.08"') || 'no';
+                                                            var hevc = vid.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') || 'no';
+                                                            var codecs = 'h264=' + h264
+                                                                + ',aac=' + aac
+                                                                + ',mp4_avc_aac=' + mp4AvcAac
+                                                                + ',mse_avc_aac=' + mseAvcAac
+                                                                + ',vp9=' + vp9
+                                                                + ',av1=' + av1
+                                                                + ',hevc=' + hevc;
                                                             if (window.ipc && window.ipc.postMessage) {
                                                                 window.ipc.postMessage(JSON.stringify({
                                                                     cmd: 'smoke_probe',
@@ -4118,7 +4143,13 @@ fn run_windows_frameless_browser(
                                                                     body_h: Math.round(window.innerHeight || 0),
                                                                     has_url_input: !!url,
                                                                     tab_count: tabs,
-                                                                    codecs: codecs
+                                                                    codecs: codecs,
+                                                                    h264_ok: h264 !== 'no',
+                                                                    aac_ok: aac !== 'no',
+                                                                    mp4_avc_aac_ok: mp4AvcAac !== 'no',
+                                                                    mse_avc_aac_ok: mseAvcAac,
+                                                                    ua: String(navigator.userAgent || ''),
+                                                                    webdriver: !!navigator.webdriver
                                                                 }));
                                                             }
                                                         });
@@ -4140,12 +4171,18 @@ fn run_windows_frameless_browser(
                                 has_url_input,
                                 tab_count,
                                 codecs,
+                                h264_ok,
+                                aac_ok,
+                                mp4_avc_aac_ok,
+                                mse_avc_aac_ok,
+                                ua,
+                                webdriver,
                             } => {
                                 if let Some(ref mut sm) = smoke_tracker {
                                     sm.codecs_summary = codecs.clone();
                                     let summary = format!(
-                                        "bar={}x{}, viewport={}x{}, has_url_input={}, tab_count={}, codecs=[{}]",
-                                        bar_w, bar_h, body_w, body_h, has_url_input, tab_count, codecs
+                                        "bar={}x{}, viewport={}x{}, has_url_input={}, tab_count={}, webdriver={}, codecs=[{}], ua=\"{}\"",
+                                        bar_w, bar_h, body_w, body_h, has_url_input, tab_count, webdriver, codecs, ua
                                     );
                                     sm.probe_summary = summary.clone();
                                     sm.probe_ok = bar_h >= 40
@@ -4153,7 +4190,12 @@ fn run_windows_frameless_browser(
                                         && body_w >= 400
                                         && body_h >= 300
                                         && has_url_input
-                                        && tab_count >= 1;
+                                        && tab_count >= 1
+                                        && h264_ok
+                                        && aac_ok
+                                        && mp4_avc_aac_ok
+                                        && mse_avc_aac_ok
+                                        && !webdriver;
                                     sm.log(&format!(
                                         "SmokeProbe (2x rAF completed): ok={}, {}",
                                         sm.probe_ok, summary

@@ -37,4 +37,4 @@ cef-dox = ["cef/dox"]
 
 [target.'cfg(windows)'.dependencies]
 tao = "0.37"
-cef = { version = "156.7.0", default-features = false }
+cef = { version = "=150.2.1", default-features = false }

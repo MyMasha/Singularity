@@ -1,7 +1,7 @@
 //! Pure Chromium Embedded Framework (CEF) Runtime Engine for Singularity Browser on Windows.
 //!
 //! Replaces Microsoft Edge WebView2 (`wry` / `msedgewebview2.exe`) completely with pure
-//! Chromium (`libcef.dll` via `cef` 156.7.0):
+//! Chromium (`libcef.dll` via `cef` 150.2.1 / branch 7871 with proprietary H.264/AAC/HEVC codecs):
 //! - **Single Chromium Browser Process** shared across ALL Singularity windows & tabs
 //!   (one GPU process, one Network Service, one Storage Service — eliminates multi-window
 //!   WebView2 process-tree duplication!).
@@ -474,9 +474,11 @@ wrap_app! {
                     "disable-features",
                     "BackForwardCache,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls",
                 ),
+                ("enable-features", "PlatformHEVCDecoderSupport"),
+                ("disable-blink-features", "AutomationControlled"),
                 ("autoplay-policy", "no-user-gesture-required"),
                 ("disk-cache-size", "67108864"),
-                ("media-cache-size", "33554432"),
+                ("media-cache-size", "67108864"),
             ];
             for (k, v) in kv_switches {
                 cmd.append_switch_with_value(Some(&CefString::from(k)), Some(&CefString::from(v)));
@@ -1029,15 +1031,27 @@ fn is_same_platform_ecosystem(doc_host: &str, req_host: &str) -> bool {
         &[
             "tiktok.com",
             "tiktokv.com",
+            "tiktokv.eu",
+            "tiktokv.us",
             "tiktokw.us",
+            "tiktokw.eu",
             "tiktokcdn.com",
             "tiktokcdn-us.com",
             "tiktokcdn-eu.com",
+            "tiktokcdn-in.com",
             "byteoversea.com",
+            "bytedance.com",
+            "byteimg.com",
+            "bytescm.com",
             "ttwstatic.com",
+            "ttlivecdn.com",
+            "tiktokstaticb.com",
             "ibytedtos.com",
             "ibyteimg.com",
+            "muscdn.com",
             "musical.ly",
+            "sgsnssdk.com",
+            "isnssdk.com",
             "tiktokglobalshop.com",
         ],
         &[

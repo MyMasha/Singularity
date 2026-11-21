@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "cef"
-version = "156.7.0+156.0.31"
+version = "150.2.1+150.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "292ba28510070fe38679adb866cb0dc2f8b5ccced8fd29e56e561ccda98b8cfb"
+checksum = "b912d9d13dd63b4bffa750f1f3c49271dc96d6c91ca2d1c1f68a0172832170c8"
 dependencies = [
  "cef-dll-sys",
  "libloading",
@@ -254,12 +254,11 @@ dependencies = [
 
 [[package]]
 name = "cef-dll-sys"
-version = "156.7.0+156.0.31"
+version = "150.2.1+150.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdb47aa0db7e12990e90e37f5295ca7ec54446b35142ee8399442b53b9014f56"
+checksum = "31b1059b49a0d5aa3872035f076210a31df6d70e039e12427b41ceba7c650b49"
 dependencies = [
  "anyhow",
- "cc",
  "cmake",
  "download-cef",
  "serde_json",
@@ -651,9 +650,9 @@ dependencies = [
 
 [[package]]
 name = "download-cef"
-version = "3.0.1"
+version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "734444ee6a26f89cc9f883e9de0ced6b2afef7d4c561d7c949aeb13119f8f98d"
+checksum = "c169adf067a787e1f1c58ed62906a557de85388bee4b54fb878b722ff606b113"
 dependencies = [
  "bzip2",
  "clap",
@@ -2150,7 +2149,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "singularity-chromium-ffi"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "hex",
  "rand_core",
@@ -2163,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-core"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2176,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-installer"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "windows",
  "zip",
@@ -2184,14 +2183,14 @@ dependencies = [
 
 [[package]]
 name = "singularity-media"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "singularity-net-mullvad"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2205,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-settings-registry"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2215,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-ui"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "base64 0.22.1",
  "cef",
@@ -2241,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-vault"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "argon2",
  "base64 0.22.1",
