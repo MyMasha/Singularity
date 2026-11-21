@@ -53,8 +53,6 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    env:
-      CEF_PATH: ${{ env.USERPROFILE }}\.local\share\cef
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -65,12 +63,15 @@ jobs:
       - name: Cache Pure Chromium (CEF) SDK
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: ${{ env.USERPROFILE }}\.local\share\cef
+          path: ~/.local/share/cef
           key: cef-win64-156.7.0+156.0.31
 
-      - name: Ensure Ninja build tool is available for CEF C++ wrapper
+      - name: Configure CEF_PATH and Ninja build tool
         shell: pwsh
         run: |
+          $cefPath = Join-Path $env:USERPROFILE ".local\share\cef"
+          "CEF_PATH=$cefPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "CEF_PATH=$cefPath"
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
             $vsNinja = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "ninja.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($vsNinja) {
@@ -93,43 +94,9 @@ jobs:
           cargo build --release --locked --bin singularity
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # Stage Pure Chromium CEF runtime + singularity.exe (EN/FR locales only for lean installer size)
-          Remove-Item -Recurse -Force dist\stage -ErrorAction SilentlyContinue
-          Remove-Item -Force dist\singularity-bundle.zip -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path dist\stage\locales | Out-Null
-          Copy-Item target\release\singularity.exe dist\stage\singularity.exe -Force
-          foreach ($pat in @("*.dll", "*.dat", "*.bin", "*.pak", "vk_swiftshader_icd.json")) {
-            Get-ChildItem -Path target\release -Filter $pat -File -ErrorAction SilentlyContinue | ForEach-Object {
-              Copy-Item $_.FullName (Join-Path "dist\stage" $_.Name) -Force
-            }
-          }
-          foreach ($loc in @("en-US.pak", "fr.pak")) {
-            $srcLoc = Join-Path "target\release\locales" $loc
-            if (Test-Path $srcLoc) {
-              Copy-Item $srcLoc (Join-Path "dist\stage\locales" $loc) -Force
-            }
-          }
-          foreach ($reqFile in @("dist\stage\singularity.exe", "dist\stage\libcef.dll", "dist\stage\icudtl.dat", "dist\stage\resources.pak")) {
-            if (-not (Test-Path $reqFile)) {
-              Write-Error "Missing required Pure Chromium runtime file: $reqFile"
-              exit 1
-            }
-          }
-
-          # Compress staged bundle with maximum DEFLATE compression
-          @'
-import os, zipfile
-root = "dist/stage"
-out = "dist/singularity-bundle.zip"
-with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-    for dp, _, fns in os.walk(root):
-        for fn in sorted(fns):
-            full = os.path.join(dp, fn)
-            rel = os.path.relpath(full, root).replace("\\", "/")
-            zf.write(full, rel)
-print(f"Created {out}: {os.path.getsize(out) / 1048576:.2f} MB")
-'@ | python -
+          python scripts/package-windows-cef.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           Copy-Item target\release\singularity.exe dist\singularity.exe -Force
 
           cargo build --release --locked --bin Singularity-Setup
