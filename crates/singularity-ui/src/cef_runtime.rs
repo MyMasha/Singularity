@@ -29,6 +29,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const WINDOWS_TO_UNIX_EPOCH_US: i64 = 11_644_473_600_000_000;
@@ -46,6 +47,12 @@ extern "system" {
         uflags: u32,
     ) -> i32;
     fn ShowWindow(hwnd: *mut core::ffi::c_void, n_cmd_show: i32) -> i32;
+    fn InvalidateRect(
+        hwnd: *mut core::ffi::c_void,
+        lp_rect: *const core::ffi::c_void,
+        b_erase: i32,
+    ) -> i32;
+    fn UpdateWindow(hwnd: *mut core::ffi::c_void) -> i32;
     fn SetFocus(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
@@ -75,6 +82,11 @@ fn is_ctrl_or_mbutton_down_cef() -> bool {
 /// Callback events emitted from CEF browser/client handlers into `server.rs`'s `tao` event loop.
 #[derive(Debug, Clone)]
 pub enum CefCallbackEvent {
+    BrowserCreated {
+        tab_id: u64,
+        is_ui: bool,
+        hwnd: isize,
+    },
     UiIpc(String),
     ContentIpc {
         tab_id: u64,
@@ -87,6 +99,21 @@ pub enum CefCallbackEvent {
     PageFinished {
         tab_id: u64,
         url: String,
+        http_status: i32,
+    },
+    LoadError {
+        tab_id: u64,
+        is_ui: bool,
+        error_code: i32,
+        error_text: String,
+        failed_url: String,
+    },
+    RenderProcessTerminated {
+        tab_id: u64,
+        is_ui: bool,
+        status: i32,
+        error_code: i32,
+        error_string: String,
     },
     AddressChanged {
         tab_id: u64,
@@ -363,11 +390,16 @@ wrap_render_process_handler! {
 
 wrap_browser_process_handler! {
     struct SingularityBrowserProcessHandler {
+        context_initialized: Arc<AtomicBool>,
         on_pump: Option<CefPumpCallback>,
         on_relaunch: Option<CefRelaunchCallback>,
     }
 
     impl BrowserProcessHandler {
+        fn on_context_initialized(&self) {
+            self.context_initialized.store(true, Ordering::Release);
+        }
+
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
             if let Some(ref cb) = self.on_pump {
                 cb(delay_ms);
@@ -392,6 +424,7 @@ wrap_browser_process_handler! {
 wrap_app! {
     struct SingularityCefApp {
         extensions_dir: Option<PathBuf>,
+        context_initialized: Arc<AtomicBool>,
         on_pump: Option<CefPumpCallback>,
         on_relaunch: Option<CefRelaunchCallback>,
     }
@@ -464,6 +497,7 @@ wrap_app! {
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(SingularityBrowserProcessHandler::new(
+                Arc::clone(&self.context_initialized),
                 self.on_pump.clone(),
                 self.on_relaunch.clone(),
             ))
@@ -475,56 +509,68 @@ wrap_app! {
     }
 }
 
-/// MUST be called at the very entry of `main()` on Windows.
-/// - For CEF subprocesses (`--type=renderer`, `--type=gpu-process`, `--type=utility`, etc.),
-///   executes the Chromium subprocess cleanly and returns `Some(exit_code)`.
-/// - For the main browser process, returns `None` so Singularity proceeds with startup.
+/// MUST be called at the very entry of `main()` on Windows when `--type=...` is present.
+/// Executes the Chromium subprocess (`renderer`, `gpu-process`, `utility`, etc.) cleanly via
+/// CEF's native Win32 command-line parser (avoiding `Args::as_cmd_line()`, which loses quoting
+/// on Windows paths containing spaces!).
 pub fn maybe_run_cef_subprocess() -> Option<i32> {
     // Required in CEF 133+ before calling `execute_process` or `initialize`.
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
     let args = args::Args::new();
-    let is_subprocess = args
-        .as_cmd_line()
-        .map(|cl| cl.has_switch(Some(&CefString::from("type"))) != 0)
-        .unwrap_or(false);
-    if !is_subprocess {
-        return None;
-    }
-
-    let mut app = SingularityCefApp::new(None, None, None);
+    let mut app = SingularityCefApp::new(
+        None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+        None,
+    );
     let ret = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
     if ret >= 0 {
         Some(ret)
     } else {
-        Some(0)
+        None
     }
 }
 
 /// RAII guard for the single process-wide Chromium Embedded Framework runtime.
 pub struct CefRuntimeGuard {
     _initialized: bool,
+    context_initialized: Arc<AtomicBool>,
+    log_path: PathBuf,
 }
 
 impl CefRuntimeGuard {
     pub fn initialize(
         profile_dir: &Path,
         extensions_dir: &Path,
+        cef_log_path: Option<&Path>,
+        verbose_logging: bool,
         on_pump: CefPumpCallback,
         on_relaunch: CefRelaunchCallback,
     ) -> Result<Self, String> {
         let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
         let _ = std::fs::create_dir_all(profile_dir);
 
+        let context_initialized = Arc::new(AtomicBool::new(false));
         let args = args::Args::new();
         let mut app = SingularityCefApp::new(
             Some(extensions_dir.to_path_buf()),
+            Arc::clone(&context_initialized),
             Some(on_pump),
             Some(on_relaunch),
         );
 
         let profile_str = profile_dir.to_string_lossy().into_owned();
-        let settings = Settings {
+        let exe_path = std::env::current_exe().ok();
+        let exe_dir = exe_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+        let resolved_log = cef_log_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| profile_dir.parent().unwrap_or(profile_dir).join("cef.log"));
+        if let Some(parent) = resolved_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let mut settings = Settings {
             no_sandbox: 1,
             multi_threaded_message_loop: 0,
             external_message_pump: 1,
@@ -533,9 +579,24 @@ impl CefRuntimeGuard {
             cache_path: CefString::from(profile_str.as_str()),
             persist_session_cookies: 1,
             background_color: 0xFF00_0000, // OLED Pure Black (#000000) — zero white flash
-            log_severity: LogSeverity::DISABLE,
+            log_file: CefString::from(resolved_log.to_string_lossy().as_ref()),
+            log_severity: if verbose_logging {
+                LogSeverity::INFO
+            } else {
+                LogSeverity::WARNING
+            },
             ..Default::default()
         };
+        if let Some(ref exe) = exe_path {
+            settings.browser_subprocess_path = CefString::from(exe.to_string_lossy().as_ref());
+        }
+        if let Some(ref dir) = exe_dir {
+            settings.resources_dir_path = CefString::from(dir.to_string_lossy().as_ref());
+            let loc_dir = dir.join("locales");
+            if loc_dir.is_dir() {
+                settings.locales_dir_path = CefString::from(loc_dir.to_string_lossy().as_ref());
+            }
+        }
 
         let ok = initialize(
             Some(args.as_main_args()),
@@ -544,9 +605,42 @@ impl CefRuntimeGuard {
             std::ptr::null_mut(),
         );
         if ok == 0 {
-            return Err("CEF Chromium runtime initialization failed (another instance may own this profile).".to_string());
+            let code = get_exit_code();
+            return Err(format!(
+                "CEF Chromium runtime initialization failed (exit_code={}, another instance may own this profile).",
+                code
+            ));
         }
-        Ok(Self { _initialized: true })
+        Ok(Self {
+            _initialized: true,
+            context_initialized,
+            log_path: resolved_log,
+        })
+    }
+
+    /// Pumps CEF until `BrowserProcessHandler::on_context_initialized()` fires so browsers are
+    /// NEVER created before Chromium's BrowserContext & Mojo channels are ready.
+    pub fn wait_for_context_initialized(&self, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while !self.context_initialized.load(Ordering::Acquire) {
+            pump_cef_message_loop();
+            if self.context_initialized.load(Ordering::Acquire) {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    pub fn is_context_initialized(&self) -> bool {
+        self.context_initialized.load(Ordering::Acquire)
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 }
 
@@ -558,9 +652,39 @@ impl Drop for CefRuntimeGuard {
     }
 }
 
-/// Runs a single iteration of CEF's external message pump on the main UI thread.
+thread_local! {
+    static IN_CEF_PUMP: Cell<bool> = const { Cell::new(false) };
+    static PUMP_AGAIN: Cell<bool> = const { Cell::new(false) };
+}
+
+struct PumpReentrantReset;
+impl Drop for PumpReentrantReset {
+    fn drop(&mut self) {
+        IN_CEF_PUMP.with(|f| f.set(false));
+    }
+}
+
+/// Runs a single re-entrancy-safe iteration of CEF's external message pump on the main UI thread.
 pub fn pump_cef_message_loop() {
-    do_message_loop_work();
+    if IN_CEF_PUMP.with(|f| f.get()) {
+        PUMP_AGAIN.with(|f| f.set(true));
+        return;
+    }
+    for _ in 0..2 {
+        PUMP_AGAIN.with(|f| f.set(false));
+        IN_CEF_PUMP.with(|f| f.set(true));
+        let _reset = PumpReentrantReset;
+        do_message_loop_work();
+        drop(_reset);
+        if !PUMP_AGAIN.with(|f| f.get()) {
+            break;
+        }
+    }
+}
+
+/// Allows/disables nested Chromium task processing during native Win32 modal loops (drag/menus).
+pub fn set_cef_nestable_tasks_allowed(allowed: bool) {
+    set_nestable_tasks_allowed(if allowed { 1 } else { 0 });
 }
 
 /// Creates a pure in-memory incognito Chromium `RequestContext` (zero disk cookies or history).
@@ -613,6 +737,18 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let hwnd = browser
+                .and_then(|b| b.host())
+                .map(|h| h.window_handle().0 as isize)
+                .unwrap_or(0);
+            (self.cfg.sink)(CefCallbackEvent::BrowserCreated {
+                tab_id: self.cfg.tab_id,
+                is_ui: self.cfg.is_ui,
+                hwnd,
+            });
+        }
+
         fn on_before_popup(
             &self,
             _browser: Option<&mut Browser>,
@@ -753,7 +889,7 @@ wrap_load_handler! {
             frame: Option<&mut Frame>,
             _transition_type: TransitionType,
         ) {
-            if self.cfg.is_ui || self.cfg.is_ext_popup || self.cfg.tab_id == 0 {
+            if self.cfg.is_ext_popup || (!self.cfg.is_ui && self.cfg.tab_id == 0) {
                 return;
             }
             let Some(frame) = frame else {
@@ -775,9 +911,9 @@ wrap_load_handler! {
             &self,
             _browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
-            _http_status_code: ::std::os::raw::c_int,
+            http_status_code: ::std::os::raw::c_int,
         ) {
-            if self.cfg.is_ui || self.cfg.is_ext_popup || self.cfg.tab_id == 0 {
+            if self.cfg.is_ext_popup || (!self.cfg.is_ui && self.cfg.tab_id == 0) {
                 return;
             }
             let Some(frame) = frame else {
@@ -791,8 +927,33 @@ wrap_load_handler! {
                 (self.cfg.sink)(CefCallbackEvent::PageFinished {
                     tab_id: self.cfg.tab_id,
                     url: u,
+                    http_status: http_status_code,
                 });
             }
+        }
+
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            if error_code == Errorcode::ABORTED {
+                return;
+            }
+            let is_main = frame.map(|f| f.is_main() != 0).unwrap_or(true);
+            if !is_main {
+                return;
+            }
+            (self.cfg.sink)(CefCallbackEvent::LoadError {
+                tab_id: self.cfg.tab_id,
+                is_ui: self.cfg.is_ui,
+                error_code: *error_code.as_ref() as i32,
+                error_text: error_text.map(CefString::to_string).unwrap_or_default(),
+                failed_url: failed_url.map(CefString::to_string).unwrap_or_default(),
+            });
         }
     }
 }
@@ -931,6 +1092,22 @@ wrap_request_handler! {
             } else {
                 Some(SingularityResourceRequestHandler::new(self.cfg.clone()))
             }
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            (self.cfg.sink)(CefCallbackEvent::RenderProcessTerminated {
+                tab_id: self.cfg.tab_id,
+                is_ui: self.cfg.is_ui,
+                status: *status.as_ref() as i32,
+                error_code,
+                error_string: error_string.map(CefString::to_string).unwrap_or_default(),
+            });
         }
     }
 }
@@ -1100,6 +1277,12 @@ pub struct CefBrowserHandle {
 }
 
 impl CefBrowserHandle {
+    pub fn cache_hwnd(&self, hwnd: isize) {
+        if hwnd != 0 {
+            self.cached_hwnd.set(hwnd);
+        }
+    }
+
     pub fn hwnd(&self) -> *mut core::ffi::c_void {
         let cached = self.cached_hwnd.get();
         if cached != 0 {
@@ -1115,38 +1298,46 @@ impl CefBrowserHandle {
         core::ptr::null_mut()
     }
 
-    pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32) {
+    /// Resizes and positions the child CEF HWND in physical pixels. Returns `true` only if the
+    /// underlying Win32 HWND already existed (so callers do not poison layout caches on NULL HWND).
+    pub fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32) -> bool {
         const SWP_NOZORDER: u32 = 0x0004;
         const SWP_NOACTIVATE: u32 = 0x0010;
         let hwnd = self.hwnd();
-        if !hwnd.is_null() {
-            unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    core::ptr::null_mut(),
-                    x,
-                    y,
-                    w.max(1) as i32,
-                    h.max(1) as i32,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+        if hwnd.is_null() {
+            return false;
         }
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                core::ptr::null_mut(),
+                x,
+                y,
+                w.max(1) as i32,
+                h.max(1) as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        true
     }
 
-    pub fn set_visible(&self, visible: bool) {
+    /// Shows or hides the windowed child CEF HWND natively via Win32 `ShowWindow` (which signals
+    /// Chromium's `HWNDMessageHandler` cleanly without calling OSR-only `CefBrowserHost::WasHidden`).
+    pub fn set_visible(&self, visible: bool) -> bool {
         const SW_HIDE: i32 = 0;
         const SW_SHOWNOACTIVATE: i32 = 4;
         let hwnd = self.hwnd();
-        if !hwnd.is_null() {
-            unsafe {
-                let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        if hwnd.is_null() {
+            return false;
+        }
+        unsafe {
+            let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            if visible {
+                let _ = InvalidateRect(hwnd, core::ptr::null(), 0);
+                let _ = UpdateWindow(hwnd);
             }
         }
-        // Tell Chromium's compositor & renderer to drop GPU surfaces & throttle hidden tabs!
-        if let Some(host) = self.browser.host() {
-            host.was_hidden(if visible { 0 } else { 1 });
-        }
+        true
     }
 
     pub fn focus(&self) {

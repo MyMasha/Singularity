@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v2.0.1)"
+        description: "Release tag to build and publish assets for (e.g. v2.0.2)"
         required: false
-        default: "v2.0.1"
+        default: "v2.0.2"
 
 permissions:
   contents: read
@@ -125,7 +125,35 @@ jobs:
             }
           }
           Write-Host "[OK] Silent SFX extraction verified all Pure Chromium CEF runtime files"
-          Remove-Item -Recurse -Force $smokeDir -ErrorAction SilentlyContinue
+
+          # End-to-end REAL Pure Chromium (CEF) launch, V8 IPC, DOM/rAF & non-black pixel smoke test!
+          $smokeLog = Join-Path $env:RUNNER_TEMP "singularity-cef-smoke.log"
+          $smokeCefLog = Join-Path $env:RUNNER_TEMP "singularity-cef-runtime.log"
+          $smokeProf = Join-Path $env:RUNNER_TEMP "singularity-cef-profile"
+          Remove-Item -Force $smokeLog, $smokeCefLog -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force $smokeProf -ErrorAction SilentlyContinue
+          $pLaunch = Start-Process -FilePath (Join-Path $smokeDir "singularity.exe") `
+            -ArgumentList "--smoke-test-cef", "--smoke-log", $smokeLog, "--smoke-cef-log", $smokeCefLog, "--smoke-profile", $smokeProf `
+            -WorkingDirectory $env:RUNNER_TEMP -PassThru
+          if (-not $pLaunch.WaitForExit(60000)) {
+            Write-Host "=== CEF Smoke Test Timed Out After 60s — Killing Process ==="
+            try { $pLaunch.Kill($true) } catch {}
+            if (Test-Path $smokeLog) { Get-Content $smokeLog }
+            if (Test-Path $smokeCefLog) { Get-Content $smokeCefLog | Select-Object -Last 120 }
+            Write-Error "Real CEF UI launch smoke test TIMED OUT after 60s"
+            exit 1
+          }
+          Write-Host "=== CEF Smoke Test Log ==="
+          if (Test-Path $smokeLog) { Get-Content $smokeLog } else { Write-Host "(no smoke log written)" }
+          if ($pLaunch.ExitCode -ne 0) {
+            Write-Host "=== CEF Runtime Log ==="
+            if (Test-Path $smokeCefLog) { Get-Content $smokeCefLog | Select-Object -Last 120 } else { Write-Host "(no cef log written)" }
+            Write-Error "Real CEF UI launch smoke test FAILED with exit code $($pLaunch.ExitCode)"
+            exit 1
+          }
+          Write-Host "[OK] Real Windows Pure Chromium (CEF) UI launch, V8 IPC, DOM/rAF & pixel check PASSED!"
+          Remove-Item -Recurse -Force $smokeDir, $smokeProf -ErrorAction SilentlyContinue
+          Remove-Item -Force $smokeLog, $smokeCefLog -ErrorAction SilentlyContinue
 
           # Smoke-test /DELAYLOAD:libcef.dll: running singularity.exe ALONE (no libcef.dll!) must NOT fail with OS DLL error
           $isoDir = Join-Path $env:RUNNER_TEMP "singularity-no-cef-test"
@@ -195,7 +223,7 @@ jobs:
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v2.0.1"
+            TARGET_TAG="v2.0.2"
           fi
           if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes

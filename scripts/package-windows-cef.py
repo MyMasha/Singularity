@@ -80,10 +80,22 @@ def main() -> int:
         return 1
     print(f"[INFO] Staging Pure Chromium (CEF) runtime from: {cef_dir}")
 
+    staged_names: set[str] = set()
     for pattern in ("*.dll", "*.dat", "*.bin", "*.pak", "vk_swiftshader_icd.json"):
         for src in glob.glob(os.path.join(cef_dir, pattern)):
             if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(stage_dir, os.path.basename(src)))
+                name = os.path.basename(src)
+                shutil.copy2(src, os.path.join(stage_dir, name))
+                staged_names.add(name)
+
+    skipped = sorted(
+        entry
+        for entry in os.listdir(cef_dir)
+        if entry not in staged_names and entry != "locales"
+    )
+    print(f"[INFO] Staged CEF root files ({len(staged_names)}): {', '.join(sorted(staged_names))}")
+    if skipped:
+        print(f"[INFO] Unstaged entries in CEF dir: {', '.join(skipped[:20])}")
 
     locales_src = os.path.join(cef_dir, "locales")
     for loc in ("en-US.pak", "fr.pak"):

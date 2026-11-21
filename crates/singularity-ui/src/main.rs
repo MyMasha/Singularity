@@ -3,16 +3,17 @@
 
 use singularity_ui::{
     execute_self_update, execute_uninstall, perform_startup_maintenance,
-    run_interactive_browser_app, SingularityBrowserShell,
+    run_interactive_browser_app, run_interactive_browser_app_with_smoke, CefSmokeTestOptions,
+    SingularityBrowserShell,
 };
 
 fn main() {
     // 0. Pure Chromium (CEF) multi-process entry point: renderer, GPU, network, and utility
-    //    subprocesses re-execute `singularity.exe --type=...`. Checking `--type=` in pure Rust
-    //    FIRST prevents delay-loaded `libcef.dll` from being touched during CLI flags (`--version`,
-    //    `--update`, `--uninstall`) or self-healing runtime bootstrap!
+    //    subprocesses re-execute `singularity.exe --type=...`. Checking `--type=` / `--type` in
+    //    pure Rust FIRST prevents delay-loaded `libcef.dll` from being touched during CLI flags
+    //    (`--version`, `--update`, `--uninstall`) or self-healing runtime bootstrap!
     #[cfg(target_os = "windows")]
-    if std::env::args().any(|a| a.starts_with("--type=")) {
+    if std::env::args().any(|a| a.starts_with("--type=") || a == "--type") {
         singularity_ui::updater::configure_local_cef_dll_directory();
         if let Some(exit_code) = singularity_ui::cef_runtime::maybe_run_cef_subprocess() {
             std::process::exit(exit_code);
@@ -43,6 +44,7 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    let smoke_test_cef = args.iter().any(|a| a == "--smoke-test-cef");
     let force_new_window = args.iter().any(|a| a == "--new-window");
     let detach_handoff_id = args
         .windows(2)
@@ -61,6 +63,9 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to boot Singularity Browser Engine: {}", e);
+            if smoke_test_cef {
+                std::process::exit(1);
+            }
             return;
         }
     };
@@ -82,12 +87,50 @@ fn main() {
     #[cfg(target_os = "windows")]
     {
         if !singularity_ui::updater::has_local_cef_runtime() {
+            if smoke_test_cef {
+                eprintln!("Smoke test failed: missing local CEF runtime alongside singularity.exe");
+                std::process::exit(1);
+            }
             if let Err(err) = singularity_ui::updater::bootstrap_missing_cef_runtime() {
                 singularity_ui::updater::show_missing_cef_error_dialog(&err);
             }
             return;
         }
         singularity_ui::updater::configure_local_cef_dll_directory();
+    }
+
+    if smoke_test_cef {
+        let base_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(std::env::temp_dir);
+        let log_path = args
+            .windows(2)
+            .find(|w| w[0] == "--smoke-log")
+            .map(|w| std::path::PathBuf::from(&w[1]))
+            .unwrap_or_else(|| base_dir.join("singularity-smoke.log"));
+        let cef_log_path = args
+            .windows(2)
+            .find(|w| w[0] == "--smoke-cef-log")
+            .map(|w| std::path::PathBuf::from(&w[1]))
+            .unwrap_or_else(|| base_dir.join("singularity-smoke-cef.log"));
+        let profile_dir = args
+            .windows(2)
+            .find(|w| w[0] == "--smoke-profile")
+            .map(|w| std::path::PathBuf::from(&w[1]))
+            .unwrap_or_else(|| std::env::temp_dir().join("singularity-smoke-cef-profile"));
+        let opts = CefSmokeTestOptions {
+            log_path: log_path.clone(),
+            cef_log_path,
+            profile_dir,
+            timeout_secs: 25,
+        };
+        if let Err(err) = run_interactive_browser_app_with_smoke(shell, Some(opts)) {
+            let _ = std::fs::write(&log_path, format!("[SMOKE] FATAL: {}\n", err));
+            eprintln!("Singularity CEF smoke test failed: {}", err);
+            std::process::exit(1);
+        }
+        return;
     }
 
     if let Err(err) = run_interactive_browser_app(shell) {

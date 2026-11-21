@@ -29,7 +29,9 @@ pub use roaming_store::{
     EncryptedAuthTokenRecord, RoamingSingularityStore, SavedTabEntry, SavedTabGroup,
     WindowGeometry, WindowRestorePayload, WindowSessionFile,
 };
-pub use server::run_interactive_browser_app;
+pub use server::{
+    run_interactive_browser_app, run_interactive_browser_app_with_smoke, CefSmokeTestOptions,
+};
 pub use shaders::{BLACK_HOLE_LENSING_WGSL_SHADER, CURSOR_ACCRETION_TRAIL_WGSL_SHADER};
 pub use shell::SingularityBrowserShell;
 pub use theme::{
@@ -785,11 +787,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.2");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.1"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.2"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1179,7 +1181,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.1"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.2"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1202,19 +1204,31 @@ mod tests {
         assert!(server_src.contains("CefRuntimeGuard"));
         assert!(server_src.contains("window_sessions"));
         assert!(server_src.contains("x-singularity-window"));
+        assert!(server_src.contains("ensure_win32_clip_children"));
+        assert!(server_src.contains("WS_CLIPCHILDREN"));
+        assert!(server_src.contains("wait_for_context_initialized"));
+        assert!(server_src.contains("PrintWindow"));
 
         let main_src = include_str!("main.rs");
         assert!(main_src.contains("maybe_run_cef_subprocess"));
         assert!(main_src.contains("has_local_cef_runtime"));
         assert!(main_src.contains("bootstrap_missing_cef_runtime"));
         assert!(main_src.contains("configure_local_cef_dll_directory"));
+        assert!(main_src.contains("--smoke-test-cef"));
 
-        // 2. Pure Chromium CEF low-RAM flags, real network-layer uBlock, and Win32 working-set trim
+        // 2. Pure Chromium CEF low-RAM flags, real network-layer uBlock, and black-screen invariants
         let cef_src = include_str!("cef_runtime.rs");
         assert!(cef_src.contains("process-per-site"));
         assert!(cef_src.contains("BackForwardCache"));
         assert!(cef_src.contains("on_before_resource_load"));
-        assert!(cef_src.contains("was_hidden"));
+        assert!(!cef_src.contains("host.was_hidden("));
+        assert!(!cef_src.contains("args.as_cmd_line()"));
+        assert!(cef_src.contains("on_context_initialized"));
+        assert!(cef_src.contains("on_after_created"));
+        assert!(cef_src.contains("on_load_error"));
+        assert!(cef_src.contains("on_render_process_terminated"));
+        assert!(cef_src.contains("IN_CEF_PUMP"));
+        assert!(cef_src.contains("browser_subprocess_path"));
         assert!(cef_src.contains("K32EmptyWorkingSet"));
         assert!(cef_src.contains("trim_process_working_set"));
         assert!(cef_src.contains("on_already_running_app_relaunch"));

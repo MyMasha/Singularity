@@ -330,8 +330,25 @@ impl HttpResponse {
     }
 }
 
+/// Configuration for `--smoke-test-cef` end-to-end Windows Pure Chromium verification.
+#[derive(Debug, Clone)]
+pub struct CefSmokeTestOptions {
+    pub log_path: std::path::PathBuf,
+    pub cef_log_path: std::path::PathBuf,
+    pub profile_dir: std::path::PathBuf,
+    pub timeout_secs: u64,
+}
+
 /// Boots the Singularity Rust IPC server on an ephemeral loopback port and opens the desktop shell.
 pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(), String> {
+    run_interactive_browser_app_with_smoke(shell, None)
+}
+
+/// Boots the Singularity Rust IPC server and optional real-window CEF smoke-test verifier.
+pub fn run_interactive_browser_app_with_smoke(
+    shell: SingularityBrowserShell,
+    smoke: Option<CefSmokeTestOptions>,
+) -> Result<(), String> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("Failed to bind local IPC server: {}", e))?;
 
@@ -359,12 +376,17 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
             })
             .map_err(|e| format!("Failed spawning HTTP accept thread: {}", e))?;
 
+        let is_smoke = smoke.is_some();
         if let Err(err) = run_windows_frameless_browser(
             local_addr.port(),
             &cfg,
             Arc::clone(&shared_shell),
+            smoke,
         ) {
             eprintln!("Singularity Chromium CEF error: {}", err);
+            if is_smoke {
+                return Err(err);
+            }
             launch_native_chromium_window(&app_url);
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
@@ -375,6 +397,7 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = smoke;
         launch_native_chromium_window(&app_url);
         for stream in listener.incoming().flatten() {
             pool.submit(stream, &active_conns);
@@ -388,6 +411,7 @@ fn run_windows_frameless_browser(
     bind_port: u16,
     server_cfg: &ServerConfig,
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
+    smoke_opt: Option<CefSmokeTestOptions>,
 ) -> Result<(), String> {
     use tao::dpi::{
         LogicalSize, PhysicalPosition as TaoPhysicalPosition, PhysicalSize as TaoPhysicalSize, Size,
@@ -404,6 +428,8 @@ fn run_windows_frameless_browser(
         OpenNewWindowInProcess,
         AdoptExternalTab(TabHandoffPayload),
         UiStartupWatchdog(WindowId),
+        SmokeCheckPixels(WindowId),
+        SmokeTimeout,
         CookieHygieneDone {
             win_id: WindowId,
             mode: &'static str,
@@ -424,6 +450,20 @@ fn run_windows_frameless_browser(
     #[serde(tag = "cmd", rename_all = "snake_case")]
     enum UiIpcCmd {
         UiReady,
+        SmokeProbe {
+            #[serde(default)]
+            bar_h: i32,
+            #[serde(default)]
+            bar_w: i32,
+            #[serde(default)]
+            body_w: i32,
+            #[serde(default)]
+            body_h: i32,
+            #[serde(default)]
+            has_url_input: bool,
+            #[serde(default)]
+            tab_count: i32,
+        },
         DragWindow,
         DragResize {
             direction: String,
@@ -602,6 +642,7 @@ fn run_windows_frameless_browser(
         was_maximized_before_fs: bool,
         last_maximized: Option<bool>,
         ui_ready_received: bool,
+        ui_recovery_attempts: u8,
         was_minimized: bool,
         ext_popup: Option<(String, WindowId, bool, Window, CefBrowserHandle)>,
         last_ext_popup_closed: Option<(String, std::time::Instant)>,
@@ -617,6 +658,11 @@ fn run_windows_frameless_browser(
         }
 
         fn sync_layout(&mut self) {
+            // Re-enforce WS_CLIPCHILDREN on tao's parent HWND (tao's WindowFlags::apply_diff
+            // strips it on set_visible / set_maximized / set_fullscreen, causing WM_ERASEBKGND
+            // to paint solid black directly over child Chromium HWNDs!).
+            ensure_win32_clip_children(self.window.hwnd() as *mut core::ffi::c_void);
+
             let phys = self.window.inner_size();
             if phys.width == 0 || phys.height == 0 {
                 return;
@@ -645,13 +691,11 @@ fn run_windows_frameless_browser(
                 rect: Option<(i32, i32, u32, u32)>,
             ) {
                 if let Some(r) = rect {
-                    if cache.ui_bounds != Some(r) {
-                        ui_b.set_bounds(r.0, r.1, r.2, r.3);
+                    if cache.ui_bounds != Some(r) && ui_b.set_bounds(r.0, r.1, r.2, r.3) {
                         cache.ui_bounds = Some(r);
                     }
                 }
-                if cache.ui_visible != Some(vis) {
-                    ui_b.set_visible(vis);
+                if cache.ui_visible != Some(vis) && ui_b.set_visible(vis) {
                     cache.ui_visible = Some(vis);
                 }
             }
@@ -664,13 +708,13 @@ fn run_windows_frameless_browser(
                 rect: Option<(i32, i32, u32, u32)>,
             ) {
                 if let Some(r) = rect {
-                    if cache.tab_bounds.get(&tid).copied() != Some(r) {
-                        b.set_bounds(r.0, r.1, r.2, r.3);
+                    if cache.tab_bounds.get(&tid).copied() != Some(r)
+                        && b.set_bounds(r.0, r.1, r.2, r.3)
+                    {
                         cache.tab_bounds.insert(tid, r);
                     }
                 }
-                if cache.tab_visible.get(&tid).copied() != Some(vis) {
-                    b.set_visible(vis);
+                if cache.tab_visible.get(&tid).copied() != Some(vis) && b.set_visible(vis) {
                     cache.tab_visible.insert(tid, vis);
                 }
             }
@@ -732,6 +776,7 @@ fn run_windows_frameless_browser(
                     self.window.set_maximized(true);
                 }
             }
+            ensure_win32_clip_children(self.window.hwnd() as *mut core::ffi::c_void);
             self.layout_cache.invalidate_ui();
             self.sync_layout();
             self.sync_maximized(false);
@@ -910,8 +955,221 @@ fn run_windows_frameless_browser(
         }
     }
 
+    fn ensure_win32_clip_children(hwnd: *mut core::ffi::c_void) {
+        if hwnd.is_null() {
+            return;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongPtrW(hwnd: *mut core::ffi::c_void, n_index: i32) -> isize;
+            fn SetWindowLongPtrW(
+                hwnd: *mut core::ffi::c_void,
+                n_index: i32,
+                dw_new_long: isize,
+            ) -> isize;
+            fn SetWindowPos(
+                hwnd: *mut core::ffi::c_void,
+                hwnd_insert_after: *mut core::ffi::c_void,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                uflags: u32,
+            ) -> i32;
+        }
+        const GWL_STYLE: i32 = -16;
+        const WS_CLIPCHILDREN: isize = 0x0200_0000;
+        const WS_CLIPSIBLINGS: isize = 0x0400_0000;
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_FRAMECHANGED: u32 = 0x0020;
+        unsafe {
+            let cur = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let want = cur | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+            if want != cur {
+                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, want);
+                let _ = SetWindowPos(
+                    hwnd,
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+
+    fn has_win32_clip_children(hwnd: *mut core::ffi::c_void) -> bool {
+        if hwnd.is_null() {
+            return false;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongPtrW(hwnd: *mut core::ffi::c_void, n_index: i32) -> isize;
+        }
+        const GWL_STYLE: i32 = -16;
+        const WS_CLIPCHILDREN: isize = 0x0200_0000;
+        unsafe { (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CLIPCHILDREN) != 0 }
+    }
+
+    /// Captures rendered pixels of a Win32 window via `PrintWindow(PW_RENDERFULLCONTENT)` and
+    /// returns `(capture_ok, width, height, bar_non_black_pixels, total_non_black_pixels, max_luma)`.
+    fn capture_window_non_black_pixels(
+        hwnd: *mut core::ffi::c_void,
+    ) -> (bool, i32, i32, usize, usize, u8) {
+        if hwnd.is_null() {
+            return (false, 0, 0, 0, 0, 0);
+        }
+        #[repr(C)]
+        struct BitmapInfoHeader {
+            bi_size: u32,
+            bi_width: i32,
+            bi_height: i32,
+            bi_planes: u16,
+            bi_bit_count: u16,
+            bi_compression: u32,
+            bi_size_image: u32,
+            bi_x_pels_per_meter: i32,
+            bi_y_pels_per_meter: i32,
+            bi_clr_used: u32,
+            bi_clr_important: u32,
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetDC(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+            fn ReleaseDC(hwnd: *mut core::ffi::c_void, hdc: *mut core::ffi::c_void) -> i32;
+            fn PrintWindow(
+                hwnd: *mut core::ffi::c_void,
+                hdc_blt: *mut core::ffi::c_void,
+                n_flags: u32,
+            ) -> i32;
+        }
+        #[link(name = "gdi32")]
+        extern "system" {
+            fn CreateCompatibleDC(hdc: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+            fn CreateCompatibleBitmap(
+                hdc: *mut core::ffi::c_void,
+                cx: i32,
+                cy: i32,
+            ) -> *mut core::ffi::c_void;
+            fn SelectObject(
+                hdc: *mut core::ffi::c_void,
+                h: *mut core::ffi::c_void,
+            ) -> *mut core::ffi::c_void;
+            fn DeleteObject(ho: *mut core::ffi::c_void) -> i32;
+            fn DeleteDC(hdc: *mut core::ffi::c_void) -> i32;
+            fn GetDIBits(
+                hdc: *mut core::ffi::c_void,
+                hbm: *mut core::ffi::c_void,
+                start: u32,
+                c_lines: u32,
+                lpv_bits: *mut core::ffi::c_void,
+                lpbmi: *mut BitmapInfoHeader,
+                usage: u32,
+            ) -> i32;
+        }
+        const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
+        const BI_RGB: u32 = 0;
+        const DIB_RGB_COLORS: u32 = 0;
+
+        let mut rc = WinRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            if GetWindowRect(hwnd, &mut rc) == 0 {
+                return (false, 0, 0, 0, 0, 0);
+            }
+            let w = (rc.right - rc.left).clamp(0, 4096);
+            let h = (rc.bottom - rc.top).clamp(0, 4096);
+            if w <= 0 || h <= 0 {
+                return (false, w, h, 0, 0, 0);
+            }
+            let wnd_dc = GetDC(hwnd);
+            if wnd_dc.is_null() {
+                return (false, w, h, 0, 0, 0);
+            }
+            let mem_dc = CreateCompatibleDC(wnd_dc);
+            if mem_dc.is_null() {
+                let _ = ReleaseDC(hwnd, wnd_dc);
+                return (false, w, h, 0, 0, 0);
+            }
+            let bmp = CreateCompatibleBitmap(wnd_dc, w, h);
+            if bmp.is_null() {
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(hwnd, wnd_dc);
+                return (false, w, h, 0, 0, 0);
+            }
+            let old = SelectObject(mem_dc, bmp);
+            let pw_ok = PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT) != 0;
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            let mut bmi = BitmapInfoHeader {
+                bi_size: core::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: w,
+                bi_height: -h, // top-down DIB
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            };
+            let dib_ok = pw_ok
+                && GetDIBits(
+                    mem_dc,
+                    bmp,
+                    0,
+                    h as u32,
+                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    &mut bmi,
+                    DIB_RGB_COLORS,
+                ) > 0;
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(hwnd, wnd_dc);
+
+            if !dib_ok {
+                return (false, w, h, 0, 0, 0);
+            }
+            let bar_rows = (64i32).min(h) as usize;
+            let mut bar_non_black = 0usize;
+            let mut total_non_black = 0usize;
+            let mut max_luma = 0u8;
+            for y in 0..(h as usize) {
+                let row_off = y * (w as usize) * 4;
+                for x in 0..(w as usize) {
+                    let i = row_off + x * 4;
+                    let b = buf[i];
+                    let g = buf[i + 1];
+                    let r = buf[i + 2];
+                    let luma = r.max(g).max(b);
+                    if luma > max_luma {
+                        max_luma = luma;
+                    }
+                    if luma > 8 {
+                        total_non_black += 1;
+                        if y < bar_rows {
+                            bar_non_black += 1;
+                        }
+                    }
+                }
+            }
+            (true, w, h, bar_non_black, total_non_black, max_luma)
+        }
+    }
+
     fn enable_win32_immersive_dark_window(hwnd: *mut core::ffi::c_void) {
         apply_win32_black_class_brush(hwnd);
+        ensure_win32_clip_children(hwnd);
         if hwnd.is_null() {
             return;
         }
@@ -2029,14 +2287,81 @@ fn run_windows_frameless_browser(
             detach_pos,
         )
     };
+    let (cef_profile_dir, cef_log_override, cef_verbose) = if let Some(ref sm) = smoke_opt {
+        (sm.profile_dir.clone(), Some(sm.cef_log_path.clone()), true)
+    } else {
+        (
+            cef_profile_dir,
+            None,
+            std::env::var_os("SINGULARITY_CEF_VERBOSE").is_some(),
+        )
+    };
     let _ = std::fs::create_dir_all(&cef_profile_dir);
     let _ = std::fs::create_dir_all(&extensions_dir);
+
+    struct SmokeTracker {
+        opts: CefSmokeTestOptions,
+        started_at: std::time::Instant,
+        context_initialized: bool,
+        browser_created: bool,
+        ui_http_status: Option<i32>,
+        ui_ready: bool,
+        probe_ok: bool,
+        probe_summary: String,
+        fatal_error: Option<String>,
+        finished: bool,
+    }
+    impl SmokeTracker {
+        fn new(opts: CefSmokeTestOptions) -> Self {
+            if let Some(p) = opts.log_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&opts.log_path, "");
+            Self {
+                opts,
+                started_at: std::time::Instant::now(),
+                context_initialized: false,
+                browser_created: false,
+                ui_http_status: None,
+                ui_ready: false,
+                probe_ok: false,
+                probe_summary: String::new(),
+                fatal_error: None,
+                finished: false,
+            }
+        }
+        fn log(&self, msg: &str) {
+            let line = format!("[SMOKE +{:>5}ms] {}\n", self.started_at.elapsed().as_millis(), msg);
+            eprint!("{}", line);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.opts.log_path)
+            {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.flush();
+            }
+        }
+    }
+
+    let mut smoke_tracker = smoke_opt.clone().map(SmokeTracker::new);
+    if let Some(ref sm) = smoke_tracker {
+        sm.log(&format!(
+            "Starting Singularity v{} CEF smoke test (bind_port={}, profile={}, cef_log={})",
+            env!("CARGO_PKG_VERSION"),
+            bind_port,
+            cef_profile_dir.display(),
+            sm.opts.cef_log_path.display()
+        ));
+    }
 
     let pump_proxy = proxy.clone();
     let relaunch_proxy = proxy.clone();
     let cef_guard_res = CefRuntimeGuard::initialize(
         &cef_profile_dir,
         &extensions_dir,
+        cef_log_override.as_deref(),
+        cef_verbose,
         Arc::new(move |delay_ms| {
             let _ = pump_proxy.send_event(WinEvent::CefPump(delay_ms));
         }),
@@ -2047,21 +2372,37 @@ fn run_windows_frameless_browser(
     let cef_guard = match cef_guard_res {
         Ok(g) => g,
         Err(e) => {
-            // If another Singularity instance already owns the CEF profile, CEF forwarded our
-            // relaunch via `on_already_running_app_relaunch` (opening a new window in-process).
-            let has_other_live = shared_shell
-                .lock()
-                .map(|s| !s.roaming.list_other_live_windows().is_empty())
-                .unwrap_or(false);
-            if has_other_live {
-                return Ok(());
+            if let Some(ref sm) = smoke_tracker {
+                sm.log(&format!("FAIL: CefRuntimeGuard::initialize failed: {}", e));
+            }
+            if smoke_opt.is_none() {
+                // If another Singularity instance already owns the CEF profile, CEF forwarded our
+                // relaunch via `on_already_running_app_relaunch` (opening a new window in-process).
+                let has_other_live = shared_shell
+                    .lock()
+                    .map(|s| !s.roaming.list_other_live_windows().is_empty())
+                    .unwrap_or(false);
+                if has_other_live {
+                    return Ok(());
+                }
             }
             return Err(e);
         }
     };
+    let ctx_ready = cef_guard.wait_for_context_initialized(Duration::from_secs(5));
+    if let Some(ref mut sm) = smoke_tracker {
+        sm.context_initialized = ctx_ready;
+        sm.log(&format!(
+            "CEF initialized (log={}), on_context_initialized={}",
+            cef_guard.log_path().display(),
+            ctx_ready
+        ));
+    }
 
     // Hydrate any missing encrypted Roaming auth cookies into Chromium's CookieManager
-    cef_runtime::hydrate_cookies_from_roaming_cef(&shared_shell);
+    if smoke_opt.is_none() {
+        cef_runtime::hydrate_cookies_from_roaming_cef(&shared_shell);
+    }
 
     let download_resolver: CefDownloadResolver = Arc::new(|suggested: &str, uri: &str| {
         let dir = resolve_user_downloads_dir();
@@ -2164,12 +2505,15 @@ fn run_windows_frameless_browser(
             Arc::clone(download_resolver),
         )?;
 
-        apply_win32_black_class_brush(ui_browser.hwnd());
         window.set_visible(true);
         if override_pos.is_none() && saved_geom.maximized {
             window.set_maximized(true);
         }
-        ui_browser.set_visible(true);
+        // CRITICAL: tao's set_visible() / set_maximized() rewrites GWL_STYLE without
+        // WS_CLIPCHILDREN — restore WS_CLIPCHILDREN immediately so tao's WM_ERASEBKGND
+        // never paints solid black over the child Chromium HWND!
+        ensure_win32_clip_children(window.hwnd() as *mut core::ffi::c_void);
+        let _ = ui_browser.set_visible(true);
         ui_browser.focus();
 
         // One-shot startup watchdog per window
@@ -2201,12 +2545,14 @@ fn run_windows_frameless_browser(
             was_maximized_before_fs: false,
             last_maximized: None,
             ui_ready_received: false,
+            ui_recovery_attempts: 0,
             was_minimized: false,
             ext_popup: None,
             last_ext_popup_closed: None,
         };
         st.capture_geometry(server_cfg, shared_shell);
         st.sync_layout();
+        cef_runtime::pump_cef_message_loop();
         Ok((win_id, st))
     }
 
@@ -2224,7 +2570,20 @@ fn run_windows_frameless_browser(
         primary_session,
         startup_pos,
     )?;
-    {
+    if let Some(ref sm) = smoke_tracker {
+        let p_hwnd = primary_state.window.hwnd() as *mut core::ffi::c_void;
+        let ui_hwnd = primary_state.ui_browser.hwnd();
+        let phys = primary_state.window.inner_size();
+        sm.log(&format!(
+            "Primary window created (inner={}x{}, parent_ws_clipchildren={}, ui_hwnd=0x{:x}, ui_visible={})",
+            phys.width,
+            phys.height,
+            has_win32_clip_children(p_hwnd),
+            ui_hwnd as usize,
+            if ui_hwnd.is_null() { 0 } else { unsafe { IsWindowVisible(ui_hwnd) } }
+        ));
+    }
+    if smoke_opt.is_none() {
         let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
         shell.roaming.register_live_window(
             bind_port,
@@ -2236,42 +2595,56 @@ fn run_windows_frameless_browser(
 
     // Multi-window restart: open EVERY restored sibling window separately right inside this
     // SAME single low-RAM Chromium process (zero duplicate Chromium Browser/GPU/Network trees!)
-    for rid in pending_restore_ids {
-        if let Some(rp) =
-            crate::roaming_store::RoamingSingularityStore::consume_window_restore_handoff(
-                &root_dir, &rid,
-            )
-        {
-            let sid = crate::roaming_store::RoamingSingularityStore::new_window_session_id();
-            let sess = WindowTabSession {
-                saved_tabs: rp.tabs,
-                saved_tab_groups: rp.tab_groups,
-                active_tab_index: rp.active_tab_index,
-                geometry: rp.geometry,
-                is_detached_handoff: false,
-                is_secondary_live_window: true,
-                restored_windows_count: 1,
-            };
-            if let Ok((swid, sst)) = create_browser_window(
-                &event_loop,
-                bind_port,
-                server_cfg,
-                &shared_shell,
-                &proxy,
-                &download_resolver,
-                sid,
-                sess,
-                None,
-            ) {
-                windows.insert(swid, sst);
+    if smoke_opt.is_none() {
+        for rid in pending_restore_ids {
+            if let Some(rp) =
+                crate::roaming_store::RoamingSingularityStore::consume_window_restore_handoff(
+                    &root_dir, &rid,
+                )
+            {
+                let sid = crate::roaming_store::RoamingSingularityStore::new_window_session_id();
+                let sess = WindowTabSession {
+                    saved_tabs: rp.tabs,
+                    saved_tab_groups: rp.tab_groups,
+                    active_tab_index: rp.active_tab_index,
+                    geometry: rp.geometry,
+                    is_detached_handoff: false,
+                    is_secondary_live_window: true,
+                    restored_windows_count: 1,
+                };
+                if let Ok((swid, sst)) = create_browser_window(
+                    &event_loop,
+                    bind_port,
+                    server_cfg,
+                    &shared_shell,
+                    &proxy,
+                    &download_resolver,
+                    sid,
+                    sess,
+                    None,
+                ) {
+                    windows.insert(swid, sst);
+                }
             }
         }
     }
 
+    if let Some(ref sm_opts) = smoke_opt {
+        let timeout_proxy = proxy.clone();
+        let secs = sm_opts.timeout_secs.max(5);
+        let _ = std::thread::Builder::new()
+            .name("singularity-smoke-timeout".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                std::thread::sleep(Duration::from_secs(secs));
+                let _ = timeout_proxy.send_event(WinEvent::SmokeTimeout);
+            });
+    }
+
     let cfg_clone = server_cfg.clone();
     let mut cef_guard = Some(cef_guard);
-    let mut next_cef_pump: Option<std::time::Instant> =
-        Some(std::time::Instant::now() + Duration::from_millis(8));
+    let mut next_cef_pump: std::time::Instant =
+        std::time::Instant::now() + Duration::from_millis(8);
     let mut last_media_disk_flush = std::time::Instant::now()
         .checked_sub(Duration::from_secs(10))
         .unwrap_or_else(std::time::Instant::now);
@@ -2401,26 +2774,38 @@ fn run_windows_frameless_browser(
     }
 
     event_loop.run(move |event, elwt, control_flow| {
-        *control_flow = match next_cef_pump {
-            Some(deadline) => ControlFlow::WaitUntil(deadline),
-            None => ControlFlow::Wait,
+        let fallback_pump_ms: u64 = if windows.values().all(|st| st.was_minimized) {
+            100
+        } else {
+            16
+        };
+        let now_tick = std::time::Instant::now();
+        let max_deadline = now_tick + Duration::from_millis(fallback_pump_ms);
+        if next_cef_pump > max_deadline {
+            next_cef_pump = max_deadline;
+        }
+        *control_flow = if cef_guard.is_some() {
+            ControlFlow::WaitUntil(next_cef_pump)
+        } else {
+            ControlFlow::Exit
         };
 
         match event {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                next_cef_pump = None;
                 cef_runtime::pump_cef_message_loop();
+                next_cef_pump = std::time::Instant::now() + Duration::from_millis(fallback_pump_ms);
             }
             Event::MainEventsCleared => {
-                if let Some(deadline) = next_cef_pump {
-                    if std::time::Instant::now() >= deadline {
-                        next_cef_pump = None;
-                        cef_runtime::pump_cef_message_loop();
-                    }
+                let now = std::time::Instant::now();
+                if now >= next_cef_pump {
+                    cef_runtime::pump_cef_message_loop();
+                    next_cef_pump =
+                        std::time::Instant::now() + Duration::from_millis(fallback_pump_ms);
                 }
-                *control_flow = match next_cef_pump {
-                    Some(deadline) => ControlFlow::WaitUntil(deadline),
-                    None => ControlFlow::Wait,
+                *control_flow = if cef_guard.is_some() {
+                    ControlFlow::WaitUntil(next_cef_pump)
+                } else {
+                    ControlFlow::Exit
                 };
             }
             Event::WindowEvent {
@@ -2505,11 +2890,10 @@ fn run_windows_frameless_browser(
                 if let Some(st) = windows.get_mut(&window_id) {
                     if new_size.width == 0 || new_size.height == 0 {
                         st.was_minimized = true;
-                        // Inform Chromium to release GPU surfaces & trim OS working set while minimized!
-                        st.ui_browser.set_visible(false);
+                        let _ = st.ui_browser.set_visible(false);
                         st.layout_cache.ui_visible = Some(false);
                         if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
-                            b.set_visible(false);
+                            let _ = b.set_visible(false);
                             st.layout_cache.tab_visible.insert(st.active_tab_id, false);
                         }
                         cef_runtime::trim_process_working_set();
@@ -2527,7 +2911,7 @@ fn run_windows_frameless_browser(
                     for st in windows.values() {
                         if let Some((_, pid, _, _, pb)) = st.ext_popup.as_ref() {
                             if *pid == window_id {
-                                pb.set_bounds(0, 0, new_size.width.max(1), new_size.height.max(1));
+                                let _ = pb.set_bounds(0, 0, new_size.width.max(1), new_size.height.max(1));
                                 break;
                             }
                         }
@@ -2563,15 +2947,15 @@ fn run_windows_frameless_browser(
             Event::UserEvent(win_evt) => match win_evt {
                 WinEvent::CefPump(delay_ms) => {
                     if delay_ms <= 0 {
-                        next_cef_pump = None;
                         cef_runtime::pump_cef_message_loop();
+                        next_cef_pump =
+                            std::time::Instant::now() + Duration::from_millis(fallback_pump_ms);
                     } else {
                         let target = std::time::Instant::now()
-                            + Duration::from_millis((delay_ms as u64).min(50));
-                        next_cef_pump = Some(match next_cef_pump {
-                            Some(existing) if existing < target => existing,
-                            _ => target,
-                        });
+                            + Duration::from_millis((delay_ms as u64).min(fallback_pump_ms));
+                        if target < next_cef_pump {
+                            next_cef_pump = target;
+                        }
                     }
                 }
                 WinEvent::OpenNewWindowInProcess => {
@@ -2615,6 +2999,9 @@ fn run_windows_frameless_browser(
                 WinEvent::UiStartupWatchdog(wid) => {
                     if let Some(st) = windows.get_mut(&wid) {
                         if !st.ui_ready_received {
+                            if let Some(ref sm) = smoke_tracker {
+                                sm.log("UiStartupWatchdog fired (ui_ready not received yet) — reloading UI with fresh nonce");
+                            }
                             let fresh_nonce = cfg_clone.mint_bootstrap_nonce();
                             let fresh_url = format!(
                                 "http://127.0.0.1:{}/?boot={}&win={}",
@@ -2625,6 +3012,139 @@ fn run_windows_frameless_browser(
                             st.sync_layout();
                             st.ui_browser.focus();
                         }
+                    }
+                }
+                WinEvent::SmokeCheckPixels(wid) => {
+                    if let Some(ref mut sm) = smoke_tracker {
+                        if sm.finished {
+                            return;
+                        }
+                        sm.finished = true;
+                        let mut fail_reasons: Vec<String> = Vec::new();
+                        if !sm.context_initialized {
+                            fail_reasons.push("on_context_initialized did not fire".to_string());
+                        }
+                        if sm.ui_http_status != Some(200) {
+                            fail_reasons.push(format!(
+                                "ui_browser HTTP status was {:?} (expected Some(200))",
+                                sm.ui_http_status
+                            ));
+                        }
+                        if !sm.ui_ready {
+                            fail_reasons.push("ui_ready IPC never arrived".to_string());
+                        }
+                        if !sm.probe_ok {
+                            fail_reasons.push(format!(
+                                "DOM smoke_probe failed ({})",
+                                sm.probe_summary
+                            ));
+                        }
+                        if let Some(ref err) = sm.fatal_error {
+                            fail_reasons.push(format!("fatal CEF error: {}", err));
+                        }
+                        if let Some(st) = windows.get(&wid) {
+                            let p_hwnd = st.window.hwnd() as *mut core::ffi::c_void;
+                            let ui_hwnd = st.ui_browser.hwnd();
+                            let has_clip = has_win32_clip_children(p_hwnd);
+                            let ui_vis = !ui_hwnd.is_null() && unsafe { IsWindowVisible(ui_hwnd) } != 0;
+                            let mut ui_rc = WinRect {
+                                left: 0,
+                                top: 0,
+                                right: 0,
+                                bottom: 0,
+                            };
+                            let has_rc = !ui_hwnd.is_null()
+                                && unsafe { GetWindowRect(ui_hwnd, &mut ui_rc) } != 0;
+                            let rc_w = if has_rc { ui_rc.right - ui_rc.left } else { 0 };
+                            let rc_h = if has_rc { ui_rc.bottom - ui_rc.top } else { 0 };
+                            if !has_clip {
+                                fail_reasons.push("parent HWND missing WS_CLIPCHILDREN".to_string());
+                            }
+                            if ui_hwnd.is_null() || !ui_vis || rc_w < 400 || rc_h < 300 {
+                                fail_reasons.push(format!(
+                                    "invalid child CEF HWND state (hwnd=0x{:x}, visible={}, rect={}x{})",
+                                    ui_hwnd as usize, ui_vis, rc_w, rc_h
+                                ));
+                            }
+                            let (mut pw_ok, mut cw, mut ch, mut bar_px, mut tot_px, mut max_luma) =
+                                capture_window_non_black_pixels(p_hwnd);
+                            if !pw_ok || tot_px == 0 {
+                                let (u_ok, uw, uh, u_bar, u_tot, u_luma) =
+                                    capture_window_non_black_pixels(ui_hwnd);
+                                if u_ok && u_tot > tot_px {
+                                    pw_ok = u_ok;
+                                    cw = uw;
+                                    ch = uh;
+                                    bar_px = u_bar;
+                                    tot_px = u_tot;
+                                    max_luma = u_luma;
+                                }
+                            }
+                            sm.log(&format!(
+                                "Window & pixel check: ws_clipchildren={}, ui_hwnd=0x{:x}, ui_visible={}, ui_rect={}x{}, print_window_ok={}, cap={}x{}, bar_non_black={}, total_non_black={}, max_luma={}",
+                                has_clip,
+                                ui_hwnd as usize,
+                                ui_vis,
+                                rc_w,
+                                rc_h,
+                                pw_ok,
+                                cw,
+                                ch,
+                                bar_px,
+                                tot_px,
+                                max_luma
+                            ));
+                            if pw_ok && tot_px < 50 {
+                                fail_reasons.push(format!(
+                                    "BLACK SCREEN DETECTED: PrintWindow succeeded ({}x{}) but total_non_black={} (max_luma={})",
+                                    cw, ch, tot_px, max_luma
+                                ));
+                            }
+                        } else {
+                            fail_reasons.push("primary window missing during pixel check".to_string());
+                        }
+
+                        let exit_code = if fail_reasons.is_empty() {
+                            sm.log("RESULT=PASS (Pure Chromium CEF UI rendered cleanly!)");
+                            0
+                        } else {
+                            sm.log(&format!("RESULT=FAIL: {}", fail_reasons.join(" | ")));
+                            1
+                        };
+                        windows.clear();
+                        for _ in 0..6 {
+                            cef_runtime::pump_cef_message_loop();
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        drop(incognito_ctx.take());
+                        drop(cef_guard.take());
+                        std::process::exit(exit_code);
+                    }
+                }
+                WinEvent::SmokeTimeout => {
+                    if let Some(ref mut sm) = smoke_tracker {
+                        if sm.finished {
+                            return;
+                        }
+                        sm.finished = true;
+                        sm.log(&format!(
+                            "RESULT=FAIL: Timeout ({}s) — ctx_init={}, browser_created={}, http={:?}, ui_ready={}, probe_ok={}, fatal={:?}",
+                            sm.opts.timeout_secs,
+                            sm.context_initialized,
+                            sm.browser_created,
+                            sm.ui_http_status,
+                            sm.ui_ready,
+                            sm.probe_ok,
+                            sm.fatal_error
+                        ));
+                        windows.clear();
+                        for _ in 0..4 {
+                            cef_runtime::pump_cef_message_loop();
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        drop(incognito_ctx.take());
+                        drop(cef_guard.take());
+                        std::process::exit(1);
                     }
                 }
                 WinEvent::CookieHygieneDone {
@@ -2664,16 +3184,109 @@ fn run_windows_frameless_browser(
                     }
                 }
                 WinEvent::CefCallback(wid, cb_evt) => match cb_evt {
+                    CefCallbackEvent::BrowserCreated { tab_id, is_ui, hwnd } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if is_ui {
+                                st.ui_browser.cache_hwnd(hwnd);
+                                st.layout_cache.invalidate_ui();
+                                if let Some(ref mut sm) = smoke_tracker {
+                                    sm.browser_created = true;
+                                    sm.log(&format!("BrowserCreated (ui_browser, hwnd=0x{:x})", hwnd as usize));
+                                }
+                            } else if let Some(b) = st.tab_browsers.get(&tab_id) {
+                                b.cache_hwnd(hwnd);
+                                st.layout_cache.invalidate_tab(Some(tab_id));
+                            }
+                            st.sync_layout();
+                        }
+                    }
+                    CefCallbackEvent::LoadError {
+                        tab_id,
+                        is_ui,
+                        error_code,
+                        error_text,
+                        failed_url,
+                    } => {
+                        eprintln!(
+                            "Singularity CEF LoadError (is_ui={}, tab={}, code={}, text={}, url={})",
+                            is_ui, tab_id, error_code, error_text, failed_url
+                        );
+                        if let Some(ref mut sm) = smoke_tracker {
+                            let msg = format!(
+                                "LoadError(is_ui={}, code={}, text={}, url={})",
+                                is_ui, error_code, error_text, failed_url
+                            );
+                            sm.log(&msg);
+                            if is_ui && sm.fatal_error.is_none() {
+                                sm.fatal_error = Some(msg);
+                            }
+                        }
+                        if is_ui {
+                            if let Some(st) = windows.get_mut(&wid) {
+                                if !st.ui_ready_received && st.ui_recovery_attempts < 2 {
+                                    st.ui_recovery_attempts += 1;
+                                    let fresh_nonce = cfg_clone.mint_bootstrap_nonce();
+                                    let fresh_url = format!(
+                                        "http://127.0.0.1:{}/?boot={}&win={}",
+                                        bind_port, fresh_nonce, st.session_id
+                                    );
+                                    st.ui_browser.load_url(&fresh_url);
+                                    st.layout_cache.invalidate_ui();
+                                    st.sync_layout();
+                                }
+                            }
+                        }
+                    }
+                    CefCallbackEvent::RenderProcessTerminated {
+                        tab_id,
+                        is_ui,
+                        status,
+                        error_code,
+                        error_string,
+                    } => {
+                        eprintln!(
+                            "Singularity CEF RenderProcessTerminated (is_ui={}, tab={}, status={}, code={}, err={})",
+                            is_ui, tab_id, status, error_code, error_string
+                        );
+                        if let Some(ref mut sm) = smoke_tracker {
+                            let msg = format!(
+                                "RenderProcessTerminated(is_ui={}, status={}, code={}, err={})",
+                                is_ui, status, error_code, error_string
+                            );
+                            sm.log(&msg);
+                            if is_ui && sm.fatal_error.is_none() {
+                                sm.fatal_error = Some(msg);
+                            }
+                        }
+                        if is_ui {
+                            if let Some(st) = windows.get_mut(&wid) {
+                                if st.ui_recovery_attempts < 2 {
+                                    st.ui_recovery_attempts += 1;
+                                    let fresh_nonce = cfg_clone.mint_bootstrap_nonce();
+                                    let fresh_url = format!(
+                                        "http://127.0.0.1:{}/?boot={}&win={}",
+                                        bind_port, fresh_nonce, st.session_id
+                                    );
+                                    st.ui_browser.load_url(&fresh_url);
+                                    st.layout_cache.invalidate_ui();
+                                    st.sync_layout();
+                                }
+                            }
+                        }
+                    }
                     CefCallbackEvent::CloseExtensionPopup => {
                         if let Some(st) = windows.get_mut(&wid) {
                             st.close_ext_popup();
                         }
                     }
                     CefCallbackEvent::PageStarted { tab_id, url } => {
-                        if let Some(st) = windows.get_mut(&wid) {
-                            if tab_id == 0 {
-                                return;
+                        if tab_id == 0 {
+                            if let Some(ref sm) = smoke_tracker {
+                                sm.log(&format!("UI PageStarted: {}", url));
                             }
+                            return;
+                        }
+                        if let Some(st) = windows.get_mut(&wid) {
                             if st
                                 .tab_last_urls
                                 .get(&tab_id)
@@ -2724,11 +3337,22 @@ fn run_windows_frameless_browser(
                             }
                         }
                     }
-                    CefCallbackEvent::PageFinished { tab_id, url } => {
-                        if let Some(st) = windows.get_mut(&wid) {
-                            if tab_id == 0 {
-                                return;
+                    CefCallbackEvent::PageFinished {
+                        tab_id,
+                        url,
+                        http_status,
+                    } => {
+                        if tab_id == 0 {
+                            if let Some(ref mut sm) = smoke_tracker {
+                                sm.ui_http_status = Some(http_status);
+                                sm.log(&format!(
+                                    "UI PageFinished (http_status={}, url={})",
+                                    http_status, url
+                                ));
                             }
+                            return;
+                        }
+                        if let Some(st) = windows.get_mut(&wid) {
                             let final_url = st
                                 .tab_browsers
                                 .get(&tab_id)
@@ -3191,12 +3815,77 @@ fn run_windows_frameless_browser(
                                         &st.ui_browser,
                                         &serde_json::json!({ "ram_active_count": st.tab_browsers.len() }),
                                     );
+                                    if let Some(ref mut sm) = smoke_tracker {
+                                        if !sm.ui_ready {
+                                            sm.ui_ready = true;
+                                            sm.log("UiReady received via native V8 window.ipc.postMessage — running DOM & rAF compositor probe");
+                                            st.ui_browser.evaluate_script(
+                                                r#"(function(){
+                                                    requestAnimationFrame(function(){
+                                                        requestAnimationFrame(function(){
+                                                            var bar = document.getElementById('apple-titlebar') || document.querySelector('.apple-bar');
+                                                            var url = document.querySelector('.omnibar-input') || document.querySelector('input');
+                                                            var br = bar ? bar.getBoundingClientRect() : {width:0,height:0};
+                                                            var tabs = document.querySelectorAll('.tab-pill').length;
+                                                            if (window.ipc && window.ipc.postMessage) {
+                                                                window.ipc.postMessage(JSON.stringify({
+                                                                    cmd: 'smoke_probe',
+                                                                    bar_h: Math.round(br.height || 0),
+                                                                    bar_w: Math.round(br.width || 0),
+                                                                    body_w: Math.round(window.innerWidth || 0),
+                                                                    body_h: Math.round(window.innerHeight || 0),
+                                                                    has_url_input: !!url,
+                                                                    tab_count: tabs
+                                                                }));
+                                                            }
+                                                        });
+                                                    });
+                                                })();"#,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            UiIpcCmd::SmokeProbe {
+                                bar_h,
+                                bar_w,
+                                body_w,
+                                body_h,
+                                has_url_input,
+                                tab_count,
+                            } => {
+                                if let Some(ref mut sm) = smoke_tracker {
+                                    let summary = format!(
+                                        "bar={}x{}, viewport={}x{}, has_url_input={}, tab_count={}",
+                                        bar_w, bar_h, body_w, body_h, has_url_input, tab_count
+                                    );
+                                    sm.probe_summary = summary.clone();
+                                    sm.probe_ok = bar_h >= 40
+                                        && bar_w >= 400
+                                        && body_w >= 400
+                                        && body_h >= 300
+                                        && has_url_input
+                                        && tab_count >= 1;
+                                    sm.log(&format!(
+                                        "SmokeProbe (2x rAF completed): ok={}, {}",
+                                        sm.probe_ok, summary
+                                    ));
+                                    let px_proxy = proxy.clone();
+                                    let _ = std::thread::Builder::new()
+                                        .name("singularity-smoke-pixels".into())
+                                        .stack_size(128 * 1024)
+                                        .spawn(move || {
+                                            std::thread::sleep(Duration::from_millis(450));
+                                            let _ = px_proxy.send_event(WinEvent::SmokeCheckPixels(wid));
+                                        });
                                 }
                             }
                             UiIpcCmd::DragWindow => {
                                 if let Some(st) = windows.get_mut(&wid) {
                                     st.close_ext_popup();
+                                    cef_runtime::set_cef_nestable_tasks_allowed(true);
                                     let _ = st.window.drag_window();
+                                    cef_runtime::set_cef_nestable_tasks_allowed(false);
                                 }
                             }
                             UiIpcCmd::DragResize { direction } => {
@@ -3217,7 +3906,9 @@ fn run_windows_frameless_browser(
                                             _ => None,
                                         };
                                         if let Some(d) = dir {
+                                            cef_runtime::set_cef_nestable_tasks_allowed(true);
                                             let _ = st.window.drag_resize_window(d);
+                                            cef_runtime::set_cef_nestable_tasks_allowed(false);
                                         }
                                     }
                                 }
@@ -3240,7 +3931,11 @@ fn run_windows_frameless_browser(
                                         st.apply_fullscreen(true, false);
                                     } else {
                                         st.window.set_maximized(!st.window.is_maximized());
+                                        ensure_win32_clip_children(
+                                            st.window.hwnd() as *mut core::ffi::c_void,
+                                        );
                                         st.capture_geometry(&cfg_clone, &shared_shell);
+                                        st.sync_layout();
                                         st.sync_maximized(false);
                                     }
                                 }
