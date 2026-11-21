@@ -97,9 +97,9 @@ pub const DEFAULT_UBLOCK_FILTER_RULES: &str = r#"
 ||google-analytics.com^
 ||googletagmanager.com^
 ||googleadservices.com^
-||facebook.net^
-||connect.facebook.net^
-||analytics.tiktok.com^
+||facebook.net^$third-party
+||connect.facebook.net^$third-party
+||analytics.tiktok.com^$third-party
 ||ads-twitter.com^
 ||amazon-adsystem.com^
 ||adnxs.com^
@@ -197,14 +197,14 @@ impl UBlockNetworkEngine {
         first_party_host: &str,
         resource_type: NetworkResourceType,
     ) -> FilterDecision {
-        if resource_type == NetworkResourceType::PingBeacon {
-            self.blocked_count.fetch_add(1, Ordering::Relaxed);
-            return FilterDecision::BlockedBeaconOrPing;
-        }
-
         let host_lower = request_host.trim().to_ascii_lowercase();
         let fp_lower = first_party_host.trim().to_ascii_lowercase();
         let is_third_party = !fp_lower.is_empty() && !same_site(&host_lower, &fp_lower);
+
+        if resource_type == NetworkResourceType::PingBeacon && is_third_party {
+            self.blocked_count.fetch_add(1, Ordering::Relaxed);
+            return FilterDecision::BlockedBeaconOrPing;
+        }
 
         // Check exception rules (`@@||domain^`) across domain and parent labels
         for candidate in domain_hierarchy(&host_lower) {

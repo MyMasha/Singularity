@@ -29,7 +29,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const WINDOWS_TO_UNIX_EPOCH_US: i64 = 11_644_473_600_000_000;
@@ -85,6 +85,9 @@ pub enum CefCallbackEvent {
     BrowserCreated {
         tab_id: u64,
         is_ui: bool,
+        hwnd: isize,
+    },
+    DestroyChildHwnd {
         hwnd: isize,
     },
     UiIpc(String),
@@ -783,8 +786,22 @@ wrap_life_span_handler! {
             1 // Always suppress unmanaged external popup windows
         }
 
-        fn do_close(&self, _browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
-            0
+        fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
+            if self.cfg.is_ext_popup {
+                return 0; // Closing an extension popup SHOULD close its own tiny popup window.
+            }
+            // CRITICAL: On Windows, returning 0 from `do_close()` for an embedded WS_CHILD browser
+            // causes CEF to post `WM_CLOSE` to the top-level parent `tao` window, closing the ENTIRE
+            // browser window when the user closes a single tab! Instead, schedule destruction of ONLY
+            // this child browser's HWND on the UI thread and return 1 (`true`).
+            let hwnd = browser
+                .and_then(|b| b.host())
+                .map(|h| h.window_handle().0 as isize)
+                .unwrap_or(0);
+            if hwnd != 0 {
+                (self.cfg.sink)(CefCallbackEvent::DestroyChildHwnd { hwnd });
+            }
+            1
         }
     }
 }
@@ -976,6 +993,82 @@ fn map_cef_resource_type(rt: ResourceType) -> NetworkResourceType {
     }
 }
 
+fn registrable_site(host: &str) -> String {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parts: Vec<&str> = h.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return h;
+    }
+    let last2 = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+    if matches!(
+        last2.as_str(),
+        "co.uk" | "com.au" | "co.jp" | "com.br" | "co.kr" | "co.nz" | "com.mx" | "co.za"
+    ) && parts.len() >= 3
+    {
+        format!("{}.{}", parts[parts.len() - 3], last2)
+    } else {
+        last2
+    }
+}
+
+fn host_in_list(host: &str, domains: &[&str]) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    domains
+        .iter()
+        .any(|d| h == *d || h.ends_with(&format!(".{}", d)))
+}
+
+fn is_same_platform_ecosystem(doc_host: &str, req_host: &str) -> bool {
+    if doc_host.is_empty() || req_host.is_empty() {
+        return false;
+    }
+    if registrable_site(doc_host) == registrable_site(req_host) {
+        return true;
+    }
+    const ECOSYSTEMS: &[&[&str]] = &[
+        &[
+            "tiktok.com",
+            "tiktokv.com",
+            "tiktokw.us",
+            "tiktokcdn.com",
+            "tiktokcdn-us.com",
+            "tiktokcdn-eu.com",
+            "byteoversea.com",
+            "ttwstatic.com",
+            "ibytedtos.com",
+            "ibyteimg.com",
+            "musical.ly",
+            "tiktokglobalshop.com",
+        ],
+        &[
+            "youtube.com",
+            "youtu.be",
+            "googlevideo.com",
+            "ytimg.com",
+            "ggpht.com",
+            "google.com",
+            "google.fr",
+            "gstatic.com",
+            "googleusercontent.com",
+            "googleapis.com",
+        ],
+        &["twitch.tv", "ttvnw.net", "jtvnw.net", "twitchcdn.net"],
+        &[
+            "facebook.com",
+            "fbcdn.net",
+            "instagram.com",
+            "cdninstagram.com",
+            "threads.net",
+            "messenger.com",
+        ],
+        &["x.com", "twitter.com", "twimg.com", "t.co"],
+        &["discord.com", "discordapp.com", "discordapp.net", "discord.gg"],
+    ];
+    ECOSYSTEMS
+        .iter()
+        .any(|group| host_in_list(doc_host, group) && host_in_list(req_host, group))
+}
+
 wrap_resource_request_handler! {
     struct SingularityResourceRequestHandler {
         cfg: ClientConfig,
@@ -984,7 +1077,7 @@ wrap_resource_request_handler! {
     impl ResourceRequestHandler {
         fn on_before_resource_load(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             _callback: Option<&mut Callback>,
@@ -1007,11 +1100,22 @@ wrap_resource_request_handler! {
                 return ReturnValue::CONTINUE;
             };
             let first_party_url = cef_str_userfree(req.first_party_for_cookies());
-            let doc_host = parse_http_host_port(&first_party_url)
+            let mut doc_host = parse_http_host_port(&first_party_url)
                 .map(|(h, _)| h)
                 .unwrap_or_default();
-            // Never block first-party resources so YouTube/Twitch/sites stay 100% functional
-            if !doc_host.is_empty() && (req_host == doc_host || req_host.ends_with(&format!(".{}", doc_host))) {
+            if doc_host.is_empty() {
+                if let Some(main_url) = browser
+                    .and_then(|b| b.main_frame())
+                    .map(|f| cef_str_userfree(f.url()))
+                {
+                    if let Some((mh, _)) = parse_http_host_port(&main_url) {
+                        doc_host = mh;
+                    }
+                }
+            }
+            // Never block same-site or same-platform CDN/API resources (TikTok, YouTube, Twitch,
+            // Google, Meta, Discord, X) so web SPAs and anti-bot telemetry stay 100% functional!
+            if !doc_host.is_empty() && is_same_platform_ecosystem(&doc_host, &req_host) {
                 return ReturnValue::CONTINUE;
             }
             let res_type = map_cef_resource_type(rtype);
@@ -1393,6 +1497,13 @@ impl CefBrowserHandle {
     }
 
     pub fn close_force(&self) {
+        const SW_HIDE: i32 = 0;
+        let hwnd = self.hwnd();
+        if !hwnd.is_null() {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
         if let Some(host) = self.browser.host() {
             host.close_browser(1);
         }
@@ -1568,7 +1679,7 @@ wrap_cookie_visitor! {
                                 shell.core.adblocker.evaluate_request(
                                     &probe_url,
                                     clean_dom,
-                                    "singularity.local",
+                                    clean_dom,
                                     NetworkResourceType::Image,
                                 ),
                                 FilterDecision::BlockedByDomainRule(_)
@@ -1622,10 +1733,41 @@ wrap_cookie_visitor! {
     }
 }
 
+wrap_set_cookie_callback! {
+    struct SingularitySetCookieCounter {
+        remaining: Arc<AtomicUsize>,
+        succeeded: Arc<AtomicUsize>,
+    }
+
+    impl SetCookieCallback {
+        fn on_complete(&self, success: ::std::os::raw::c_int) {
+            if success != 0 {
+                self.succeeded.fetch_add(1, Ordering::AcqRel);
+            }
+            self.remaining.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+wrap_completion_callback! {
+    struct SingularityCompletionFlag {
+        done: Arc<AtomicBool>,
+    }
+
+    impl CompletionCallback {
+        fn on_complete(&self) {
+            self.done.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct HydrateFinalize {
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
     existing: Mutex<HashSet<(String, String)>>,
     manager: CookieManager,
+    visit_done: Arc<AtomicBool>,
+    pending_sets: Arc<AtomicUsize>,
+    hydrated_count: Arc<AtomicUsize>,
 }
 
 impl Drop for HydrateFinalize {
@@ -1650,17 +1792,33 @@ impl Drop for HydrateFinalize {
                 continue;
             }
             let clean_dom = rec.domain.trim_start_matches('.').to_ascii_lowercase();
-            if seen.contains(&(clean_dom.clone(), lower_name)) {
+            if seen.contains(&(clean_dom.clone(), lower_name.clone())) {
                 continue;
             }
             let cookie_url = format!("https://{}/", clean_dom);
+            let is_domain_cookie = rec.domain.starts_with('.');
+            let is_3p_cookie = lower_name.starts_with("__secure-3p");
+            let secure_flag = if rec.secure || lower_name.starts_with("__secure-") || is_3p_cookie {
+                1
+            } else {
+                0
+            };
             let mut cef_cookie = Cookie {
                 name: CefString::from(rec.token_name.as_str()),
                 value: CefString::from(rec.secret_value.as_str()),
-                domain: CefString::from(rec.domain.as_str()),
+                domain: if is_domain_cookie {
+                    CefString::from(rec.domain.as_str())
+                } else {
+                    CefString::default()
+                },
                 path: CefString::from(if rec.path.is_empty() { "/" } else { rec.path.as_str() }),
-                secure: if rec.secure { 1 } else { 0 },
+                secure: secure_flag,
                 httponly: if rec.http_only { 1 } else { 0 },
+                same_site: if is_3p_cookie {
+                    CookieSameSite::NO_RESTRICTION
+                } else {
+                    CookieSameSite::LAX_MODE
+                },
                 ..Default::default()
             };
             if let Some(exp) = rec.expires_unix {
@@ -1672,12 +1830,21 @@ impl Drop for HydrateFinalize {
                     cef_cookie.expires = Basetime { val: us };
                 }
             }
-            let _ = self.manager.set_cookie(
+            self.pending_sets.fetch_add(1, Ordering::AcqRel);
+            let mut cb = SingularitySetCookieCounter::new(
+                Arc::clone(&self.pending_sets),
+                Arc::clone(&self.hydrated_count),
+            );
+            let queued = self.manager.set_cookie(
                 Some(&CefString::from(cookie_url.as_str())),
                 Some(&cef_cookie),
-                None,
+                Some(&mut cb),
             );
+            if queued == 0 {
+                self.pending_sets.fetch_sub(1, Ordering::AcqRel);
+            }
         }
+        self.visit_done.store(true, Ordering::Release);
     }
 }
 
@@ -1743,26 +1910,91 @@ wrap_cookie_visitor! {
     }
 }
 
-/// Restores missing encrypted Roaming auth cookies into Chromium's `CookieManager` without ever
-/// overwriting fresher live cookies or touching `__Host-` invariants.
-pub fn hydrate_cookies_from_roaming_cef(shared_shell: &Arc<Mutex<SingularityBrowserShell>>) {
-    let is_empty_or_private = shared_shell
+/// Synchronously warms Chromium's persistent SQLite cookie store AND hydrates any missing
+/// encrypted Roaming auth cookies BEFORE initial restored tabs navigate — preventing the
+/// "appeared logged out until manual F5 refresh" startup race!
+pub fn hydrate_cookies_from_roaming_cef_sync(
+    shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+    timeout: std::time::Duration,
+) -> usize {
+    let is_private = shared_shell
         .lock()
-        .map(|s| s.private_browsing_active || s.roaming.tokens.sessions.is_empty())
+        .map(|s| s.private_browsing_active)
         .unwrap_or(true);
-    if is_empty_or_private {
-        return;
+    if is_private {
+        return 0;
     }
+    let Some(mgr) = cookie_manager_get_global_manager(None) else {
+        return 0;
+    };
+
+    let visit_done = Arc::new(AtomicBool::new(false));
+    let pending_sets = Arc::new(AtomicUsize::new(0));
+    let hydrated_count = Arc::new(AtomicUsize::new(0));
+
+    {
+        let fin = Arc::new(HydrateFinalize {
+            shared_shell: Arc::clone(shared_shell),
+            existing: Mutex::new(HashSet::new()),
+            manager: mgr.clone(),
+            visit_done: Arc::clone(&visit_done),
+            pending_sets: Arc::clone(&pending_sets),
+            hydrated_count: Arc::clone(&hydrated_count),
+        });
+        let mut visitor = SingularityHydrateCollector::new(fin);
+        let ok = mgr.visit_all_cookies(Some(&mut visitor));
+        if ok == 0 {
+            return 0;
+        }
+    }
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        pump_cef_message_loop();
+        if visit_done.load(Ordering::Acquire) && pending_sets.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    let restored = hydrated_count.load(Ordering::Acquire);
+    if restored > 0 && start.elapsed() < timeout {
+        let flushed = Arc::new(AtomicBool::new(false));
+        let mut flush_cb = SingularityCompletionFlag::new(Arc::clone(&flushed));
+        if mgr.flush_store(Some(&mut flush_cb)) != 0 {
+            while !flushed.load(Ordering::Acquire) && start.elapsed() < timeout {
+                pump_cef_message_loop();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+    restored
+}
+
+/// Flushes Chromium's persistent cookie store to disk synchronously before clean browser shutdown
+/// so freshly refreshed Google / TikTok / YouTube session cookies are never dropped on exit.
+pub fn flush_cookie_store_cef_sync(timeout: std::time::Duration) {
     let Some(mgr) = cookie_manager_get_global_manager(None) else {
         return;
     };
-    let fin = Arc::new(HydrateFinalize {
-        shared_shell: Arc::clone(shared_shell),
-        existing: Mutex::new(HashSet::new()),
-        manager: mgr.clone(),
-    });
-    let mut visitor = SingularityHydrateCollector::new(fin);
-    let _ = mgr.visit_all_cookies(Some(&mut visitor));
+    let done = Arc::new(AtomicBool::new(false));
+    let mut cb = SingularityCompletionFlag::new(Arc::clone(&done));
+    if mgr.flush_store(Some(&mut cb)) == 0 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    while !done.load(Ordering::Acquire) && start.elapsed() < timeout {
+        pump_cef_message_loop();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Backwards-compatible entry point delegating to synchronous cookie hydration.
+pub fn hydrate_cookies_from_roaming_cef(shared_shell: &Arc<Mutex<SingularityBrowserShell>>) {
+    let _ = hydrate_cookies_from_roaming_cef_sync(
+        shared_shell,
+        std::time::Duration::from_millis(1500),
+    );
 }
 
 /// Single-pass asynchronous CEF cookie hygiene & encrypted auth token snapshot.

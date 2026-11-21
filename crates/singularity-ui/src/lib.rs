@@ -2,6 +2,7 @@
 //! Custom Cursor Engine, Black Hole WGSL Shader, Vim Modal Navigation, and 2,165+ Virtualized Settings UI.
 
 pub mod browser_import;
+pub mod crash_guard;
 pub mod cursor;
 pub mod extensions;
 pub mod roaming_store;
@@ -787,11 +788,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.2");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.3");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.2"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.3"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1181,7 +1182,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.2"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.3"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1250,5 +1251,211 @@ mod tests {
         assert!(installer_src.contains("zip::ZipArchive"));
         assert!(installer_src.contains("libcef.dll"));
         assert!(installer_src.contains("--launch"));
+    }
+
+    #[test]
+    fn test_v203_tab_close_auth_hydration_tiktok_and_crash_guard() {
+        use singularity_core::{FilterDecision, NetworkResourceType, UBlockNetworkEngine};
+
+        // 1. TikTok auth cookies + functional anti-bot cookies are preserved, while 3rd-party pixels stay blocked
+        assert_eq!(classify_auth_cookie(".tiktok.com", "sessionid"), Some("TikTok"));
+        assert_eq!(classify_auth_cookie(".tiktok.com", "sid_tt"), Some("TikTok"));
+        for (dom, name, val) in [
+            (".tiktok.com", "_ttp", "abc123"),
+            (".tiktok.com", "ttwid", "1%7Cxyz"),
+            (".tiktok.com", "msToken", "tok123"),
+            (".tiktok.com", "s_v_web_id", "verify_123"),
+            (".tiktok.com", "sessionid", "sess_tiktok"),
+            (".analytics.tiktok.com", "tt_csrf_token", "csrf"),
+            (".byteoversea.com", "odin_tt", "odin"),
+            (".tiktokw.us", "tt_chain_token", "chain"),
+            ("example.org", "ak_bmsc", "waf"),
+            ("example.org", "datadome", "dd"),
+        ] {
+            assert_eq!(
+                classify_tracker_or_malicious_cookie(dom, name, val),
+                None,
+                "TikTok / WAF cookie ({}, {}) must NEVER be deleted",
+                dom,
+                name
+            );
+        }
+
+        let blocker = UBlockNetworkEngine::default();
+        // First-party TikTok analytics & PingBeacon allowed; third-party TikTok pixel & beacon blocked
+        assert!(matches!(
+            blocker.evaluate_request(
+                "https://analytics.tiktok.com/api/v2/report",
+                "analytics.tiktok.com",
+                "analytics.tiktok.com",
+                NetworkResourceType::XmlHttpRequestFetch,
+            ),
+            FilterDecision::Allow | FilterDecision::AllowByExceptionRule(_)
+        ));
+        assert!(matches!(
+            blocker.evaluate_request(
+                "https://www.tiktok.com/api/v1/beacon",
+                "www.tiktok.com",
+                "www.tiktok.com",
+                NetworkResourceType::PingBeacon,
+            ),
+            FilterDecision::Allow | FilterDecision::AllowByExceptionRule(_)
+        ));
+        assert!(matches!(
+            blocker.evaluate_request(
+                "https://analytics.tiktok.com/i18n/pixel/events.js",
+                "analytics.tiktok.com",
+                "news.example.com",
+                NetworkResourceType::Script,
+            ),
+            FilterDecision::BlockedByDomainRule(_)
+        ));
+        assert!(matches!(
+            blocker.evaluate_request(
+                "https://telemetry.other.test/beacon",
+                "telemetry.other.test",
+                "news.example.com",
+                NetworkResourceType::PingBeacon,
+            ),
+            FilterDecision::BlockedBeaconOrPing
+        ));
+
+        // 2. Crash detection, copyable error report formatting, cef.log tail, and full checkpoint recovery
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity_v203_crash_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp_dir");
+        std::fs::write(
+            tmp_dir.join("cef.log"),
+            "[INFO] boot ok\n[ERROR] simulated crash line\n",
+        )
+        .expect("write cef.log");
+
+        // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
+        std::fs::write(
+            tmp_dir.join("running.lock"),
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.3"}"#,
+        )
+        .expect("write stale lock");
+        assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
+
+        let checkpoint_windows = vec![
+            WindowSessionFile {
+                window_id: "win-crash-1".into(),
+                pid: 999_997,
+                updated_unix: 1000,
+                active_tab_index: 0,
+                tabs: vec![SavedTabEntry {
+                    title: "Long YouTube Video".into(),
+                    url: "https://www.youtube.com/watch?v=recover999".into(),
+                    media_time_sec: Some(1337),
+                    scroll_y: Some(250),
+                    group_id: None,
+                    favicon_url: None,
+                }],
+                tab_groups: Vec::new(),
+                geometry: WindowGeometry::default(),
+                closed_while_other_live: true, // Even if stale flag was true, crash recovery MUST restore it!
+            },
+            WindowSessionFile {
+                window_id: "win-crash-2".into(),
+                pid: 999_997,
+                updated_unix: 1100,
+                active_tab_index: 0,
+                tabs: vec![SavedTabEntry {
+                    title: "TikTok Feed".into(),
+                    url: "https://www.tiktok.com/".into(),
+                    media_time_sec: None,
+                    scroll_y: None,
+                    group_id: None,
+                    favicon_url: None,
+                }],
+                tab_groups: Vec::new(),
+                geometry: WindowGeometry::default(),
+                closed_while_other_live: false,
+            },
+        ];
+        let sessions_dir = tmp_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+        std::fs::write(
+            sessions_dir.join("crash_checkpoint.json"),
+            serde_json::to_vec(&checkpoint_windows).expect("ser checkpoint"),
+        )
+        .expect("write checkpoint");
+
+        // Opening store during crash recovery restores BOTH windows and exact 1337s video timestamp!
+        let restored = RoamingSingularityStore::open_at(tmp_dir.clone()).expect("open after crash");
+        assert_eq!(restored.restored_windows_count, 2);
+        assert_eq!(restored.pending_restore_window_ids.len(), 1);
+        let mut all_urls: Vec<String> = restored
+            .profile
+            .saved_tabs
+            .iter()
+            .map(|t| t.url.clone())
+            .collect();
+        let mut all_times: Vec<Option<u64>> = restored
+            .profile
+            .saved_tabs
+            .iter()
+            .map(|t| t.media_time_sec)
+            .collect();
+        let win2 = RoamingSingularityStore::open_at_with_launch_args(
+            tmp_dir.clone(),
+            None,
+            Some(&restored.pending_restore_window_ids[0]),
+            false,
+        )
+        .expect("open crash sibling");
+        all_urls.extend(win2.profile.saved_tabs.iter().map(|t| t.url.clone()));
+        all_times.extend(win2.profile.saved_tabs.iter().map(|t| t.media_time_sec));
+        assert!(all_urls.iter().any(|u| u.contains("recover999")));
+        assert!(all_urls.iter().any(|u| u.contains("tiktok.com")));
+        assert!(all_times.contains(&Some(1337)));
+
+        // detect_previous_crash_and_mark_running emits copyable CrashReport including cef.log tail
+        let rep = crash_guard::detect_previous_crash_and_mark_running(&tmp_dir)
+            .expect("detect previous crash");
+        assert_eq!(rep.kind, "unclean_shutdown");
+        let txt = rep.format_copyable_text();
+        assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
+        assert!(txt.contains("simulated crash line"));
+        assert!(txt.contains("v2.0.3"));
+
+        // Clean shutdown clears running.lock sentinel
+        crash_guard::mark_clean_shutdown(&tmp_dir);
+        assert!(!crash_guard::has_unclean_crash_sentinel(&tmp_dir));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 3. Verify v2.0.3 source-level & UI invariants
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("DestroyChildHwnd"));
+        assert!(cef_src.contains("is_same_platform_ecosystem"));
+        assert!(cef_src.contains("hydrate_cookies_from_roaming_cef_sync"));
+        assert!(cef_src.contains("flush_cookie_store_cef_sync"));
+        assert!(cef_src.contains("CookieSameSite::NO_RESTRICTION"));
+
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("destroy_cef_child_hwnd"));
+        assert!(server_src.contains("DestroyWindow"));
+        assert!(server_src.contains("WS_CHILD"));
+        assert!(server_src.contains("detect_previous_crash_and_mark_running"));
+        assert!(server_src.contains("mark_clean_shutdown"));
+        assert!(server_src.contains("flush_live_crash_checkpoint"));
+        assert!(server_src.contains("SmokeFinalize"));
+        assert!(server_src.contains("close_requested_count"));
+
+        let main_src = include_str!("main.rs");
+        assert!(main_src.contains("install_crash_handlers"));
+
+        assert!(SINGULARITY_UI_HTML.contains("crash-report-modal"));
+        assert!(SINGULARITY_UI_HTML.contains("openCrashReportModal"));
+        assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
+        assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
+        assert!(SINGULARITY_UI_HTML.contains("copy_text"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.3"));
     }
 }

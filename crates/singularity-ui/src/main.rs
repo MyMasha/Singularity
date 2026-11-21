@@ -45,7 +45,17 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let smoke_test_cef = args.iter().any(|a| a == "--smoke-test-cef");
+    let verify_only = args.iter().any(|a| a == "--verify-only");
     let force_new_window = args.iter().any(|a| a == "--new-window");
+
+    // Install Rust panic + native Windows SEH unhandled-exception crash detectors with automatic
+    // copyable error report popup before booting the browser engine (skipped in headless CI modes).
+    if !smoke_test_cef && !verify_only {
+        singularity_ui::crash_guard::install_crash_handlers(
+            &singularity_ui::resolve_roaming_singularity_dir(),
+        );
+    }
+
     let detach_handoff_id = args
         .windows(2)
         .find(|w| w[0] == "--detach-handoff")

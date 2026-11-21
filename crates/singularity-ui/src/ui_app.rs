@@ -1680,6 +1680,116 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     .ext-toolbar-strip { display: none; }
     body.bar-only #toast { max-width: calc(100vw - 24px); }
   }
+  #crash-report-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 12000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.84);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    padding: 20px;
+  }
+  #crash-report-modal.open {
+    display: flex;
+  }
+  .crash-card {
+    width: min(680px, 94vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    background: #07080c;
+    border: 1px solid rgba(248, 113, 113, 0.42);
+    border-radius: 18px;
+    padding: 22px 24px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+    color: #f3f4f6;
+  }
+  .crash-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .crash-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.14);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    border-radius: 999px;
+    padding: 4px 10px;
+    margin-bottom: 8px;
+  }
+  .crash-title {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 700;
+    color: #ffffff;
+  }
+  .crash-sub {
+    margin: 4px 0 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: rgba(229, 231, 235, 0.78);
+  }
+  #crash-report-text {
+    width: 100%;
+    min-height: 240px;
+    max-height: 46vh;
+    resize: vertical;
+    box-sizing: border-box;
+    background: #000000;
+    color: #e5e7eb;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre;
+    overflow: auto;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .crash-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  .crash-btn-copy {
+    background: linear-gradient(135deg, #ef4444, #f97316);
+    color: #ffffff;
+    border: none;
+    border-radius: 10px;
+    padding: 9px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.12s ease, opacity 0.12s ease;
+  }
+  .crash-btn-copy:hover { opacity: 0.92; }
+  .crash-btn-copy:active { transform: scale(0.98); }
+  .crash-btn-close {
+    background: rgba(255, 255, 255, 0.08);
+    color: #e5e7eb;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    padding: 9px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .crash-btn-close:hover { background: rgba(255, 255, 255, 0.14); }
 </style>
 </head>
 <body>
@@ -2081,7 +2191,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.2</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.3</div>
         </div>
       </aside>
 
@@ -2428,6 +2538,23 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   </div>
 
   <div id="tab-context-menu" role="menu"></div>
+
+  <div id="crash-report-modal" role="dialog" aria-modal="true" aria-labelledby="crash-modal-title">
+    <div class="crash-card">
+      <div class="crash-header">
+        <div>
+          <div class="crash-badge" id="crash-modal-badge">Crash Detection</div>
+          <h2 class="crash-title" id="crash-modal-title">Singularity recovered from a crash</h2>
+          <p class="crash-sub" id="crash-modal-sub">Your open windows, tabs, and video positions were automatically restored. Copy the error report below and share it with us so we can fix the issue.</p>
+        </div>
+      </div>
+      <textarea id="crash-report-text" readonly spellcheck="false"></textarea>
+      <div class="crash-actions">
+        <button type="button" class="crash-btn-copy" id="btn-crash-copy" onclick="copyCrashReport()">Copy Error Report</button>
+        <button type="button" class="crash-btn-close" id="btn-crash-close" onclick="closeCrashReportModal()">Close</button>
+      </div>
+    </div>
+  </div>
 
   <div id="toast"></div>
 
@@ -4282,7 +4409,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   function anyModalOpen() {
-    return document.getElementById("onboarding-overlay").classList.contains("open");
+    const ob = document.getElementById("onboarding-overlay");
+    const cr = document.getElementById("crash-report-modal");
+    return (ob && ob.classList.contains("open")) || (cr && cr.classList.contains("open"));
   }
 
   // `actionMode`: "navigate" (new URL in active tab), "activate" (zero-reload tab switch), or "view" (overlay/home)
@@ -5518,9 +5647,83 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     showToast(L("Welcome to Singularity! Preferences saved", "Bienvenue sur Singularity ! Configuration enregistrée"));
   }
 
-  // Native WebView2 per-tab synchronization callback
+  let lastCrashReportText = "";
+
+  function openCrashReportModal(rep) {
+    if (!rep || !rep.text) return;
+    const modal = document.getElementById("crash-report-modal");
+    const ta = document.getElementById("crash-report-text");
+    const badge = document.getElementById("crash-modal-badge");
+    const title = document.getElementById("crash-modal-title");
+    const sub = document.getElementById("crash-modal-sub");
+    const copyBtn = document.getElementById("btn-crash-copy");
+    const closeBtn = document.getElementById("btn-crash-close");
+    if (!modal || !ta) return;
+
+    lastCrashReportText = String(rep.text);
+    ta.value = lastCrashReportText;
+    const isRenderer = rep.kind && String(rep.kind).includes("renderer");
+    if (badge) badge.textContent = L("Crash Detection", "Détection de crash");
+    if (title) {
+      title.textContent = isRenderer
+        ? L("A tab process crashed", "Un onglet a rencontré un crash")
+        : L("Singularity recovered from a crash", "Singularity a récupéré après un crash");
+    }
+    if (sub) {
+      sub.textContent = isRenderer
+        ? L("Copy the error report below and share it with us so we can fix it. Your other tabs remain safe.",
+            "Copiez le rapport d'erreur ci-dessous pour nous l'envoyer. Vos autres onglets restent intacts.")
+        : L("Your open windows, tabs, and video timestamps were automatically restored. Copy the error report below and send it to us.",
+            "Vos fenêtres, onglets et positions vidéo ont été restaurés automatiquement. Copiez le rapport d'erreur ci-dessous pour nous l'envoyer.");
+    }
+    if (copyBtn) copyBtn.textContent = L("Copy Error Report", "Copier l'erreur");
+    if (closeBtn) closeBtn.textContent = L("Close", "Fermer");
+
+    modal.classList.add("open");
+    document.body.classList.remove("bar-only");
+    setBlackHoleSuspended(false);
+    sendNativeIpc({ cmd: "set_overlay", open: true });
+    setTimeout(() => {
+      try { ta.focus(); ta.select(); } catch (_) {}
+    }, 40);
+  }
+
+  function copyCrashReport() {
+    const ta = document.getElementById("crash-report-text");
+    const text = (ta && ta.value) ? ta.value : lastCrashReportText;
+    if (!text) return;
+    sendNativeIpc({ cmd: "copy_text", text });
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => {});
+      } else if (ta) {
+        ta.select();
+        document.execCommand("copy");
+      }
+    } catch (_) {}
+    const copyBtn = document.getElementById("btn-crash-copy");
+    if (copyBtn) {
+      copyBtn.textContent = L("✓ Copied!", "✓ Erreur copiée !");
+      setTimeout(() => {
+        if (copyBtn) copyBtn.textContent = L("Copy Error Report", "Copier l'erreur");
+      }, 2200);
+    }
+    showToast(L("Crash report copied to clipboard", "Rapport d'erreur copié dans le presse-papiers"));
+  }
+
+  function closeCrashReportModal() {
+    const modal = document.getElementById("crash-report-modal");
+    if (modal) modal.classList.remove("open");
+    sendNativeIpc({ cmd: "set_overlay", open: false });
+    syncViewportToActiveTab("activate");
+  }
+
+  // Native Chromium per-tab synchronization callback
   window.__singularitySyncWeb = function(msg) {
     if (!msg) return;
+    if (msg.crash_report) {
+      openCrashReportModal(msg.crash_report);
+    }
     if (typeof msg.maximized === "boolean") {
       applyMaximizedState(msg.maximized);
     }

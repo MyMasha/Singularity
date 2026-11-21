@@ -429,6 +429,7 @@ fn run_windows_frameless_browser(
         AdoptExternalTab(TabHandoffPayload),
         UiStartupWatchdog(WindowId),
         SmokeCheckPixels(WindowId),
+        SmokeFinalize(WindowId),
         SmokeTimeout,
         CookieHygieneDone {
             win_id: WindowId,
@@ -450,6 +451,9 @@ fn run_windows_frameless_browser(
     #[serde(tag = "cmd", rename_all = "snake_case")]
     enum UiIpcCmd {
         UiReady,
+        CopyText {
+            text: String,
+        },
         SmokeProbe {
             #[serde(default)]
             bar_h: i32,
@@ -463,6 +467,8 @@ fn run_windows_frameless_browser(
             has_url_input: bool,
             #[serde(default)]
             tab_count: i32,
+            #[serde(default)]
+            codecs: String,
         },
         DragWindow,
         DragResize {
@@ -885,6 +891,7 @@ fn run_windows_frameless_browser(
             lparam: isize,
         ) -> i32;
         fn GetWindowRect(hwnd: *mut core::ffi::c_void, lp_rect: *mut WinRect) -> i32;
+        fn IsWindow(hwnd: *mut core::ffi::c_void) -> i32;
         fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
         fn IsIconic(hwnd: *mut core::ffi::c_void) -> i32;
         fn ShowWindow(hwnd: *mut core::ffi::c_void, n_cmd_show: i32) -> i32;
@@ -1014,6 +1021,28 @@ fn run_windows_frameless_browser(
         const GWL_STYLE: i32 = -16;
         const WS_CLIPCHILDREN: isize = 0x0200_0000;
         unsafe { (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CLIPCHILDREN) != 0 }
+    }
+
+    /// Safely destroys ONLY an embedded `WS_CHILD` CEF browser HWND on the main UI thread so
+    /// closing a single tab frees 100% of Chromium resources without ever posting `WM_CLOSE` to
+    /// the top-level parent `tao` browser window.
+    fn destroy_cef_child_hwnd(hwnd_isize: isize) {
+        if hwnd_isize == 0 {
+            return;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongPtrW(hwnd: *mut core::ffi::c_void, n_index: i32) -> isize;
+            fn DestroyWindow(hwnd: *mut core::ffi::c_void) -> i32;
+        }
+        const GWL_STYLE: i32 = -16;
+        const WS_CHILD: isize = 0x4000_0000;
+        let hwnd = hwnd_isize as *mut core::ffi::c_void;
+        unsafe {
+            if IsWindow(hwnd) != 0 && (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CHILD) != 0 {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
     }
 
     /// Captures rendered pixels of a Win32 window via `PrintWindow(PW_RENDERFULLCONTENT)` and
@@ -2308,6 +2337,11 @@ fn run_windows_frameless_browser(
         ui_ready: bool,
         probe_ok: bool,
         probe_summary: String,
+        codecs_summary: String,
+        pixel_fail_reasons: Vec<String>,
+        close_requested_count: usize,
+        smoke_tab_created: bool,
+        smoke_tab_closed: bool,
         fatal_error: Option<String>,
         finished: bool,
     }
@@ -2326,6 +2360,11 @@ fn run_windows_frameless_browser(
                 ui_ready: false,
                 probe_ok: false,
                 probe_summary: String::new(),
+                codecs_summary: String::new(),
+                pixel_fail_reasons: Vec::new(),
+                close_requested_count: 0,
+                smoke_tab_created: false,
+                smoke_tab_closed: false,
                 fatal_error: None,
                 finished: false,
             }
@@ -2389,6 +2428,15 @@ fn run_windows_frameless_browser(
             return Err(e);
         }
     };
+
+    // Detect any previous crash (panic, Win32 SEH, or stale dead-PID lock) and arm `running.lock`
+    // ONLY after acquiring ownership of the single Chromium profile so relaunches never clobber it.
+    let mut pending_crash_report: Option<crate::crash_guard::CrashReport> = if smoke_opt.is_none() {
+        crate::crash_guard::detect_previous_crash_and_mark_running(&root_dir)
+    } else {
+        None
+    };
+
     let ctx_ready = cef_guard.wait_for_context_initialized(Duration::from_secs(5));
     if let Some(ref mut sm) = smoke_tracker {
         sm.context_initialized = ctx_ready;
@@ -2399,9 +2447,14 @@ fn run_windows_frameless_browser(
         ));
     }
 
-    // Hydrate any missing encrypted Roaming auth cookies into Chromium's CookieManager
+    // Synchronously warm Chromium's persistent SQLite CookieStore AND hydrate any missing encrypted
+    // Roaming auth cookies BEFORE initial restored tabs navigate — preventing the "appeared logged
+    // out until manual F5 refresh" startup race!
     if smoke_opt.is_none() {
-        cef_runtime::hydrate_cookies_from_roaming_cef(&shared_shell);
+        let _hydrated = cef_runtime::hydrate_cookies_from_roaming_cef_sync(
+            &shared_shell,
+            Duration::from_millis(1500),
+        );
     }
 
     let download_resolver: CefDownloadResolver = Arc::new(|suggested: &str, uri: &str| {
@@ -2711,6 +2764,60 @@ fn run_windows_frameless_browser(
         }
     };
 
+    let flush_live_crash_checkpoint = |wins: &HashMap<WindowId, BrowserWindowState>,
+                                       cfg: &ServerConfig,
+                                       shared: &Arc<Mutex<SingularityBrowserShell>>| {
+        let mut live_files: Vec<crate::roaming_store::WindowSessionFile> = Vec::new();
+        let pid = std::process::id();
+        let now_ts = crate::roaming_store::unix_now();
+        if let Ok(mut map) = cfg.window_sessions.lock() {
+            for st in wins.values() {
+                if let Some(sess) = map.get_mut(&st.session_id) {
+                    for (&tid, u) in &st.tab_last_urls {
+                        let t = st.tab_media_times.get(&tid).copied().unwrap_or(0);
+                        let sy = st.tab_scroll_ys.get(&tid).copied().unwrap_or(0);
+                        if t >= 2 || sy > 0 {
+                            let norm_u = normalize_url_without_media_time(u);
+                            for entry in &mut sess.saved_tabs {
+                                if normalize_url_without_media_time(&entry.url) == norm_u {
+                                    if t >= 2 {
+                                        entry.media_time_sec = Some(t);
+                                    }
+                                    if sy > 0 {
+                                        entry.scroll_y = Some(sy);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !sess.saved_tabs.is_empty() {
+                        live_files.push(crate::roaming_store::WindowSessionFile {
+                            window_id: st.session_id.clone(),
+                            pid,
+                            updated_unix: now_ts,
+                            active_tab_index: sess.active_tab_index,
+                            tabs: sess.saved_tabs.clone(),
+                            tab_groups: sess.saved_tab_groups.clone(),
+                            geometry: sess.geometry,
+                            closed_while_other_live: false,
+                        });
+                    }
+                }
+            }
+        }
+        if !live_files.is_empty() {
+            if let Ok(shell) = shared.lock() {
+                if !shell.private_browsing_active && shell.roaming.profile.restore_session {
+                    shell.roaming.save_crash_checkpoint(&live_files);
+                }
+            }
+        }
+    };
+
+    if smoke_opt.is_none() {
+        flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn spawn_content_tab_cef(
         win_id: WindowId,
@@ -2813,6 +2920,15 @@ fn run_windows_frameless_browser(
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                if let Some(ref mut sm) = smoke_tracker {
+                    if windows.contains_key(&window_id) {
+                        sm.close_requested_count += 1;
+                        sm.log(&format!(
+                            "ERROR: Unexpected CloseRequested fired on primary window (count={})!",
+                            sm.close_requested_count
+                        ));
+                    }
+                }
                 if let Some(mut st) = windows.remove(&window_id) {
                     st.close_ext_popup();
                     let others_alive = !windows.is_empty();
@@ -2829,10 +2945,14 @@ fn run_windows_frameless_browser(
                             cef_runtime::pump_cef_message_loop();
                             std::thread::sleep(Duration::from_millis(8));
                         }
+                        cef_runtime::flush_cookie_store_cef_sync(Duration::from_millis(800));
                         {
                             let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                             shell.roaming.flush_async_persistence();
                             shell.roaming.unregister_live_window();
+                        }
+                        if smoke_tracker.is_none() {
+                            crate::crash_guard::mark_clean_shutdown(&root_dir);
                         }
                         drop(incognito_ctx.take());
                         drop(cef_guard.take());
@@ -3019,7 +3139,6 @@ fn run_windows_frameless_browser(
                         if sm.finished {
                             return;
                         }
-                        sm.finished = true;
                         let mut fail_reasons: Vec<String> = Vec::new();
                         if !sm.context_initialized {
                             fail_reasons.push("on_context_initialized did not fire".to_string());
@@ -3081,7 +3200,7 @@ fn run_windows_frameless_browser(
                                 }
                             }
                             sm.log(&format!(
-                                "Window & pixel check: ws_clipchildren={}, ui_hwnd=0x{:x}, ui_visible={}, ui_rect={}x{}, print_window_ok={}, cap={}x{}, bar_non_black={}, total_non_black={}, max_luma={}",
+                                "Window & pixel check: ws_clipchildren={}, ui_hwnd=0x{:x}, ui_visible={}, ui_rect={}x{}, print_window_ok={}, cap={}x{}, bar_non_black={}, total_non_black={}, max_luma={}, codecs=[{}]",
                                 has_clip,
                                 ui_hwnd as usize,
                                 ui_vis,
@@ -3092,7 +3211,8 @@ fn run_windows_frameless_browser(
                                 ch,
                                 bar_px,
                                 tot_px,
-                                max_luma
+                                max_luma,
+                                sm.codecs_summary
                             ));
                             if pw_ok && tot_px < 50 {
                                 fail_reasons.push(format!(
@@ -3103,9 +3223,76 @@ fn run_windows_frameless_browser(
                         } else {
                             fail_reasons.push("primary window missing during pixel check".to_string());
                         }
+                        sm.pixel_fail_reasons = fail_reasons;
+
+                        // Phase 2 of CEF smoke test: spawn a real child content tab (9999) and
+                        // close ONLY that tab to prove `do_close() == 1` + `DestroyWindow(child)`
+                        // NEVER triggers `WM_CLOSE` on the top-level parent `tao` window!
+                        if let Some(st) = windows.get_mut(&wid) {
+                            let smoke_tab_url = format!("http://127.0.0.1:{}/api/logo.png", bind_port);
+                            sm.log("Phase 2: Spawning real content tab 9999 to verify closing 1 tab keeps parent window alive");
+                            spawn_content_tab_cef(
+                                wid,
+                                st,
+                                9999,
+                                &smoke_tab_url,
+                                bind_port,
+                                false,
+                                &mut incognito_ctx,
+                                None,
+                                None,
+                                false,
+                                &proxy,
+                                &shared_shell,
+                                &download_resolver,
+                            );
+                        } else {
+                            let _ = proxy.send_event(WinEvent::SmokeFinalize(wid));
+                        }
+                    }
+                }
+                WinEvent::SmokeFinalize(wid) => {
+                    if let Some(ref mut sm) = smoke_tracker {
+                        if sm.finished {
+                            return;
+                        }
+                        sm.finished = true;
+                        let mut fail_reasons = std::mem::take(&mut sm.pixel_fail_reasons);
+                        if !sm.smoke_tab_created || !sm.smoke_tab_closed {
+                            fail_reasons.push(format!(
+                                "smoke content tab lifecycle incomplete (created={}, closed={})",
+                                sm.smoke_tab_created, sm.smoke_tab_closed
+                            ));
+                        }
+                        if sm.close_requested_count > 0 {
+                            fail_reasons.push(format!(
+                                "CLOSING 1 TAB KILLED PARENT WINDOW: CloseRequested fired {} time(s)!",
+                                sm.close_requested_count
+                            ));
+                        }
+                        let parent_alive = windows
+                            .get(&wid)
+                            .map(|st| {
+                                let p_hwnd = st.window.hwnd() as *mut core::ffi::c_void;
+                                unsafe { IsWindow(p_hwnd) != 0 && IsWindowVisible(p_hwnd) != 0 }
+                            })
+                            .unwrap_or(false);
+                        if !parent_alive {
+                            fail_reasons.push(
+                                "parent window disappeared or became invisible after closing single content tab"
+                                    .to_string(),
+                            );
+                        }
+                        sm.log(&format!(
+                            "Tab-close resilience check: tab_created={}, tab_closed={}, close_requested_count={}, parent_still_alive={}",
+                            sm.smoke_tab_created,
+                            sm.smoke_tab_closed,
+                            sm.close_requested_count,
+                            parent_alive
+                        ));
 
                         let exit_code = if fail_reasons.is_empty() {
-                            sm.log("RESULT=PASS (Pure Chromium CEF UI rendered cleanly!)");
+                            sm.log("RESULT=PASS (Pure Chromium CEF UI rendered cleanly & single-tab close kept parent window alive!)");
                             0
                         } else {
                             sm.log(&format!("RESULT=FAIL: {}", fail_reasons.join(" | ")));
@@ -3128,13 +3315,16 @@ fn run_windows_frameless_browser(
                         }
                         sm.finished = true;
                         sm.log(&format!(
-                            "RESULT=FAIL: Timeout ({}s) — ctx_init={}, browser_created={}, http={:?}, ui_ready={}, probe_ok={}, fatal={:?}",
+                            "RESULT=FAIL: Timeout ({}s) — ctx_init={}, browser_created={}, http={:?}, ui_ready={}, probe_ok={}, tab_created={}, tab_closed={}, close_req={}, fatal={:?}",
                             sm.opts.timeout_secs,
                             sm.context_initialized,
                             sm.browser_created,
                             sm.ui_http_status,
                             sm.ui_ready,
                             sm.probe_ok,
+                            sm.smoke_tab_created,
+                            sm.smoke_tab_closed,
+                            sm.close_requested_count,
                             sm.fatal_error
                         ));
                         windows.clear();
@@ -3184,6 +3374,9 @@ fn run_windows_frameless_browser(
                     }
                 }
                 WinEvent::CefCallback(wid, cb_evt) => match cb_evt {
+                    CefCallbackEvent::DestroyChildHwnd { hwnd } => {
+                        destroy_cef_child_hwnd(hwnd);
+                    }
                     CefCallbackEvent::BrowserCreated { tab_id, is_ui, hwnd } => {
                         if let Some(st) = windows.get_mut(&wid) {
                             if is_ui {
@@ -3196,6 +3389,31 @@ fn run_windows_frameless_browser(
                             } else if let Some(b) = st.tab_browsers.get(&tab_id) {
                                 b.cache_hwnd(hwnd);
                                 st.layout_cache.invalidate_tab(Some(tab_id));
+                                if tab_id == 9999 {
+                                    if let Some(ref mut sm) = smoke_tracker {
+                                        if !sm.smoke_tab_closed {
+                                            sm.smoke_tab_created = true;
+                                            sm.smoke_tab_closed = true;
+                                            sm.log(&format!(
+                                                "Smoke content tab 9999 created (hwnd=0x{:x}) — closing ONLY tab 9999 now",
+                                                hwnd as usize
+                                            ));
+                                            if let Some(tab_handle) = st.tab_browsers.remove(&9999) {
+                                                drop(tab_handle);
+                                            }
+                                            st.layout_cache.invalidate_tab(Some(9999));
+                                            let fin_proxy = proxy.clone();
+                                            let _ = std::thread::Builder::new()
+                                                .name("singularity-smoke-finalize".into())
+                                                .stack_size(128 * 1024)
+                                                .spawn(move || {
+                                                    std::thread::sleep(Duration::from_millis(550));
+                                                    let _ = fin_proxy.send_event(WinEvent::SmokeFinalize(wid));
+                                                });
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                             st.sync_layout();
                         }
@@ -3256,6 +3474,46 @@ fn run_windows_frameless_browser(
                             sm.log(&msg);
                             if is_ui && sm.fatal_error.is_none() {
                                 sm.fatal_error = Some(msg);
+                            }
+                        } else {
+                            let tab_url = windows
+                                .get(&wid)
+                                .and_then(|st| st.tab_last_urls.get(&tab_id).cloned())
+                                .unwrap_or_default();
+                            let kind = if is_ui {
+                                "cef_ui_renderer_crash"
+                            } else {
+                                "cef_tab_renderer_crash"
+                            };
+                            let summary = format!(
+                                "Chromium renderer terminated (is_ui={}, tab={}, status={}, code={})",
+                                is_ui, tab_id, status, error_code
+                            );
+                            let details = format!(
+                                "Component  : {}\nTab ID     : {}\nURL        : {}\nStatus     : {}\nError Code : {}\nError Text : {}",
+                                if is_ui { "Browser UI Shell" } else { "Web Tab Renderer" },
+                                tab_id,
+                                if tab_url.is_empty() { "<none>" } else { &tab_url },
+                                status,
+                                error_code,
+                                if error_string.is_empty() { "<none>" } else { &error_string }
+                            );
+                            let rep = crate::crash_guard::record_runtime_error_report(
+                                &root_dir, kind, &summary, &details,
+                            );
+                            if is_ui {
+                                pending_crash_report = Some(rep);
+                            } else if let Some(st) = windows.get(&wid) {
+                                emit_ui_sync(
+                                    &st.ui_browser,
+                                    &serde_json::json!({
+                                        "crash_report": {
+                                            "kind": rep.kind,
+                                            "summary": rep.summary,
+                                            "text": rep.format_copyable_text()
+                                        }
+                                    }),
+                                );
                             }
                         }
                         if is_ui {
@@ -3748,7 +4006,9 @@ fn run_windows_frameless_browser(
                                             "scroll_y": scroll_y
                                         }),
                                     );
+                                    let mut should_flush_checkpoint = false;
                                     if last_media_disk_flush.elapsed() >= Duration::from_secs(6) {
+                                        should_flush_checkpoint = true;
                                         let mut shell = shared_shell
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner());
@@ -3763,8 +4023,12 @@ fn run_windows_frameless_browser(
                                             shell.roaming.schedule_save_profile();
                                             history_dirty = false;
                                             last_history_disk_flush = std::time::Instant::now();
-                                            last_media_disk_flush = std::time::Instant::now();
                                         }
+                                        last_media_disk_flush = std::time::Instant::now();
+                                    }
+                                    if should_flush_checkpoint && smoke_tracker.is_none() {
+                                        let _ = st;
+                                        flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
                                     }
                                 }
                             }
@@ -3815,6 +4079,20 @@ fn run_windows_frameless_browser(
                                         &st.ui_browser,
                                         &serde_json::json!({ "ram_active_count": st.tab_browsers.len() }),
                                     );
+                                    if smoke_tracker.is_none() {
+                                        if let Some(rep) = pending_crash_report.take() {
+                                            emit_ui_sync(
+                                                &st.ui_browser,
+                                                &serde_json::json!({
+                                                    "crash_report": {
+                                                        "kind": rep.kind,
+                                                        "summary": rep.summary,
+                                                        "text": rep.format_copyable_text()
+                                                    }
+                                                }),
+                                            );
+                                        }
+                                    }
                                     if let Some(ref mut sm) = smoke_tracker {
                                         if !sm.ui_ready {
                                             sm.ui_ready = true;
@@ -3827,6 +4105,10 @@ fn run_windows_frameless_browser(
                                                             var url = document.querySelector('.omnibar-input') || document.querySelector('input');
                                                             var br = bar ? bar.getBoundingClientRect() : {width:0,height:0};
                                                             var tabs = document.querySelectorAll('.tab-pill').length;
+                                                            var vid = document.createElement('video');
+                                                            var codecs = 'h264=' + (vid.canPlayType('video/mp4; codecs="avc1.42E01E"') || 'no')
+                                                                + ',vp9=' + (vid.canPlayType('video/webm; codecs="vp9"') || 'no')
+                                                                + ',av1=' + (vid.canPlayType('video/mp4; codecs="av01.0.04M.08"') || 'no');
                                                             if (window.ipc && window.ipc.postMessage) {
                                                                 window.ipc.postMessage(JSON.stringify({
                                                                     cmd: 'smoke_probe',
@@ -3835,7 +4117,8 @@ fn run_windows_frameless_browser(
                                                                     body_w: Math.round(window.innerWidth || 0),
                                                                     body_h: Math.round(window.innerHeight || 0),
                                                                     has_url_input: !!url,
-                                                                    tab_count: tabs
+                                                                    tab_count: tabs,
+                                                                    codecs: codecs
                                                                 }));
                                                             }
                                                         });
@@ -3846,6 +4129,9 @@ fn run_windows_frameless_browser(
                                     }
                                 }
                             }
+                            UiIpcCmd::CopyText { text } => {
+                                let _ = crate::crash_guard::copy_text_to_windows_clipboard(&text);
+                            }
                             UiIpcCmd::SmokeProbe {
                                 bar_h,
                                 bar_w,
@@ -3853,11 +4139,13 @@ fn run_windows_frameless_browser(
                                 body_h,
                                 has_url_input,
                                 tab_count,
+                                codecs,
                             } => {
                                 if let Some(ref mut sm) = smoke_tracker {
+                                    sm.codecs_summary = codecs.clone();
                                     let summary = format!(
-                                        "bar={}x{}, viewport={}x{}, has_url_input={}, tab_count={}",
-                                        bar_w, bar_h, body_w, body_h, has_url_input, tab_count
+                                        "bar={}x{}, viewport={}x{}, has_url_input={}, tab_count={}, codecs=[{}]",
+                                        bar_w, bar_h, body_w, body_h, has_url_input, tab_count, codecs
                                     );
                                     sm.probe_summary = summary.clone();
                                     sm.probe_ok = bar_h >= 40
@@ -3986,12 +4274,18 @@ fn run_windows_frameless_browser(
                                             cef_runtime::pump_cef_message_loop();
                                             std::thread::sleep(Duration::from_millis(8));
                                         }
+                                        cef_runtime::flush_cookie_store_cef_sync(
+                                            Duration::from_millis(800),
+                                        );
                                         {
                                             let shell = shared_shell
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
                                             shell.roaming.flush_async_persistence();
                                             shell.roaming.unregister_live_window();
+                                        }
+                                        if smoke_tracker.is_none() {
+                                            crate::crash_guard::mark_clean_shutdown(&root_dir);
                                         }
                                         drop(incognito_ctx.take());
                                         drop(cef_guard.take());
@@ -4860,6 +5154,12 @@ fn run_windows_frameless_browser(
                                             drop(st);
                                         }
                                         if windows.is_empty() {
+                                            cef_runtime::flush_cookie_store_cef_sync(
+                                                Duration::from_millis(800),
+                                            );
+                                            if smoke_tracker.is_none() {
+                                                crate::crash_guard::mark_clean_shutdown(&root_dir);
+                                            }
                                             drop(incognito_ctx.take());
                                             drop(cef_guard.take());
                                             *control_flow = ControlFlow::Exit;
@@ -5988,14 +6288,31 @@ fn dispatch_http_request(
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
                     if let Some(wid) = req_win_id {
-                        let geom = if let Ok(mut map) = cfg.window_sessions.lock() {
+                        let (geom, all_live_sessions) = if let Ok(mut map) = cfg.window_sessions.lock() {
                             let entry = map.entry(wid.clone()).or_default();
                             entry.saved_tabs = clean_tabs.clone();
                             entry.saved_tab_groups = clean_groups.clone();
                             entry.active_tab_index = active_idx;
-                            entry.geometry
+                            let g = entry.geometry;
+                            let pid = std::process::id();
+                            let now_ts = crate::roaming_store::unix_now();
+                            let snap: Vec<crate::roaming_store::WindowSessionFile> = map
+                                .iter()
+                                .filter(|(_, s)| !s.saved_tabs.is_empty())
+                                .map(|(id, s)| crate::roaming_store::WindowSessionFile {
+                                    window_id: id.clone(),
+                                    pid,
+                                    updated_unix: now_ts,
+                                    active_tab_index: s.active_tab_index,
+                                    tabs: s.saved_tabs.clone(),
+                                    tab_groups: s.saved_tab_groups.clone(),
+                                    geometry: s.geometry,
+                                    closed_while_other_live: false,
+                                })
+                                .collect();
+                            (g, snap)
                         } else {
-                            WindowGeometry::default()
+                            (WindowGeometry::default(), Vec::new())
                         };
                         if !shell.private_browsing_active && shell.roaming.profile.restore_session {
                             let _ = shell.roaming.save_window_session_for(
@@ -6004,9 +6321,12 @@ fn dispatch_http_request(
                                 &clean_groups,
                                 active_idx,
                                 geom,
-                                true,
                                 false,
+                                true,
                             );
+                            if !all_live_sessions.is_empty() {
+                                shell.roaming.save_crash_checkpoint(&all_live_sessions);
+                            }
                         }
                         if shell.roaming.window_id() == wid {
                             shell.roaming.profile.saved_tabs = clean_tabs;

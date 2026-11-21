@@ -732,12 +732,16 @@ impl RoamingSingularityStore {
             // - On restart, Window #1 claims the first dead session and queues each remaining
             //   non-empty dead window session as a single-use `--restore-session <id>` handoff
             //   so EVERY previously open window reopens separately with its own tabs (never merged!).
+            let crashed_prev = crate::crash_guard::has_unclean_crash_sentinel(&root_dir);
             let mut live_other_windows = 0usize;
             let mut dead_sessions: Vec<(PathBuf, WindowSessionFile)> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
                 for ent in entries.flatten() {
                     let p = ent.path();
                     if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if p.file_name().and_then(|n| n.to_str()) == Some("crash_checkpoint.json") {
                         continue;
                     }
                     if let Some(sess) = load_window_session_file(&p) {
@@ -757,56 +761,76 @@ impl RoamingSingularityStore {
                 profile.saved_tabs.clear();
                 profile.saved_tab_groups.clear();
                 profile.active_tab_index = 0;
-            } else if !dead_sessions.is_empty() {
-                dead_sessions.sort_by_key(|(_, s)| s.updated_unix);
+            } else {
                 let mut all_non_empty: Vec<WindowSessionFile> = Vec::new();
+                dead_sessions.sort_by_key(|(_, s)| s.updated_unix);
                 for (path, sess) in dead_sessions {
                     claimed_dead_paths.push(path);
                     if !sess.tabs.is_empty() {
                         all_non_empty.push(sess);
                     }
                 }
-                let latest_active_unix = all_non_empty
-                    .iter()
-                    .filter(|s| !s.closed_while_other_live)
-                    .map(|s| s.updated_unix)
-                    .max()
-                    .or_else(|| all_non_empty.iter().map(|s| s.updated_unix).max())
-                    .unwrap_or(0);
-                // Keep every window that crashed/power-lost/closed last (`!closed_while_other_live`)
-                // OR closed within 20s of the last window (Windows Restart / multi-window exit).
-                let non_empty_dead: Vec<WindowSessionFile> = all_non_empty
-                    .into_iter()
-                    .filter(|s| {
-                        !s.closed_while_other_live
-                            || latest_active_unix.saturating_sub(s.updated_unix) <= 20
-                    })
-                    .collect();
-
-                if let Some(first) = non_empty_dead.first() {
-                    profile.saved_tabs = first.tabs.clone();
-                    profile.saved_tab_groups = first.tab_groups.clone();
-                    profile.active_tab_index = first
-                        .active_tab_index
-                        .min(profile.saved_tabs.len().saturating_sub(1));
-                    window_geometry = first.geometry;
-                    restored_windows_count = 1;
-
-                    if profile.restore_session {
-                        // Spawn each additional dead window as its own independent Singularity window
-                        // (capped at 7 extra windows = 8 total for safety).
-                        for sibling in non_empty_dead.into_iter().skip(1).take(7) {
-                            let rp = WindowRestorePayload {
-                                active_tab_index: sibling.active_tab_index,
-                                tabs: sibling.tabs,
-                                tab_groups: sibling.tab_groups,
-                                geometry: sibling.geometry,
-                            };
-                            if let Ok(rid) = Self::write_window_restore_handoff_at(&root_dir, &rp) {
-                                pending_restore_window_ids.push(rid);
-                            }
+                if crashed_prev || all_non_empty.is_empty() {
+                    for cp_sess in Self::load_crash_checkpoint_at(&root_dir) {
+                        if cp_sess.tabs.is_empty() {
+                            continue;
                         }
-                        restored_windows_count += pending_restore_window_ids.len();
+                        if let Some(existing) =
+                            all_non_empty.iter_mut().find(|s| s.window_id == cp_sess.window_id)
+                        {
+                            if cp_sess.updated_unix >= existing.updated_unix {
+                                *existing = cp_sess;
+                            }
+                        } else {
+                            all_non_empty.push(cp_sess);
+                        }
+                    }
+                }
+                if !all_non_empty.is_empty() {
+                    let latest_active_unix = all_non_empty
+                        .iter()
+                        .filter(|s| !s.closed_while_other_live)
+                        .map(|s| s.updated_unix)
+                        .max()
+                        .or_else(|| all_non_empty.iter().map(|s| s.updated_unix).max())
+                        .unwrap_or(0);
+                    // On crash recovery, restore EVERY non-empty window from the last checkpoint.
+                    // On normal restart, restore every window still open at exit (`!closed_while_other_live`)
+                    // OR closed within 20s of the last window (Windows Restart / multi-window exit).
+                    let non_empty_dead: Vec<WindowSessionFile> = all_non_empty
+                        .into_iter()
+                        .filter(|s| {
+                            crashed_prev
+                                || !s.closed_while_other_live
+                                || latest_active_unix.saturating_sub(s.updated_unix) <= 20
+                        })
+                        .collect();
+
+                    if let Some(first) = non_empty_dead.first() {
+                        profile.saved_tabs = first.tabs.clone();
+                        profile.saved_tab_groups = first.tab_groups.clone();
+                        profile.active_tab_index = first
+                            .active_tab_index
+                            .min(profile.saved_tabs.len().saturating_sub(1));
+                        window_geometry = first.geometry;
+                        restored_windows_count = 1;
+
+                        if profile.restore_session {
+                            // Spawn each additional dead window as its own independent Singularity window
+                            // (capped at 7 extra windows = 8 total for safety).
+                            for sibling in non_empty_dead.into_iter().skip(1).take(7) {
+                                let rp = WindowRestorePayload {
+                                    active_tab_index: sibling.active_tab_index,
+                                    tabs: sibling.tabs,
+                                    tab_groups: sibling.tab_groups,
+                                    geometry: sibling.geometry,
+                                };
+                                if let Ok(rid) = Self::write_window_restore_handoff_at(&root_dir, &rp) {
+                                    pending_restore_window_ids.push(rid);
+                                }
+                            }
+                            restored_windows_count += pending_restore_window_ids.len();
+                        }
                     }
                 }
             }
@@ -1072,6 +1096,28 @@ impl RoamingSingularityStore {
         let p = self.sessions_dir().join(format!("{}.json", window_id));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("json.bak"));
+    }
+
+    /// Atomically persists a rolling multi-window crash-recovery checkpoint containing ALL open
+    /// windows, tabs, groups, active indices, geometries, and latest video timestamps.
+    pub fn save_crash_checkpoint(&self, sessions: &[WindowSessionFile]) {
+        if sessions.is_empty() {
+            return;
+        }
+        let sessions_dir = self.sessions_dir();
+        let _ = std::fs::create_dir_all(&sessions_dir);
+        if let Ok(bytes) = serde_json::to_vec(sessions) {
+            let _ = atomic_write(&sessions_dir.join("crash_checkpoint.json"), &bytes);
+        }
+    }
+
+    /// Loads the rolling multi-window crash-recovery checkpoint if present.
+    pub fn load_crash_checkpoint_at(root_dir: &Path) -> Vec<WindowSessionFile> {
+        let p = root_dir.join("sessions").join("crash_checkpoint.json");
+        let Ok(bytes) = std::fs::read(&p) else {
+            return Vec::new();
+        };
+        serde_json::from_slice::<Vec<WindowSessionFile>>(&bytes).unwrap_or_default()
     }
 
     /// Allocates an isolated, reusable per-live-window WebView2 user-data directory
@@ -1626,6 +1672,27 @@ pub fn classify_auth_cookie(domain: &str, cookie_name: &str) -> Option<&'static 
         }
     }
 
+    if is_tiktok_domain(&d) {
+        const TIKTOK_AUTH: &[&str] = &[
+            "sessionid",
+            "sessionid_ss",
+            "sid_tt",
+            "uid_tt",
+            "uid_tt_ss",
+            "sid_guard",
+            "sid_ucp_v1",
+            "ssid_ucp_v1",
+            "odin_tt",
+            "cmpl_token",
+            "tt_chain_token",
+            "passport_auth_status",
+            "passport_auth_status_ss",
+        ];
+        if TIKTOK_AUTH.contains(&n.as_str()) {
+            return Some("TikTok");
+        }
+    }
+
     // Generic OAuth / SSO / Session cookies on other sites
     if n.contains("access_token")
         || n.contains("refresh_token")
@@ -1641,6 +1708,21 @@ pub fn classify_auth_cookie(domain: &str, cookie_name: &str) -> Option<&'static 
     None
 }
 
+fn is_tiktok_domain(d: &str) -> bool {
+    const TIKTOK_DOMAINS: &[&str] = &[
+        "tiktok.com",
+        "tiktokv.com",
+        "tiktokw.us",
+        "byteoversea.com",
+        "tiktokcdn.com",
+        "tiktokcdn-us.com",
+        "tiktokcdn-eu.com",
+        "ttwstatic.com",
+        "musical.ly",
+    ];
+    TIKTOK_DOMAINS.iter().any(|t| matches_domain_or_sub(d, t))
+}
+
 /// Classification for selective cookie scrubbing: ONLY trackers, ad-network cookies, and
 /// malicious/injected cookies are ever removed; 100% of login tokens, sessions, consent,
 /// CSRF, anti-bot, and functional cookies are strictly preserved.
@@ -1652,14 +1734,20 @@ pub enum CookieThreatKind {
 }
 
 /// Returns `true` for cookies that are strictly protected (auth tokens, `__Host-`/`__Secure-`
-/// security cookies, Google/YouTube consent & anti-abuse cookies, Cloudflare/CSRF/session cookies)
-/// and must NEVER be deleted by selective tracker cleanup.
+/// security cookies, Google/YouTube consent & anti-abuse cookies, TikTok first-party session &
+/// anti-bot cookies, Cloudflare/CSRF/session cookies) and must NEVER be deleted by selective cleanup.
 pub fn is_protected_session_or_functional_cookie(domain: &str, cookie_name: &str) -> bool {
     if classify_auth_cookie(domain, cookie_name).is_some() {
         return true;
     }
+    let d = domain.trim_start_matches('.').to_ascii_lowercase();
     let n = cookie_name.trim().to_ascii_lowercase();
     if n.starts_with("__host-") || n.starts_with("__secure-") {
+        return true;
+    }
+    // Preserve ALL first-party TikTok anti-bot, feed, device & pixel-compat cookies on TikTok's own
+    // domains (while still blocking 3rd-party `_ttp` ad pixel cookies on external websites).
+    if is_tiktok_domain(&d) {
         return true;
     }
     const ESSENTIAL_COOKIES: &[&str] = &[
@@ -1680,7 +1768,27 @@ pub fn is_protected_session_or_functional_cookie(domain: &str, cookie_name: &str
         "dv",
         "cgic",
         "stx_gp",
-        // Anti-bot / Cloudflare / WAF / CSRF / standard web sessions
+        // TikTok / anti-bot / Cloudflare / Akamai / DataDome / WAF / CSRF / standard web sessions
+        "ttwid",
+        "mstoken",
+        "s_v_web_id",
+        "tt_csrf_token",
+        "passport_csrf_token",
+        "passport_csrf_token_default",
+        "passport_fe_beating_status",
+        "tt_webid",
+        "tt_webid_v2",
+        "store-idc",
+        "store-country-code",
+        "tt-target-idc",
+        "webapp_launch_mode",
+        "ak_bmsc",
+        "bm_sz",
+        "_abck",
+        "datadome",
+        "px3",
+        "_px3",
+        "_pxvid",
         "cf_clearance",
         "__cf_bm",
         "_cfuvid",
@@ -1842,7 +1950,6 @@ pub fn classify_tracker_or_malicious_cookie(
         "analytics.google.com",
         "facebook.net",
         "connect.facebook.net",
-        "analytics.tiktok.com",
         "scorecardresearch.com",
         "quantserve.com",
         "hotjar.com",
@@ -1884,8 +1991,6 @@ pub fn classify_tracker_or_malicious_cookie(
         "heap.io",
         "heapanalytics.com",
         "pendo.io",
-        "tiktokw.us",
-        "byteoversea.com",
     ];
     if TRACKER_DOMAINS
         .iter()
