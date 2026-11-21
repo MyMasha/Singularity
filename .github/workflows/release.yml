@@ -112,8 +112,11 @@ jobs:
           # Smoke-test real Windows silent SFX extraction of Pure Chromium CEF runtime
           $smokeDir = Join-Path $env:RUNNER_TEMP "singularity-smoke-install"
           Remove-Item -Recurse -Force $smokeDir -ErrorAction SilentlyContinue
-          & release-artifacts\Singularity-setup.exe --silent --dir $smokeDir
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pInstall = Start-Process -FilePath "release-artifacts\Singularity-setup.exe" -ArgumentList "--silent", "--dir", $smokeDir -Wait -PassThru
+          if ($pInstall.ExitCode -ne 0) {
+            Write-Error "Smoke install exited with code $($pInstall.ExitCode)"
+            exit 1
+          }
           foreach ($f in @("singularity.exe", "libcef.dll", "icudtl.dat", "resources.pak", "locales\en-US.pak", "locales\fr.pak")) {
             $p = Join-Path $smokeDir $f
             if (-not (Test-Path $p)) {
@@ -121,6 +124,7 @@ jobs:
               exit 1
             }
           }
+          Write-Host "[OK] Silent SFX extraction verified all Pure Chromium CEF runtime files"
           Remove-Item -Recurse -Force $smokeDir -ErrorAction SilentlyContinue
 
           # Smoke-test /DELAYLOAD:libcef.dll: running singularity.exe ALONE (no libcef.dll!) must NOT fail with OS DLL error
@@ -128,12 +132,12 @@ jobs:
           Remove-Item -Recurse -Force $isoDir -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $isoDir | Out-Null
           Copy-Item target\release\singularity.exe (Join-Path $isoDir "singularity.exe") -Force
-          $verOut = & (Join-Path $isoDir "singularity.exe") --version
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Isolated singularity.exe --version failed (delay-load libcef.dll broken!)"
+          $pIso = Start-Process -FilePath (Join-Path $isoDir "singularity.exe") -ArgumentList "--version" -Wait -PassThru
+          if ($pIso.ExitCode -ne 0) {
+            Write-Error "Isolated singularity.exe --version exited with code $($pIso.ExitCode) (delay-load libcef.dll broken!)"
             exit 1
           }
-          Write-Host "[OK] /DELAYLOAD:libcef.dll verified without libcef.dll: $verOut"
+          Write-Host "[OK] /DELAYLOAD:libcef.dll verified cleanly without libcef.dll (exit code 0)"
           Remove-Item -Recurse -Force $isoDir -ErrorAction SilentlyContinue
 
           Copy-Item target\release\singularity.exe release-artifacts\singularity.exe -Force

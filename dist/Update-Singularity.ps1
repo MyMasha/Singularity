@@ -82,8 +82,11 @@ if ($actualHash -ne $expectedHash) {
 Write-Host "      SHA-256 verified: $actualHash" -ForegroundColor Green
 
 Write-Host "[4/4] Installing Singularity $tag + Pure Chromium runtime into $InstallDir ..." -ForegroundColor Gray
-& $SetupExe --silent --dir $InstallDir --launch
+$proc = Start-Process -FilePath $SetupExe -ArgumentList "--silent", "--dir", $InstallDir, "--launch" -Wait -PassThru
 Remove-Item -LiteralPath $SetupExe -Force -ErrorAction SilentlyContinue
+if ($proc.ExitCode -ne 0) {
+    throw "Singularity-setup.exe exited with code $($proc.ExitCode)."
+}
 
 Write-Host ""
 Write-Host "[OK] Singularity $tag installed and verified." -ForegroundColor Green
