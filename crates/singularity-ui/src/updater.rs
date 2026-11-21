@@ -302,6 +302,236 @@ pub fn verify_downloaded_binary_sha256(
     Ok(())
 }
 
+/// Checks whether the Pure Chromium (CEF) runtime (`libcef.dll`, `icudtl.dat`, `resources.pak`)
+/// is installed alongside the currently running `singularity.exe`.
+#[cfg(target_os = "windows")]
+pub fn has_local_cef_runtime() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    dir.join("libcef.dll").is_file()
+        && dir.join("icudtl.dat").is_file()
+        && dir.join("resources.pak").is_file()
+}
+
+/// Ensures Windows searches the `singularity.exe` directory first when delay-loading `libcef.dll`
+/// and its Chromium dependencies, even if launched with an arbitrary working directory.
+#[cfg(target_os = "windows")]
+pub fn configure_local_cef_dll_directory() {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+            unsafe {
+                let _ = SetDllDirectoryW(wide.as_ptr());
+            }
+        }
+    }
+}
+
+/// Displays a clear native Win32 dialog if Pure Chromium runtime files are missing and offline
+/// self-healing could not reach GitHub Releases (never an opaque system DLL error).
+#[cfg(target_os = "windows")]
+pub fn show_missing_cef_error_dialog(err: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hWnd: *mut core::ffi::c_void,
+            lpText: *const u16,
+            lpCaption: *const u16,
+            uType: u32,
+        ) -> i32;
+    }
+    let body = format!(
+        "Singularity Browser v{} requires its Pure Chromium (CEF) runtime (libcef.dll), which was not found next to singularity.exe.\n\n\
+         Automatic download failed: {}\n\n\
+         Please download and run Singularity-setup.exe from:\n\
+         https://github.com/MyMasha/Singularity/releases/latest\n\n\
+         Your existing encrypted profile (%APPDATA%\\.singularity) will be preserved.",
+        CURRENT_VERSION, err
+    );
+    let text_w: Vec<u16> = std::ffi::OsStr::new(&body).encode_wide().chain(Some(0)).collect();
+    let title_w: Vec<u16> = std::ffi::OsStr::new("Singularity Browser — Chromium Runtime Required")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        let _ = MessageBoxW(
+            core::ptr::null_mut(),
+            text_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn download_and_run_verified_setup_installer(target_dir: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let setup_tmp = std::env::temp_dir().join("Singularity-setup-update.exe");
+    let sums_file = std::env::temp_dir().join("Singularity-SHA256SUMS.new.txt");
+    let sig_file = std::env::temp_dir().join("Singularity-SHA256SUMS.new.txt.sig");
+    let require_ed25519 = !RELEASE_SIGNING_PUBKEY_HEX.trim().is_empty();
+    let opt_token = resolve_github_token();
+    let ua = format!("Singularity-Updater/{}", CURRENT_VERSION);
+
+    let fetch_api = |tok: Option<&str>| -> Result<serde_json::Value, String> {
+        let mut headers = vec![("Accept", "application/vnd.github+json")];
+        let auth_val;
+        if let Some(t) = tok {
+            auth_val = format!("Bearer {}", t);
+            headers.push(("Authorization", auth_val.as_str()));
+        }
+        let bytes = crate::winhttp_client::winhttp_get_https_bytes(
+            RELEASES_API_URL,
+            &ua,
+            &headers,
+            8_000,
+            15_000,
+            512 * 1024,
+        )?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "Invalid GitHub Releases API response.".to_string())
+    };
+
+    let rel = match opt_token.as_deref() {
+        Some(tok) => fetch_api(Some(tok)).or_else(|_| fetch_api(None)),
+        None => fetch_api(None),
+    }?;
+
+    let assets = rel
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let find_asset_url = |name: &str| -> Option<String> {
+        assets.iter().find_map(|a| {
+            if a.get("name").and_then(|n| n.as_str()) == Some(name) {
+                a.get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .filter(|u| u.starts_with("https://"))
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    };
+
+    let Some(setup_url) = find_asset_url("Singularity-setup.exe") else {
+        return Err("Release asset 'Singularity-setup.exe' is unavailable for the latest release.".into());
+    };
+    let Some(sums_url) = find_asset_url("SHA256SUMS.txt") else {
+        return Err("Release asset 'SHA256SUMS.txt' is unavailable for the latest release.".into());
+    };
+    let sig_url = find_asset_url("SHA256SUMS.txt.sig");
+
+    let dl_setup = crate::winhttp_client::winhttp_download_https_to_file(
+        &setup_url,
+        &setup_tmp,
+        &ua,
+        &[],
+        10_000,
+        240_000,
+        350 * 1024 * 1024,
+    );
+    let dl_sums = if dl_setup.is_ok() {
+        crate::winhttp_client::winhttp_download_https_to_file(
+            &sums_url,
+            &sums_file,
+            &ua,
+            &[],
+            10_000,
+            25_000,
+            512 * 1024,
+        )
+    } else {
+        Err("Skipped sums".into())
+    };
+    if dl_setup.is_err() || dl_sums.is_err() || !setup_tmp.exists() || !sums_file.exists() {
+        let _ = std::fs::remove_file(&setup_tmp);
+        let _ = std::fs::remove_file(&sums_file);
+        let _ = std::fs::remove_file(&sig_file);
+        return Err("Failed downloading Singularity-setup.exe or SHA256SUMS.txt from GitHub Releases.".into());
+    }
+    if let Some(s_url) = sig_url {
+        let _ = crate::winhttp_client::winhttp_download_https_to_file(
+            &s_url,
+            &sig_file,
+            &ua,
+            &[],
+            8_000,
+            15_000,
+            64 * 1024,
+        );
+    }
+
+    let sums_bytes = std::fs::read(&sums_file)
+        .map_err(|e| format!("Failed reading SHA256SUMS.txt: {}", e))?;
+    let sums_content = String::from_utf8_lossy(&sums_bytes).into_owned();
+    let _ = std::fs::remove_file(&sums_file);
+
+    if require_ed25519 {
+        let sig_str = std::fs::read_to_string(&sig_file).map_err(|_| {
+            let _ = std::fs::remove_file(&setup_tmp);
+            "Missing SHA256SUMS.txt.sig Ed25519 signature. Update aborted.".to_string()
+        })?;
+        let _ = std::fs::remove_file(&sig_file);
+        if let Err(err) =
+            verify_sha256sums_ed25519(&sums_bytes, &sig_str, RELEASE_SIGNING_PUBKEY_HEX)
+        {
+            let _ = std::fs::remove_file(&setup_tmp);
+            return Err(err);
+        }
+    } else {
+        let _ = std::fs::remove_file(&sig_file);
+    }
+
+    if let Err(err) =
+        verify_downloaded_binary_sha256(&setup_tmp, &sums_content, "Singularity-setup.exe")
+    {
+        let _ = std::fs::remove_file(&setup_tmp);
+        return Err(err);
+    }
+
+    // Launch the verified native Win32 installer silently so it atomically installs/updates
+    // `singularity.exe`, `libcef.dll`, and all Pure Chromium CEF runtime files, then relaunches.
+    Command::new(&setup_tmp)
+        .arg("--silent")
+        .arg("--dir")
+        .arg(target_dir)
+        .arg("--launch")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("Failed launching verified installer: {}", e))?;
+    std::process::exit(0);
+}
+
+/// Self-healing Windows runtime bootstrap: if `singularity.exe` was updated in-place from v1.0.x
+/// (Edge WebView2) or run standalone without `libcef.dll`, downloads the verified
+/// `Singularity-setup.exe` bundle and silently installs Pure Chromium CEF into the current folder.
+#[cfg(target_os = "windows")]
+pub fn bootstrap_missing_cef_runtime() -> Result<(), String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Unable to locate current executable: {}", e))?;
+    let target_dir = current_exe.parent().unwrap_or(Path::new("."));
+    download_and_run_verified_setup_installer(target_dir)
+}
+
 /// Downloads, verifies SHA-256 integrity (and Ed25519 signature when configured), and atomically
 /// updates the installation directly from public GitHub Release Assets at
 /// `https://github.com/MyMasha/Singularity`.
@@ -321,157 +551,19 @@ pub fn execute_self_update() -> Result<String, String> {
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("Unable to locate current executable: {}", e))?;
     let target_dir = current_exe.parent().unwrap_or(Path::new("."));
-    #[cfg(not(target_os = "windows"))]
-    let new_exe = target_dir.join("singularity.new");
-    let sums_file = target_dir.join("SHA256SUMS.new.txt");
-    let sig_file = target_dir.join("SHA256SUMS.new.txt.sig");
-    let require_ed25519 = !RELEASE_SIGNING_PUBKEY_HEX.trim().is_empty();
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let setup_tmp = std::env::temp_dir().join("Singularity-setup-update.exe");
-        let opt_token = resolve_github_token();
-        let ua = format!("Singularity-Updater/{}", CURRENT_VERSION);
-
-        let fetch_api = |tok: Option<&str>| -> Result<serde_json::Value, String> {
-            let mut headers = vec![("Accept", "application/vnd.github+json")];
-            let auth_val;
-            if let Some(t) = tok {
-                auth_val = format!("Bearer {}", t);
-                headers.push(("Authorization", auth_val.as_str()));
-            }
-            let bytes = crate::winhttp_client::winhttp_get_https_bytes(
-                RELEASES_API_URL,
-                &ua,
-                &headers,
-                8_000,
-                15_000,
-                512 * 1024,
-            )?;
-            serde_json::from_slice(&bytes)
-                .map_err(|_| "Invalid GitHub Releases API response.".to_string())
-        };
-
-        let rel = match opt_token.as_deref() {
-            Some(tok) => fetch_api(Some(tok)).or_else(|_| fetch_api(None)),
-            None => fetch_api(None),
-        }?;
-
-        let assets = rel
-            .get("assets")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let find_asset_url = |name: &str| -> Option<String> {
-            assets.iter().find_map(|a| {
-                if a.get("name").and_then(|n| n.as_str()) == Some(name) {
-                    a.get("browser_download_url")
-                        .and_then(|u| u.as_str())
-                        .filter(|u| u.starts_with("https://"))
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-        };
-
-        let Some(setup_url) = find_asset_url("Singularity-setup.exe") else {
-            return Err("Release asset 'Singularity-setup.exe' is unavailable for the latest release.".into());
-        };
-        let Some(sums_url) = find_asset_url("SHA256SUMS.txt") else {
-            return Err("Release asset 'SHA256SUMS.txt' is unavailable for the latest release.".into());
-        };
-        let sig_url = find_asset_url("SHA256SUMS.txt.sig");
-
-        let dl_setup = crate::winhttp_client::winhttp_download_https_to_file(
-            &setup_url,
-            &setup_tmp,
-            &ua,
-            &[],
-            10_000,
-            180_000,
-            300 * 1024 * 1024,
-        );
-        let dl_sums = if dl_setup.is_ok() {
-            crate::winhttp_client::winhttp_download_https_to_file(
-                &sums_url,
-                &sums_file,
-                &ua,
-                &[],
-                10_000,
-                25_000,
-                512 * 1024,
-            )
-        } else {
-            Err("Skipped sums".into())
-        };
-        if dl_setup.is_err() || dl_sums.is_err() || !setup_tmp.exists() || !sums_file.exists() {
-            let _ = std::fs::remove_file(&setup_tmp);
-            let _ = std::fs::remove_file(&sums_file);
-            let _ = std::fs::remove_file(&sig_file);
-            return Err("Failed downloading Singularity-setup.exe or SHA256SUMS.txt from GitHub Releases.".into());
-        }
-        if let Some(s_url) = sig_url {
-            let _ = crate::winhttp_client::winhttp_download_https_to_file(
-                &s_url,
-                &sig_file,
-                &ua,
-                &[],
-                8_000,
-                15_000,
-                64 * 1024,
-            );
-        }
-
-        let sums_bytes = std::fs::read(&sums_file)
-            .map_err(|e| format!("Failed reading SHA256SUMS.txt: {}", e))?;
-        let sums_content = String::from_utf8_lossy(&sums_bytes).into_owned();
-        let _ = std::fs::remove_file(&sums_file);
-
-        if require_ed25519 {
-            let sig_str = std::fs::read_to_string(&sig_file).map_err(|_| {
-                let _ = std::fs::remove_file(&setup_tmp);
-                "Missing SHA256SUMS.txt.sig Ed25519 signature. Update aborted.".to_string()
-            })?;
-            let _ = std::fs::remove_file(&sig_file);
-            if let Err(err) =
-                verify_sha256sums_ed25519(&sums_bytes, &sig_str, RELEASE_SIGNING_PUBKEY_HEX)
-            {
-                let _ = std::fs::remove_file(&setup_tmp);
-                return Err(err);
-            }
-        } else {
-            let _ = std::fs::remove_file(&sig_file);
-        }
-
-        if let Err(err) =
-            verify_downloaded_binary_sha256(&setup_tmp, &sums_content, "Singularity-setup.exe")
-        {
-            let _ = std::fs::remove_file(&setup_tmp);
-            return Err(err);
-        }
-
-        // Launch the verified native Win32 installer silently so it atomically updates
-        // `singularity.exe`, `libcef.dll`, and all Pure Chromium CEF runtime files, then relaunches.
-        Command::new(&setup_tmp)
-            .arg("--silent")
-            .arg("--dir")
-            .arg(target_dir)
-            .arg("--launch")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("Failed launching verified updater: {}", e))?;
-        std::process::exit(0);
+        download_and_run_verified_setup_installer(target_dir)?;
+        Ok("Singularity updater launched.".into())
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let new_exe = target_dir.join("singularity.new");
+        let sums_file = target_dir.join("SHA256SUMS.new.txt");
+        let sig_file = target_dir.join("SHA256SUMS.new.txt.sig");
+        let require_ed25519 = !RELEASE_SIGNING_PUBKEY_HEX.trim().is_empty();
         let opt_token = resolve_github_token();
         let fetch_api = |tok: Option<&str>| -> Option<serde_json::Value> {
             let mut api_child = Command::new("curl")

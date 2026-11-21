@@ -785,11 +785,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.1");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.0"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.1"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.0"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.1"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1190,6 +1190,9 @@ mod tests {
         let ui_cargo = include_str!("../Cargo.toml");
         assert!(ui_cargo.contains("cef = "));
         assert!(!ui_cargo.contains("wry = "));
+
+        let build_rs = include_str!("../build.rs");
+        assert!(build_rs.contains("/DELAYLOAD:libcef.dll"));
 
         let server_src = include_str!("server.rs");
         assert!(!server_src.contains("msedge.exe"));
@@ -1202,6 +1205,9 @@ mod tests {
 
         let main_src = include_str!("main.rs");
         assert!(main_src.contains("maybe_run_cef_subprocess"));
+        assert!(main_src.contains("has_local_cef_runtime"));
+        assert!(main_src.contains("bootstrap_missing_cef_runtime"));
+        assert!(main_src.contains("configure_local_cef_dll_directory"));
 
         // 2. Pure Chromium CEF low-RAM flags, real network-layer uBlock, and Win32 working-set trim
         let cef_src = include_str!("cef_runtime.rs");
@@ -1220,10 +1226,12 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("c.width = 1;"));
         assert!(SINGULARITY_UI_HTML.contains("maxActiveBackgroundTabsForMode"));
 
-        // 4. Self-updater & installer bundle Pure Chromium CEF ZIP
+        // 4. Self-updater & installer bundle Pure Chromium CEF ZIP + self-healing bootstrap
         let updater_src = include_str!("updater.rs");
         assert!(updater_src.contains("Singularity-setup.exe"));
         assert!(updater_src.contains("\"--launch\""));
+        assert!(updater_src.contains("SetDllDirectoryW"));
+        assert!(updater_src.contains("bootstrap_missing_cef_runtime"));
         let installer_src = include_str!("../../singularity-installer/src/main.rs");
         assert!(installer_src.contains("zip::ZipArchive"));
         assert!(installer_src.contains("libcef.dll"));

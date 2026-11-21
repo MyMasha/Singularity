@@ -8,11 +8,15 @@ use singularity_ui::{
 
 fn main() {
     // 0. Pure Chromium (CEF) multi-process entry point: renderer, GPU, network, and utility
-    //    subprocesses re-execute `singularity.exe --type=...` and MUST return immediately here
-    //    before any CLI handling, roaming store access, or window creation.
+    //    subprocesses re-execute `singularity.exe --type=...`. Checking `--type=` in pure Rust
+    //    FIRST prevents delay-loaded `libcef.dll` from being touched during CLI flags (`--version`,
+    //    `--update`, `--uninstall`) or self-healing runtime bootstrap!
     #[cfg(target_os = "windows")]
-    if let Some(exit_code) = singularity_ui::cef_runtime::maybe_run_cef_subprocess() {
-        std::process::exit(exit_code);
+    if std::env::args().any(|a| a.starts_with("--type=")) {
+        singularity_ui::updater::configure_local_cef_dll_directory();
+        if let Some(exit_code) = singularity_ui::cef_runtime::maybe_run_cef_subprocess() {
+            std::process::exit(exit_code);
+        }
     }
 
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -69,6 +73,21 @@ fn main() {
             shell.roaming.root_dir().display()
         );
         return;
+    }
+
+    // 3. Self-healing Pure Chromium (CEF) runtime check on Windows:
+    //    If a user upgraded in-place from v1.0.x (Edge WebView2) via the in-app updater or ran
+    //    standalone `singularity.exe` without `libcef.dll`, automatically download & verify
+    //    `Singularity-setup.exe` and silently install the CEF runtime beside `singularity.exe`.
+    #[cfg(target_os = "windows")]
+    {
+        if !singularity_ui::updater::has_local_cef_runtime() {
+            if let Err(err) = singularity_ui::updater::bootstrap_missing_cef_runtime() {
+                singularity_ui::updater::show_missing_cef_error_dialog(&err);
+            }
+            return;
+        }
+        singularity_ui::updater::configure_local_cef_dll_directory();
     }
 
     if let Err(err) = run_interactive_browser_app(shell) {

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v2.0.0)"
+        description: "Release tag to build and publish assets for (e.g. v2.0.1)"
         required: false
-        default: "v2.0.0"
+        default: "v2.0.1"
 
 permissions:
   contents: read
@@ -109,6 +109,33 @@ jobs:
           & release-artifacts\Singularity-setup.exe --verify-only
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          # Smoke-test real Windows silent SFX extraction of Pure Chromium CEF runtime
+          $smokeDir = Join-Path $env:RUNNER_TEMP "singularity-smoke-install"
+          Remove-Item -Recurse -Force $smokeDir -ErrorAction SilentlyContinue
+          & release-artifacts\Singularity-setup.exe --silent --dir $smokeDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($f in @("singularity.exe", "libcef.dll", "icudtl.dat", "resources.pak", "locales\en-US.pak", "locales\fr.pak")) {
+            $p = Join-Path $smokeDir $f
+            if (-not (Test-Path $p)) {
+              Write-Error "Smoke install missing required file: $p"
+              exit 1
+            }
+          }
+          Remove-Item -Recurse -Force $smokeDir -ErrorAction SilentlyContinue
+
+          # Smoke-test /DELAYLOAD:libcef.dll: running singularity.exe ALONE (no libcef.dll!) must NOT fail with OS DLL error
+          $isoDir = Join-Path $env:RUNNER_TEMP "singularity-no-cef-test"
+          Remove-Item -Recurse -Force $isoDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $isoDir | Out-Null
+          Copy-Item target\release\singularity.exe (Join-Path $isoDir "singularity.exe") -Force
+          $verOut = & (Join-Path $isoDir "singularity.exe") --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Isolated singularity.exe --version failed (delay-load libcef.dll broken!)"
+            exit 1
+          }
+          Write-Host "[OK] /DELAYLOAD:libcef.dll verified without libcef.dll: $verOut"
+          Remove-Item -Recurse -Force $isoDir -ErrorAction SilentlyContinue
+
           Copy-Item target\release\singularity.exe release-artifacts\singularity.exe -Force
           Get-ChildItem release-artifacts | Format-Table Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
 
@@ -164,7 +191,7 @@ jobs:
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v2.0.0"
+            TARGET_TAG="v2.0.1"
           fi
           if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes

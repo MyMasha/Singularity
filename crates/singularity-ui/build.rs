@@ -61,8 +61,8 @@ fn embed_windows_exe_resources() {
          {icon_line}\
          1 24 \"{manifest_escaped}\"\r\n\
          1 VERSIONINFO\r\n\
-         FILEVERSION 2,0,0,0\r\n\
-         PRODUCTVERSION 2,0,0,0\r\n\
+         FILEVERSION 2,0,1,0\r\n\
+         PRODUCTVERSION 2,0,1,0\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -75,11 +75,11 @@ fn embed_windows_exe_resources() {
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Singularity\\0\"\r\n\
                VALUE \"FileDescription\", \"Singularity Browser (Pure Chromium CEF)\\0\"\r\n\
-               VALUE \"FileVersion\", \"2.0.0.0\\0\"\r\n\
+               VALUE \"FileVersion\", \"2.0.1.0\\0\"\r\n\
                VALUE \"InternalName\", \"singularity\\0\"\r\n\
                VALUE \"OriginalFilename\", \"singularity.exe\\0\"\r\n\
                VALUE \"ProductName\", \"Singularity\\0\"\r\n\
-               VALUE \"ProductVersion\", \"2.0.0.0\\0\"\r\n\
+               VALUE \"ProductVersion\", \"2.0.1.0\\0\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\
@@ -92,6 +92,12 @@ fn embed_windows_exe_resources() {
 
     let is_msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if is_msvc {
+        // Delay-load `libcef.dll` on the `singularity.exe` binary so the Windows OS loader NEVER
+        // aborts with "libcef.dll was not found" when upgrading in-place from v1.0.x or running
+        // standalone: `main()` checks local CEF presence and auto-installs it via Singularity-setup.exe.
+        println!("cargo:rustc-link-arg-bin=singularity=/DELAYLOAD:libcef.dll");
+        println!("cargo:rustc-link-lib=dylib=delayimp");
+
         let res_path = out_path.join("singularity_res.res");
         let obj_path = out_path.join("singularity_res.o");
         let compiled_rc = find_msvc_rc_exe()
