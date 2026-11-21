@@ -2081,7 +2081,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.4</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.5</div>
         </div>
       </aside>
 
@@ -4323,6 +4323,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         setBlackHoleSuspended(!tutorialOpen);
         if (actionMode === "navigate") {
           tab.unloaded = false;
+          tab.startPaused = false;
           sendNativeIpc({
             cmd: "navigate_web",
             tab_id: tab.id,
@@ -4330,7 +4331,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             overlay_open: tutorialOpen
           });
         } else {
+          const shouldStartPaused = !!tab.startPaused;
           tab.unloaded = false;
+          tab.startPaused = false;
           sendNativeIpc({
             cmd: "activate_tab",
             tab_id: tab.id,
@@ -4338,7 +4341,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             web_visible: true,
             overlay_open: tutorialOpen,
             resume_time_sec: tab.mediaTimeSec >= 3 ? Math.floor(tab.mediaTimeSec) : null,
-            resume_scroll_y: tab.scrollY >= 40 ? Math.floor(tab.scrollY) : null
+            resume_scroll_y: tab.scrollY >= 40 ? Math.floor(tab.scrollY) : null,
+            start_paused: shouldStartPaused
           });
         }
       } else {
@@ -4434,7 +4438,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   function activateTab(id) {
-    if (activeTabId === id) return;
+    if (activeTabId === id) {
+      const cur = getActiveTab();
+      if (cur && cur.url && !isInternalSettingsUrl(cur.url) && !anyModalOpen() && hasNativeIpc()) {
+        sendNativeIpc({ cmd: "focus_active_web", toggle_media_play: false });
+      }
+      return;
+    }
     const prev = getActiveTab();
     if (prev) prev.lastActiveAt = Date.now();
     activeTabId = id;
@@ -5741,6 +5751,20 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     } else if (alt && !e.shiftKey && e.key === "ArrowRight") {
       e.preventDefault();
       handleBrowserShortcut("web_forward", 0);
+    } else if (
+      !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !e.repeat
+      && (code === "Space" || e.key === " ")
+      && document.body.classList.contains("bar-only")
+      && !anyModalOpen()
+      && hasNativeIpc()
+    ) {
+      const ae = document.activeElement;
+      const tag = ae && ae.tagName ? ae.tagName.toUpperCase() : "";
+      const isEditing = !!(ae && (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || ae.isContentEditable));
+      if (!isEditing) {
+        e.preventDefault();
+        sendNativeIpc({ cmd: "focus_active_web", toggle_media_play: true });
+      }
     } else if (e.key === "Escape") {
       closeHtmlTabContextMenu();
       closeGroupEditor();
@@ -7126,7 +7150,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
         let restoredCount = 0;
         let restoredActiveMedia = 0;
-        const mergedWins = Math.floor(Number(st.merged_windows_count || 0));
+        const restoredWins = Math.floor(Number(st.restored_windows_count || 0));
         const isDetachedHandoff = !!st.is_detached_handoff;
         if ((restoreSessionEnabled || isDetachedHandoff) && Array.isArray(st.saved_tabs) && st.saved_tabs.length > 0) {
           const now = Date.now();
@@ -7154,7 +7178,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             groupId: (t.group_id && validGroupIds.has(t.group_id)) ? t.group_id : null,
             faviconUrl: (t.favicon_url && /^https?:\/\//i.test(t.favicon_url)) ? t.favicon_url : "",
             lastActiveAt: now,
-            unloaded: idx !== savedActiveIdx
+            unloaded: idx !== savedActiveIdx,
+            startPaused: !isDetachedHandoff
           }));
           pruneEmptyGroups();
           nextTabId = tabs.length + 1;
@@ -7170,10 +7195,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           syncViewportToActiveTab("activate");
           if (!isDetachedHandoff) {
             const mediaNote = restoredActiveMedia >= 3
-              ? L(` · video resumes at ${formatMediaTimestamp(restoredActiveMedia)}`, ` · reprise vidéo à ${formatMediaTimestamp(restoredActiveMedia)}`)
+              ? L(` · video paused at ${formatMediaTimestamp(restoredActiveMedia)}`, ` · vidéo en pause à ${formatMediaTimestamp(restoredActiveMedia)}`)
               : "";
-            const winNote = mergedWins > 1
-              ? L(`${mergedWins} windows merged · `, `${mergedWins} fenêtres combinées · `)
+            const winNote = restoredWins > 1
+              ? L(`${restoredWins} windows · `, `${restoredWins} fenêtres · `)
               : "";
             showToast(L(
               `Session restored (${winNote}${restoredCount} tab${restoredCount === 1 ? "" : "s"}${mediaNote})`,

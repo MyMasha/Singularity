@@ -187,6 +187,20 @@ pub struct SavedTabGroup {
     pub collapsed: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowGeometry {
+    #[serde(default)]
+    pub pos_x: Option<i32>,
+    #[serde(default)]
+    pub pos_y: Option<i32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowSessionFile {
     pub window_id: String,
@@ -198,6 +212,28 @@ pub struct WindowSessionFile {
     pub tabs: Vec<SavedTabEntry>,
     #[serde(default)]
     pub tab_groups: Vec<SavedTabGroup>,
+    #[serde(default)]
+    pub geometry: WindowGeometry,
+    /// Set to `true` only when this window closed cleanly while another Singularity window
+    /// remained alive, so a window manually closed minutes/hours earlier is pruned on next
+    /// boot while windows closed together during Windows Restart (<= 20s) or power loss all reopen.
+    #[serde(default)]
+    pub closed_while_other_live: bool,
+}
+
+/// Single-use sibling window restoration payload written under `%APPDATA%\.singularity\handoff\restore-<id>.json`
+/// so restarting after running 2+ Singularity windows reopens EVERY window separately with its own
+/// tabs, tab groups, active tab, and saved screen position/size instead of merging them into one!
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowRestorePayload {
+    #[serde(default)]
+    pub active_tab_index: usize,
+    #[serde(default)]
+    pub tabs: Vec<SavedTabEntry>,
+    #[serde(default)]
+    pub tab_groups: Vec<SavedTabGroup>,
+    #[serde(default)]
+    pub geometry: WindowGeometry,
 }
 
 /// Authenticated peer descriptor published by each live Singularity window in
@@ -526,6 +562,9 @@ pub struct RoamingSingularityStore {
     root_dir: PathBuf,
     window_id: String,
     ui_slot_lock_path: Option<PathBuf>,
+    pub window_geometry: WindowGeometry,
+    pub pending_restore_window_ids: Vec<String>,
+    pub restored_windows_count: usize,
     pub merged_windows_count: usize,
     pub is_secondary_live_window: bool,
     pub startup_handoff: Option<TabHandoffPayload>,
@@ -543,24 +582,41 @@ impl Drop for RoamingSingularityStore {
 
 impl RoamingSingularityStore {
     pub fn open_default() -> Result<Self, String> {
-        Self::open_default_with_options(None, false)
+        Self::open_default_with_launch_args(None, None, false)
     }
 
     pub fn open_default_with_options(
         detach_handoff_id: Option<&str>,
         force_new_window: bool,
     ) -> Result<Self, String> {
+        Self::open_default_with_launch_args(detach_handoff_id, None, force_new_window)
+    }
+
+    pub fn open_default_with_launch_args(
+        detach_handoff_id: Option<&str>,
+        restore_session_id: Option<&str>,
+        force_new_window: bool,
+    ) -> Result<Self, String> {
         let dir = ensure_roaming_dir_initialized()?;
-        Self::open_at_with_options(dir, detach_handoff_id, force_new_window)
+        Self::open_at_with_launch_args(dir, detach_handoff_id, restore_session_id, force_new_window)
     }
 
     pub fn open_at(root_dir: PathBuf) -> Result<Self, String> {
-        Self::open_at_with_options(root_dir, None, false)
+        Self::open_at_with_launch_args(root_dir, None, None, false)
     }
 
     pub fn open_at_with_options(
         root_dir: PathBuf,
         detach_handoff_id: Option<&str>,
+        force_new_window: bool,
+    ) -> Result<Self, String> {
+        Self::open_at_with_launch_args(root_dir, detach_handoff_id, None, force_new_window)
+    }
+
+    pub fn open_at_with_launch_args(
+        root_dir: PathBuf,
+        detach_handoff_id: Option<&str>,
+        restore_session_id: Option<&str>,
         force_new_window: bool,
     ) -> Result<Self, String> {
         std::fs::create_dir_all(&root_dir)
@@ -609,8 +665,16 @@ impl RoamingSingularityStore {
 
         let startup_handoff = detach_handoff_id
             .and_then(|id| Self::consume_detach_handoff(&root_dir, id));
+        let restore_payload = if startup_handoff.is_none() {
+            restore_session_id.and_then(|id| Self::consume_window_restore_handoff(&root_dir, id))
+        } else {
+            None
+        };
 
-        let mut merged_windows_count = 0usize;
+        let mut window_geometry = WindowGeometry::default();
+        let mut pending_restore_window_ids: Vec<String> = Vec::new();
+        let mut restored_windows_count = 0usize;
+        let merged_windows_count = 0usize;
         let mut is_secondary_live_window = false;
         let mut claimed_dead_paths: Vec<PathBuf> = Vec::new();
 
@@ -645,17 +709,29 @@ impl RoamingSingularityStore {
                     favicon_url: h.favicon_url.clone(),
                 });
             }
+        } else if let Some(rp) = restore_payload {
+            // Sibling window spawned on multi-window restart: restore ONLY this window's own
+            // tabs, tab groups, active tab, and saved screen geometry!
+            is_secondary_live_window = true;
+            profile.saved_tabs = rp.tabs;
+            profile.saved_tab_groups = rp.tab_groups;
+            profile.active_tab_index = rp
+                .active_tab_index
+                .min(profile.saved_tabs.len().saturating_sub(1));
+            window_geometry = rp.geometry;
+            restored_windows_count = 1;
         } else if force_new_window {
             is_secondary_live_window = true;
             profile.saved_tabs.clear();
             profile.saved_tab_groups.clear();
             profile.active_tab_index = 0;
         } else {
-            // Multi-window crash-proof session discovery:
-            // - Simultaneous Singularity windows each write to their own `sessions/<win_id>.json`
-            //   so they NEVER overwrite each other's tabs.
-            // - When reopened after closing or PC shutdown, all dead window sessions are combined
-            //   cleanly into ONE single window with all tabs, tab groups & video timestamps merged!
+            // Multi-window crash-proof separate session restoration:
+            // - Simultaneous Singularity windows each persist their own `sessions/<win_id>.json`
+            //   (tabs, tab groups, active tab, and screen geometry).
+            // - On restart, Window #1 claims the first dead session and queues each remaining
+            //   non-empty dead window session as a single-use `--restore-session <id>` handoff
+            //   so EVERY previously open window reopens separately with its own tabs (never merged!).
             let mut live_other_windows = 0usize;
             let mut dead_sessions: Vec<(PathBuf, WindowSessionFile)> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
@@ -674,86 +750,65 @@ impl RoamingSingularityStore {
                 }
             }
 
-            if !dead_sessions.is_empty() {
-                dead_sessions.sort_by_key(|(_, s)| s.updated_unix);
-                let mut merged_tabs: Vec<SavedTabEntry> = Vec::new();
-                let mut merged_groups: Vec<SavedTabGroup> = Vec::new();
-                let mut url_to_idx: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                let mut used_group_ids: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut final_active_idx: usize = 0;
-
-                let mut non_empty_windows = 0usize;
-                for (win_pos, (path, sess)) in dead_sessions.into_iter().enumerate() {
-                    claimed_dead_paths.push(path);
-                    if sess.tabs.is_empty() {
-                        continue;
-                    }
-                    non_empty_windows += 1;
-                    let mut group_remap: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    for mut g in sess.tab_groups {
-                        let orig_id = g.id.clone();
-                        if !used_group_ids.insert(g.id.clone()) {
-                            let new_id = format!("{}-w{}", g.id, win_pos);
-                            used_group_ids.insert(new_id.clone());
-                            g.id = new_id.clone();
-                        }
-                        group_remap.insert(orig_id, g.id.clone());
-                        merged_groups.push(g);
-                    }
-
-                    let active_in_sess = sess
-                        .active_tab_index
-                        .min(sess.tabs.len().saturating_sub(1));
-                    for (tab_pos, mut tab) in sess.tabs.into_iter().enumerate() {
-                        if let Some(ref gid) = tab.group_id {
-                            tab.group_id = group_remap.get(gid).cloned();
-                        }
-                        let norm = normalize_url_without_media_time(&tab.url);
-                        if let Some(&existing_i) = url_to_idx.get(&norm) {
-                            if tab.media_time_sec.unwrap_or(0)
-                                > merged_tabs[existing_i].media_time_sec.unwrap_or(0)
-                            {
-                                merged_tabs[existing_i].media_time_sec = tab.media_time_sec;
-                            }
-                            if tab.scroll_y.unwrap_or(0)
-                                > merged_tabs[existing_i].scroll_y.unwrap_or(0)
-                            {
-                                merged_tabs[existing_i].scroll_y = tab.scroll_y;
-                            }
-                            if merged_tabs[existing_i].group_id.is_none() && tab.group_id.is_some()
-                            {
-                                merged_tabs[existing_i].group_id = tab.group_id;
-                            }
-                            if tab_pos == active_in_sess {
-                                final_active_idx = existing_i;
-                            }
-                        } else if merged_tabs.len() < 200 {
-                            let idx = merged_tabs.len();
-                            url_to_idx.insert(norm, idx);
-                            merged_tabs.push(tab);
-                            if tab_pos == active_in_sess {
-                                final_active_idx = idx;
-                            }
-                        }
-                    }
-                }
-
-                if !merged_tabs.is_empty() {
-                    profile.saved_tabs = merged_tabs;
-                    profile.saved_tab_groups = merged_groups;
-                    profile.active_tab_index = final_active_idx;
-                    merged_windows_count = non_empty_windows;
-                }
-            } else if live_other_windows > 0 {
-                // Another Singularity window is already live: start this second window cleanly
-                // with its own independent tab list (it will merge on next full restart!).
+            if live_other_windows > 0 {
+                // Another Singularity window is already live: start this new window cleanly
+                // with its own independent tab list without touching dead session files!
                 is_secondary_live_window = true;
                 profile.saved_tabs.clear();
                 profile.saved_tab_groups.clear();
                 profile.active_tab_index = 0;
+            } else if !dead_sessions.is_empty() {
+                dead_sessions.sort_by_key(|(_, s)| s.updated_unix);
+                let mut all_non_empty: Vec<WindowSessionFile> = Vec::new();
+                for (path, sess) in dead_sessions {
+                    claimed_dead_paths.push(path);
+                    if !sess.tabs.is_empty() {
+                        all_non_empty.push(sess);
+                    }
+                }
+                let latest_active_unix = all_non_empty
+                    .iter()
+                    .filter(|s| !s.closed_while_other_live)
+                    .map(|s| s.updated_unix)
+                    .max()
+                    .or_else(|| all_non_empty.iter().map(|s| s.updated_unix).max())
+                    .unwrap_or(0);
+                // Keep every window that crashed/power-lost/closed last (`!closed_while_other_live`)
+                // OR closed within 20s of the last window (Windows Restart / multi-window exit).
+                let non_empty_dead: Vec<WindowSessionFile> = all_non_empty
+                    .into_iter()
+                    .filter(|s| {
+                        !s.closed_while_other_live
+                            || latest_active_unix.saturating_sub(s.updated_unix) <= 20
+                    })
+                    .collect();
+
+                if let Some(first) = non_empty_dead.first() {
+                    profile.saved_tabs = first.tabs.clone();
+                    profile.saved_tab_groups = first.tab_groups.clone();
+                    profile.active_tab_index = first
+                        .active_tab_index
+                        .min(profile.saved_tabs.len().saturating_sub(1));
+                    window_geometry = first.geometry;
+                    restored_windows_count = 1;
+
+                    if profile.restore_session {
+                        // Spawn each additional dead window as its own independent Singularity window
+                        // (capped at 7 extra windows = 8 total for safety).
+                        for sibling in non_empty_dead.into_iter().skip(1).take(7) {
+                            let rp = WindowRestorePayload {
+                                active_tab_index: sibling.active_tab_index,
+                                tabs: sibling.tabs,
+                                tab_groups: sibling.tab_groups,
+                                geometry: sibling.geometry,
+                            };
+                            if let Ok(rid) = Self::write_window_restore_handoff_at(&root_dir, &rp) {
+                                pending_restore_window_ids.push(rid);
+                            }
+                        }
+                        restored_windows_count += pending_restore_window_ids.len();
+                    }
+                }
             }
         }
 
@@ -761,6 +816,9 @@ impl RoamingSingularityStore {
             root_dir,
             window_id,
             ui_slot_lock_path: None,
+            window_geometry,
+            pending_restore_window_ids,
+            restored_windows_count,
             merged_windows_count,
             is_secondary_live_window,
             startup_handoff,
@@ -818,6 +876,14 @@ impl RoamingSingularityStore {
 
     pub fn window_session_file_path(&self) -> PathBuf {
         self.sessions_dir().join(format!("{}.json", self.window_id))
+    }
+
+    /// Deletes this window's persisted session files (called when exiting empty or after moving
+    /// this window's only tab into another window so it never reopens as a duplicate ghost window).
+    pub fn delete_window_session(&self) {
+        let p = self.window_session_file_path();
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("json.bak"));
     }
 
     pub fn live_window_file_path(&self) -> PathBuf {
@@ -902,6 +968,38 @@ impl RoamingSingularityStore {
         let raw = std::fs::read_to_string(&path).ok()?;
         let _ = std::fs::remove_file(&path);
         serde_json::from_str::<TabHandoffPayload>(&raw).ok()
+    }
+
+    /// Writes a single-use sibling window restore handoff (`handoff/restore-<id>.json`).
+    pub fn write_window_restore_handoff_at(
+        root_dir: &Path,
+        payload: &WindowRestorePayload,
+    ) -> Result<String, String> {
+        let dir = root_dir.join("handoff");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut rnd = [0u8; 16];
+        OsRng.fill_bytes(&mut rnd);
+        let id = hex::encode(rnd);
+        let bytes = serde_json::to_vec(payload)
+            .map_err(|e| format!("Failed serializing window restore handoff: {}", e))?;
+        atomic_write(&dir.join(format!("restore-{}.json", id)), &bytes)?;
+        Ok(id)
+    }
+
+    /// Reads and immediately deletes a single-use sibling window restore handoff.
+    pub fn consume_window_restore_handoff(
+        root_dir: &Path,
+        restore_id: &str,
+    ) -> Option<WindowRestorePayload> {
+        if !is_valid_handoff_id(restore_id) {
+            return None;
+        }
+        let path = root_dir
+            .join("handoff")
+            .join(format!("restore-{}.json", restore_id));
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        serde_json::from_str::<WindowRestorePayload>(&raw).ok()
     }
 
     pub fn webview_engine_dir(&self) -> PathBuf {
@@ -1041,6 +1139,8 @@ impl RoamingSingularityStore {
         root_dir: &Path,
         window_id: &str,
         profile: &UserProfile,
+        geometry: WindowGeometry,
+        closed_while_other_live: bool,
         write_backup: bool,
     ) -> Result<(), String> {
         let sessions_dir = root_dir.join("sessions");
@@ -1052,6 +1152,8 @@ impl RoamingSingularityStore {
             active_tab_index: profile.active_tab_index,
             tabs: profile.saved_tabs.clone(),
             tab_groups: profile.saved_tab_groups.clone(),
+            geometry,
+            closed_while_other_live,
         };
         let bytes = serde_json::to_vec(&sess)
             .map_err(|e| format!("Window session serialization error: {}", e))?;
@@ -1067,9 +1169,17 @@ impl RoamingSingularityStore {
         root_dir: &Path,
         window_id: &str,
         profile: &UserProfile,
+        geometry: WindowGeometry,
         write_backup: bool,
     ) -> Result<(), String> {
-        let _ = Self::write_window_session_snapshot(root_dir, window_id, profile, write_backup);
+        let _ = Self::write_window_session_snapshot(
+            root_dir,
+            window_id,
+            profile,
+            geometry,
+            false,
+            write_backup,
+        );
         let mut to_write = profile.clone();
         if Self::has_other_live_windows_at(root_dir, window_id) {
             let existing_disk = load_profile(root_dir);
@@ -1088,14 +1198,48 @@ impl RoamingSingularityStore {
         Ok(())
     }
 
-    /// Atomically persists THIS window's own tabs, active tab, and tab groups to
+    /// Atomically persists THIS window's own tabs, active tab, tab groups, and window geometry to
     /// `sessions/<window_id>.json` + `.bak` so multiple simultaneous windows never clash.
     pub fn save_window_session(&self) -> Result<(), String> {
-        Self::write_window_session_snapshot(&self.root_dir, &self.window_id, &self.profile, true)
+        Self::write_window_session_snapshot(
+            &self.root_dir,
+            &self.window_id,
+            &self.profile,
+            self.window_geometry,
+            false,
+            true,
+        )
+    }
+
+    /// Persists or cleans up THIS window's session on clean exit:
+    /// - If this window has zero saved web tabs, removes its session file (no blank ghost windows).
+    /// - Otherwise saves its final tabs & screen geometry and records whether another Singularity
+    ///   window was still alive at close time (so Windows Restart / multi-window exit reopens all
+    ///   windows separately while a window manually closed long before shutdown stays closed).
+    pub fn save_window_session_on_close(&self) {
+        if self.profile.saved_tabs.is_empty() {
+            self.delete_window_session();
+            return;
+        }
+        let other_live = Self::has_other_live_windows_at(&self.root_dir, &self.window_id);
+        let _ = Self::write_window_session_snapshot(
+            &self.root_dir,
+            &self.window_id,
+            &self.profile,
+            self.window_geometry,
+            other_live,
+            true,
+        );
     }
 
     pub fn save_profile(&self) -> Result<(), String> {
-        Self::write_profile_snapshot(&self.root_dir, &self.window_id, &self.profile, true)
+        Self::write_profile_snapshot(
+            &self.root_dir,
+            &self.window_id,
+            &self.profile,
+            self.window_geometry,
+            true,
+        )
     }
 
     /// Zero-stall non-blocking persistence for hot UI / HTTP paths: clones the in-memory profile
@@ -1106,6 +1250,7 @@ impl RoamingSingularityStore {
             self.root_dir.clone(),
             self.window_id.clone(),
             self.profile.clone(),
+            self.window_geometry,
         );
     }
 
@@ -2410,7 +2555,7 @@ fn dpapi_unprotect(sealed: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 struct PersistQueueState {
-    pending: Option<(PathBuf, String, UserProfile)>,
+    pending: Option<(PathBuf, String, UserProfile, WindowGeometry)>,
     flush_requested: bool,
     generation: u64,
     flushed_generation: u64,
@@ -2469,13 +2614,14 @@ impl ProfilePersistWorker {
                             let force_bak = st.flush_requested;
                             (job, gen_id, force_bak)
                         };
-                        if let Some((root_dir, window_id, profile)) = job {
+                        if let Some((root_dir, window_id, profile, geometry)) = job {
                             let write_backup =
                                 force_bak || last_backup_at.elapsed() >= Duration::from_secs(30);
                             let _ = RoamingSingularityStore::write_profile_snapshot(
                                 &root_dir,
                                 &window_id,
                                 &profile,
+                                geometry,
                                 write_backup,
                             );
                             if write_backup {
@@ -2494,9 +2640,15 @@ impl ProfilePersistWorker {
         })
     }
 
-    fn enqueue(&self, root_dir: PathBuf, window_id: String, profile: UserProfile) {
+    fn enqueue(
+        &self,
+        root_dir: PathBuf,
+        window_id: String,
+        profile: UserProfile,
+        geometry: WindowGeometry,
+    ) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.pending = Some((root_dir, window_id, profile));
+        st.pending = Some((root_dir, window_id, profile, geometry));
         st.generation = st.generation.wrapping_add(1);
         self.wake_cond.notify_one();
     }

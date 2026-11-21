@@ -381,7 +381,9 @@ fn run_windows_frameless_browser(
     server_cfg: &ServerConfig,
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
 ) -> Result<(), String> {
-    use tao::dpi::{LogicalSize, PhysicalPosition as TaoPhysicalPosition, Size};
+    use tao::dpi::{
+        LogicalSize, PhysicalPosition as TaoPhysicalPosition, PhysicalSize as TaoPhysicalSize, Size,
+    };
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
     use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
@@ -473,6 +475,12 @@ fn run_windows_frameless_browser(
             resume_time_sec: Option<u64>,
             #[serde(default)]
             resume_scroll_y: Option<u32>,
+            #[serde(default)]
+            start_paused: bool,
+        },
+        FocusActiveWeb {
+            #[serde(default)]
+            toggle_media_play: bool,
         },
         CloseTab {
             tab_id: u64,
@@ -1455,6 +1463,41 @@ fn run_windows_frameless_browser(
         cmd.spawn().is_ok()
     }
 
+    /// Spawns a restored sibling Singularity GUI window (`--restore-session <id>`) on multi-window
+    /// restart so each previously open window reopens separately with its own tabs & screen geometry.
+    fn spawn_restored_singularity_window(restore_id: &str) -> bool {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        Command::new(exe)
+            .arg("--restore-session")
+            .arg(restore_id)
+            .spawn()
+            .is_ok()
+    }
+
+    /// Returns `true` if the user is actively left-clicking inside the top 46px Singularity bar
+    /// (omnibar, tabs, toolbar buttons), so `WindowEvent::Focused(true)` never steals focus from
+    /// `#omnibar-input` while Alt+Tab / taskbar / webpage clicks immediately focus the active page.
+    fn is_cursor_clicking_top_bar(window: &Window) -> bool {
+        const VK_LBUTTON: i32 = 0x01;
+        let lbutton_down = unsafe { ((GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000) != 0 };
+        if !lbutton_down {
+            return false;
+        }
+        let Ok(inner_pos) = window.inner_position() else {
+            return false;
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor();
+        let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as i32).max(1);
+        let (cx, cy) = get_win32_cursor_pos();
+        cx >= inner_pos.x
+            && cx <= inner_pos.x + size.width as i32
+            && cy >= inner_pos.y
+            && cy < inner_pos.y + bar_h
+    }
+
     fn encode_menu_wide(label: &str) -> Vec<u16> {
         let clean: String = label
             .chars()
@@ -1897,6 +1940,42 @@ fn run_windows_frameless_browser(
       sendShortcut("web_back", 0, e);
     } else if (alt && !e.shiftKey && e.key === "ArrowRight") {
       sendShortcut("web_forward", 0, e);
+    } else if (
+      !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !e.repeat
+      && (code === "Space" || e.key === " ")
+      && window.top === window
+      && /(^|\.)youtube\.com$/i.test(String(location.hostname || ""))
+    ) {
+      // Ergonomic Spacebar play/pause on YouTube after switching windows or tabs even when
+      // document.activeElement is <body> (never interferes with search, comments, buttons, or #movie_player).
+      const ae = document.activeElement;
+      const tag = ae && ae.tagName ? ae.tagName.toUpperCase() : "";
+      const isInteractive = !!(ae && (
+        tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || tag === "A" ||
+        ae.isContentEditable ||
+        (ae.closest && ae.closest("input,textarea,select,button,a,[contenteditable='true'],[contenteditable=''],[role='textbox'],[role='button'],[role='slider'],#movie_player,.html5-video-player"))
+      ));
+      if (!isInteractive) {
+        const player = document.getElementById("movie_player") || document.querySelector(".html5-video-player");
+        const video = player ? player.querySelector("video") : document.querySelector("video");
+        if (player && video && isFinite(video.duration) && video.duration > 0) {
+          const rect = player.getBoundingClientRect();
+          if (rect.width > 120 && rect.height > 80) {
+            try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
+            if (typeof window.__singularityUnlockStartPaused === "function") {
+              try { window.__singularityUnlockStartPaused(); } catch (_) {}
+            }
+            try { player.focus({ preventScroll: true }); } catch (_) {}
+            if (video.paused) {
+              if (typeof player.playVideo === "function") { try { player.playVideo(); } catch (_) {} }
+              if (video.paused) { try { const p = video.play(); if (p && p.catch) p.catch(function(){}); } catch (_) {} }
+            } else {
+              if (typeof player.pauseVideo === "function") { try { player.pauseVideo(); } catch (_) {} }
+              if (!video.paused) { try { video.pause(); } catch (_) {} }
+            }
+          }
+        }
+      }
     }
   }, true);
 
@@ -1974,6 +2053,7 @@ fn run_windows_frameless_browser(
     return best;
   }
   function reportMediaProgress(force) {
+    if (window.__singularityStartPausedLock) return;
     if (!force && document.hidden) return;
     const href = String(location.href || "");
     if (!/^https?:\/\//i.test(href)) return;
@@ -2003,19 +2083,47 @@ fn run_windows_frameless_browser(
   window.addEventListener("pagehide", function() { reportMediaProgress(true); }, true);
 })();"##;
 
+    /// Executed on the active content WebView2 when the user presses Spacebar while keyboard
+    /// focus was still resting on the non-input 46px Singularity top bar (e.g. right after
+    /// dragging the window or clicking a tab pill).
+    const TOGGLE_ACTIVE_MEDIA_SCRIPT: &str = r##"(function(){
+  try {
+    const ae = document.activeElement;
+    const tag = ae && ae.tagName ? ae.tagName.toUpperCase() : "";
+    if (ae && (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || ae.isContentEditable || (ae.closest && ae.closest("input,textarea,select,[contenteditable='true'],[contenteditable=''],[role='textbox']")))) return;
+    if (typeof window.__singularityUnlockStartPaused === "function") {
+      try { window.__singularityUnlockStartPaused(); } catch (_) {}
+    }
+    const player = document.getElementById("movie_player") || document.querySelector(".html5-video-player");
+    const video = (player && player.querySelector("video")) || document.querySelector("video");
+    if (!video || !isFinite(video.duration) || video.duration <= 0) return;
+    if (player) { try { player.focus({ preventScroll: true }); } catch (_) {} }
+    if (video.paused) {
+      if (player && typeof player.playVideo === "function") { try { player.playVideo(); } catch (_) {} }
+      if (video.paused) { try { const p = video.play(); if (p && p.catch) p.catch(function(){}); } catch (_) {} }
+    } else {
+      if (player && typeof player.pauseVideo === "function") { try { player.pauseVideo(); } catch (_) {} }
+      if (!video.paused) { try { video.pause(); } catch (_) {} }
+    }
+  } catch (_) {}
+})();"##;
+
     /// Builds a strictly one-shot initialization script that resumes a restored/unloaded tab's
     /// HTML5 `<video>`/`<audio>` playback position and vertical scroll offset right where the
-    /// user left off (even after an abrupt PC power-off or RAM unload). Bound strictly to
-    /// `target_url` + a unique per-spawn nonce so subsequent navigations or manual reloads in
+    /// user left off (even after an abrupt PC power-off or RAM unload), and when `start_paused`
+    /// is `true` keeps restored YouTube/video tabs cleanly PAUSED until the user explicitly clicks
+    /// Play or presses Space/`k` (zero audio blip, exact saved timestamp preserved). Bound strictly
+    /// to `target_url` + a unique per-spawn nonce so subsequent navigations or manual reloads in
     /// the same tab are never hijacked.
     fn build_resume_init_script(
         target_url: &str,
         resume_time_sec: Option<u64>,
         resume_scroll_y: Option<u32>,
+        start_paused: bool,
     ) -> Option<String> {
         let target_sec = resume_time_sec.unwrap_or(0).min(864_000);
         let target_scroll = resume_scroll_y.unwrap_or(0).min(10_000_000);
-        if target_sec < 3 && target_scroll < 40 {
+        if !start_paused && target_sec < 3 && target_scroll < 40 {
             return None;
         }
         let expected_norm = normalize_url_without_media_time(target_url);
@@ -2024,6 +2132,7 @@ fn run_windows_frameless_browser(
         OsRng.fill_bytes(&mut rnd);
         let nonce_key = format!("__singularity_resumed_{}", hex::encode(rnd));
         let nonce_json = serde_json::to_string(&nonce_key).ok()?;
+        let start_paused_js = if start_paused { "true" } else { "false" };
         Some(format!(
             r##"(function(){{
   if (window.top !== window) return;
@@ -2031,6 +2140,7 @@ fn run_windows_frameless_browser(
   const nonceKey = {nonce_json};
   const targetSec = {target_sec};
   const targetScroll = {target_scroll};
+  const startPaused = {start_paused_js};
   function normUrl(raw) {{
     try {{
       const u = new URL(raw);
@@ -2061,17 +2171,31 @@ fn run_windows_frameless_browser(
   }} catch (_) {{}}
   let mediaDone = targetSec < 3;
   let scrollDone = targetScroll < 40;
+  let userPlayIntent = !startPaused;
+  let origMediaPlay = null;
   let attempts = 0;
+
+  function restoreOrigPlay() {{
+    if (origMediaPlay && typeof HTMLMediaElement !== "undefined" && HTMLMediaElement.prototype) {{
+      try {{ HTMLMediaElement.prototype.play = origMediaPlay; }} catch (_) {{}}
+      origMediaPlay = null;
+    }}
+  }}
+
+  function isAdShowing() {{
+    return !!document.querySelector(".html5-video-player.ad-showing, .html5-video-player.ad-interrupting");
+  }}
+
   function tryApplyMedia() {{
     if (mediaDone) return;
     if (!matchesTargetPage()) {{ mediaDone = true; return; }}
-    if (document.querySelector(".html5-video-player.ad-showing, .html5-video-player.ad-interrupting")) return;
+    if (isAdShowing()) return;
     const list = document.querySelectorAll("video, audio");
     for (let i = 0; i < list.length; i++) {{
       const m = list[i];
       if (!m || !isFinite(m.duration) || m.duration < 15) continue;
       if (targetSec < m.duration - 2) {{
-        if (Math.abs(m.currentTime - targetSec) > 3) {{
+        if (Math.abs(m.currentTime - targetSec) > 2) {{
           try {{ m.currentTime = targetSec; }} catch (_) {{}}
         }}
         mediaDone = true;
@@ -2079,6 +2203,7 @@ fn run_windows_frameless_browser(
       }}
     }}
   }}
+
   function tryApplyScroll() {{
     if (scrollDone) return;
     if (!matchesTargetPage()) {{ scrollDone = true; return; }}
@@ -2087,18 +2212,111 @@ fn run_windows_frameless_browser(
       scrollDone = true;
     }}
   }}
-  document.addEventListener("loadedmetadata", tryApplyMedia, true);
-  document.addEventListener("canplay", tryApplyMedia, true);
+
+  function pauseAllMediaAndYt() {{
+    if (userPlayIntent) return;
+    if (!matchesTargetPage()) {{ unlockStartPaused(); return; }}
+    const yp = document.getElementById("movie_player") || document.querySelector(".html5-video-player");
+    if (yp && typeof yp.pauseVideo === "function") {{
+      try {{ yp.pauseVideo(); }} catch (_) {{}}
+    }}
+    const list = document.querySelectorAll("video, audio");
+    for (let i = 0; i < list.length; i++) {{
+      const m = list[i];
+      if (m && !m.paused) {{
+        try {{ m.pause(); }} catch (_) {{}}
+      }}
+    }}
+    tryApplyMedia();
+  }}
+
+  function onMediaPlayEvent(e) {{
+    if (userPlayIntent) return;
+    if (!matchesTargetPage()) {{ unlockStartPaused(); return; }}
+    const m = e && e.target;
+    if (m && typeof m.pause === "function") {{
+      try {{ m.pause(); }} catch (_) {{}}
+    }}
+    pauseAllMediaAndYt();
+  }}
+
+  function onUserKeyUnlock(e) {{
+    if (userPlayIntent || !e || e.isTrusted === false) return;
+    const k = String(e.key || "").toLowerCase();
+    const code = String(e.code || "");
+    if (code === "Space" || e.key === " " || k === "k" || e.key === "Enter" || e.key === "MediaPlayPause" || e.key === "MediaPlay") {{
+      unlockStartPaused();
+    }}
+  }}
+
+  function onUserPointerUnlock(e) {{
+    if (userPlayIntent || !e || e.isTrusted === false) return;
+    if (!matchesTargetPage()) {{ unlockStartPaused(); return; }}
+    const tgt = e.target;
+    if (!tgt || !tgt.closest) return;
+    const anchor = tgt.closest("a[href]");
+    if (anchor && anchor.href && normUrl(anchor.href) !== expectedNorm) {{
+      unlockStartPaused();
+      return;
+    }}
+    if (tgt.closest("video,audio,#movie_player,.html5-video-player,button,[role='button'],[class*='player'],[id*='player'],[class*='play'],[id*='play'],[aria-label*='Play' i],[aria-label*='Lire' i],[aria-label*='Lecture' i]")) {{
+      unlockStartPaused();
+    }}
+  }}
+
+  function unlockStartPaused() {{
+    if (userPlayIntent) return;
+    userPlayIntent = true;
+    window.__singularityStartPausedLock = false;
+    restoreOrigPlay();
+    document.removeEventListener("play", onMediaPlayEvent, true);
+    document.removeEventListener("playing", onMediaPlayEvent, true);
+    window.removeEventListener("keydown", onUserKeyUnlock, true);
+    window.removeEventListener("pointerdown", onUserPointerUnlock, true);
+    window.removeEventListener("mousedown", onUserPointerUnlock, true);
+    window.removeEventListener("touchstart", onUserPointerUnlock, true);
+    window.removeEventListener("click", onUserPointerUnlock, true);
+    if (!mediaDone) tryApplyMedia();
+  }}
+
+  if (startPaused) {{
+    window.__singularityStartPausedLock = true;
+    window.__singularityUnlockStartPaused = unlockStartPaused;
+    if (typeof HTMLMediaElement !== "undefined" && HTMLMediaElement.prototype && typeof HTMLMediaElement.prototype.play === "function") {{
+      origMediaPlay = HTMLMediaElement.prototype.play;
+      HTMLMediaElement.prototype.play = function() {{
+        if (!userPlayIntent && matchesTargetPage()) {{
+          try {{ this.pause(); }} catch (_) {{}}
+          setTimeout(pauseAllMediaAndYt, 0);
+          return Promise.reject(new DOMException("Singularity restored tab starts paused until user plays", "NotAllowedError"));
+        }}
+        return origMediaPlay.apply(this, arguments);
+      }};
+    }}
+    document.addEventListener("play", onMediaPlayEvent, true);
+    document.addEventListener("playing", onMediaPlayEvent, true);
+    window.addEventListener("keydown", onUserKeyUnlock, true);
+    window.addEventListener("pointerdown", onUserPointerUnlock, true);
+    window.addEventListener("mousedown", onUserPointerUnlock, true);
+    window.addEventListener("touchstart", onUserPointerUnlock, true);
+    window.addEventListener("click", onUserPointerUnlock, true);
+  }}
+
+  document.addEventListener("loadedmetadata", function() {{ tryApplyMedia(); if (startPaused && !userPlayIntent) pauseAllMediaAndYt(); }}, true);
+  document.addEventListener("loadeddata", function() {{ tryApplyMedia(); if (startPaused && !userPlayIntent) pauseAllMediaAndYt(); }}, true);
+  document.addEventListener("canplay", function() {{ tryApplyMedia(); if (startPaused && !userPlayIntent) pauseAllMediaAndYt(); }}, true);
   document.addEventListener("playing", tryApplyMedia, true);
   window.addEventListener("load", function() {{
     tryApplyMedia();
+    if (startPaused && !userPlayIntent) pauseAllMediaAndYt();
     setTimeout(tryApplyScroll, 350);
   }}, {{ once: true }});
   const timer = setInterval(function() {{
     attempts++;
     tryApplyMedia();
     tryApplyScroll();
-    if ((mediaDone && scrollDone) || attempts >= 30) {{
+    if (startPaused && !userPlayIntent) pauseAllMediaAndYt();
+    if ((mediaDone && scrollDone && (!startPaused || userPlayIntent)) || attempts >= 30) {{
       clearInterval(timer);
     }}
   }}, 500);
@@ -2124,6 +2342,7 @@ fn run_windows_frameless_browser(
         incognito: bool,
         resume_time_sec: Option<u64>,
         resume_scroll_y: Option<u32>,
+        start_paused: bool,
         proxy: &EventLoopProxy<WinEvent>,
         shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
         cookies_hydrated: &mut bool,
@@ -2148,7 +2367,8 @@ fn run_windows_frameless_browser(
             .filter(|&t| t >= 3)
             .map(|t| apply_media_timestamp_to_url(url, t))
             .unwrap_or_else(|| url.to_string());
-        let resume_script = build_resume_init_script(url, resume_time_sec, resume_scroll_y);
+        let resume_script =
+            build_resume_init_script(url, resume_time_sec, resume_scroll_y, start_paused);
 
         let build_once = |ctx: &mut WebContext,
                           with_ext_path: bool,
@@ -2471,16 +2691,33 @@ fn run_windows_frameless_browser(
     });
 
     let win_icon = Icon::from_rgba(WINDOW_ICON_64_RGBA.to_vec(), 64, 64).ok();
-    let startup_pos = {
-        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-        shell
+    let (startup_pos, saved_geom, pending_restore_ids) = {
+        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+        let detach_pos = shell
             .roaming
             .startup_handoff
             .as_ref()
             .and_then(|h| match (h.pos_x, h.pos_y) {
                 (Some(x), Some(y)) => Some((x, y)),
                 _ => None,
-            })
+            });
+        let geom = shell.roaming.window_geometry;
+        let restore_ids = std::mem::take(&mut shell.roaming.pending_restore_window_ids);
+        (detach_pos, geom, restore_ids)
+    };
+    let effective_pos = startup_pos.or_else(|| match (saved_geom.pos_x, saved_geom.pos_y) {
+        (Some(x), Some(y)) if !saved_geom.maximized => Some((x, y)),
+        _ => None,
+    });
+    let initial_size = if startup_pos.is_none() {
+        match (saved_geom.width, saved_geom.height) {
+            (Some(w), Some(h)) if w >= 480 && h >= 360 => {
+                Size::Physical(TaoPhysicalSize::new(w.min(7680), h.min(4320)))
+            }
+            _ => Size::Logical(LogicalSize::new(1440.0, 880.0)),
+        }
+    } else {
+        Size::Logical(LogicalSize::new(1440.0, 880.0))
     };
 
     let mut win_builder = WindowBuilder::new()
@@ -2490,11 +2727,11 @@ fn run_windows_frameless_browser(
         .with_decorations(false)
         .with_undecorated_shadow(true)
         .with_background_color((0, 0, 0, 255))
-        .with_inner_size(Size::Logical(LogicalSize::new(1440.0, 880.0)))
+        .with_inner_size(initial_size)
         // Minimum width <= 500 logical px is required by Windows 11 Snap Bar / Snap Layouts
         // so the window fits half, third, and quarter zones across 100%-200% DPI scaling.
         .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)));
-    if let Some((px, py)) = startup_pos {
+    if let Some((px, py)) = effective_pos {
         win_builder = win_builder.with_position(TaoPhysicalPosition::new(
             px.max(-32000),
             py.max(-32000),
@@ -2505,8 +2742,9 @@ fn run_windows_frameless_browser(
         .map_err(|e| format!("Window creation error: {}", e))?;
     let main_hwnd = window.hwnd() as *mut core::ffi::c_void;
     enable_win32_immersive_dark_window(main_hwnd);
-    // Clamp detached window cleanly inside its current monitor if it landed near a screen edge
-    if let (Some((px, py)), Some(mon)) = (startup_pos, window.current_monitor()) {
+    // Clamp detached or restored window cleanly inside its current monitor so an unplugged
+    // secondary display or screen-edge drop never strands a window off-screen.
+    if let (Some((px, py)), Some(mon)) = (effective_pos, window.current_monitor()) {
         let mpos = mon.position();
         let msize = mon.size();
         let wsize = window.outer_size();
@@ -2583,8 +2821,27 @@ fn run_windows_frameless_browser(
     // Show the window only AFTER `ui_webview` exists & its black brush is active so Windows
     // never flashes a raw black parent frame or classic Win98 blue caption bar.
     window.set_visible(true);
+    if startup_pos.is_none() && saved_geom.maximized {
+        window.set_maximized(true);
+    }
     let _ = ui_webview.set_visible(true);
     let _ = ui_webview.focus();
+
+    // Multi-window restart: spawn every sibling window separately (each gets its own tabs,
+    // tab groups, active tab, saved screen geometry, and isolated `browser-ui-slots/slot-<N>`).
+    if !pending_restore_ids.is_empty() {
+        let _ = std::thread::Builder::new()
+            .name("singularity-restore-siblings".into())
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                for (idx, rid) in pending_restore_ids.into_iter().enumerate() {
+                    if idx > 0 {
+                        std::thread::sleep(Duration::from_millis(180));
+                    }
+                    let _ = spawn_restored_singularity_window(&rid);
+                }
+            });
+    }
 
     // One-shot startup watchdog: if the UI WebView ever stalls during initial navigation on a
     // secondary window, automatically re-bootstrap with a fresh single-use nonce after 4s.
@@ -2631,6 +2888,29 @@ fn run_windows_frameless_browser(
     // Active floating Chrome extension popup: (ext_id, window_id, auto_close_on_blur, Window, WebView)
     let mut ext_popup: Option<(String, WindowId, bool, Window, WebView)> = None;
     let mut last_ext_popup_closed: Option<(String, std::time::Instant)> = None;
+
+    let capture_window_geometry = |win: &Window, shared: &Arc<Mutex<SingularityBrowserShell>>| {
+        if win.fullscreen().is_some() {
+            return;
+        }
+        let phys = win.inner_size();
+        if phys.width == 0 || phys.height == 0 {
+            return;
+        }
+        let is_max = win.is_maximized();
+        if let Ok(mut shell) = shared.lock() {
+            shell.roaming.window_geometry.maximized = is_max;
+            if !is_max {
+                if let Ok(pos) = win.outer_position() {
+                    shell.roaming.window_geometry.pos_x = Some(pos.x);
+                    shell.roaming.window_geometry.pos_y = Some(pos.y);
+                }
+                shell.roaming.window_geometry.width = Some(phys.width.max(480));
+                shell.roaming.window_geometry.height = Some(phys.height.max(360));
+            }
+        }
+    };
+    capture_window_geometry(&window, &shared_shell);
 
     invalidate_ui_layout_cache();
     sync_webview_bounds(
@@ -2723,6 +3003,7 @@ fn run_windows_frameless_browser(
                     return;
                 }
                 close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
+                capture_window_geometry(&window, &shared_shell);
                 let is_private = shared_shell
                     .lock()
                     .map(|s| s.private_browsing_active)
@@ -2746,11 +3027,30 @@ fn run_windows_frameless_browser(
                 }
                 {
                     let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                    // Drain pending background writes BEFORE writing/deleting final close session!
+                    shell.roaming.flush_async_persistence();
+                    if !shell.private_browsing_active && shell.roaming.profile.restore_session {
+                        shell.roaming.save_window_session_on_close();
+                    }
                     shell.roaming.unregister_live_window();
                     shell.roaming.release_ui_webview_slot();
-                    shell.roaming.flush_async_persistence();
                 }
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent {
+                window_id,
+                event: WindowEvent::Focused(true),
+                ..
+            } => {
+                if window_id == main_win_id
+                    && web_visible
+                    && !overlay_open
+                    && !is_cursor_clicking_top_bar(&window)
+                {
+                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
+                        let _ = wv.focus();
+                    }
+                }
             }
             Event::WindowEvent {
                 window_id,
@@ -2782,6 +3082,7 @@ fn run_windows_frameless_browser(
                         invalidate_ui_layout_cache();
                         invalidate_tab_layout_cache(None);
                     }
+                    capture_window_geometry(&window, &shared_shell);
                     sync_webview_bounds(
                         &window,
                         &ui_webview,
@@ -2813,6 +3114,7 @@ fn run_windows_frameless_browser(
                 if window_id == main_win_id {
                     invalidate_ui_layout_cache();
                     invalidate_tab_layout_cache(None);
+                    capture_window_geometry(&window, &shared_shell);
                     sync_webview_bounds(
                         &window,
                         &ui_webview,
@@ -2834,6 +3136,7 @@ fn run_windows_frameless_browser(
                     if ext_popup.as_ref().map(|p| p.2).unwrap_or(false) {
                         close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
                     }
+                    capture_window_geometry(&window, &shared_shell);
                     sync_maximized_state(&window, &ui_webview, &mut last_maximized, false);
                 }
             }
@@ -2917,6 +3220,7 @@ fn run_windows_frameless_browser(
                                     );
                                 } else {
                                     window.set_maximized(!window.is_maximized());
+                                    capture_window_geometry(&window, &shared_shell);
                                     sync_maximized_state(
                                         &window,
                                         &ui_webview,
@@ -2955,6 +3259,7 @@ fn run_windows_frameless_browser(
                             }
                             UiIpcCmd::Close => {
                                 close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
+                                capture_window_geometry(&window, &shared_shell);
                                 let is_private = shared_shell
                                     .lock()
                                     .map(|s| s.private_browsing_active)
@@ -2983,9 +3288,14 @@ fn run_windows_frameless_browser(
                                 {
                                     let mut shell =
                                         shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                    shell.roaming.flush_async_persistence();
+                                    if !shell.private_browsing_active
+                                        && shell.roaming.profile.restore_session
+                                    {
+                                        shell.roaming.save_window_session_on_close();
+                                    }
                                     shell.roaming.unregister_live_window();
                                     shell.roaming.release_ui_webview_slot();
-                                    shell.roaming.flush_async_persistence();
                                 }
                                 *control_flow = ControlFlow::Exit;
                             }
@@ -3066,6 +3376,7 @@ fn run_windows_frameless_browser(
                                     is_private,
                                     None,
                                     None,
+                                    false,
                                     &proxy,
                                     &shared_shell,
                                     &mut cookies_hydrated,
@@ -3092,6 +3403,11 @@ fn run_windows_frameless_browser(
                                     overlay_open,
                                     html_fullscreen || user_f11_fullscreen,
                                 );
+                                if web_visible && !overlay_open {
+                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
+                                        let _ = wv.focus();
+                                    }
+                                }
                                 emit_ui_sync(
                                     &ui_webview,
                                     &serde_json::json!({
@@ -3108,6 +3424,7 @@ fn run_windows_frameless_browser(
                                 overlay_open: ov,
                                 resume_time_sec,
                                 resume_scroll_y,
+                                start_paused,
                             } => {
                                 // Save exact live SPA URL of the tab we are leaving (e.g. YouTube watch?v=...).
                                 if tab_id != active_tab_id {
@@ -3187,6 +3504,7 @@ fn run_windows_frameless_browser(
                                             is_private,
                                             target_sec,
                                             target_scroll,
+                                            start_paused,
                                             &proxy,
                                             &shared_shell,
                                             &mut cookies_hydrated,
@@ -3223,6 +3541,21 @@ fn run_windows_frameless_browser(
                                     overlay_open,
                                     html_fullscreen || user_f11_fullscreen,
                                 );
+                                if web_visible && !overlay_open {
+                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
+                                        let _ = wv.focus();
+                                    }
+                                }
+                            }
+                            UiIpcCmd::FocusActiveWeb { toggle_media_play } => {
+                                if web_visible && !overlay_open {
+                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
+                                        let _ = wv.focus();
+                                        if toggle_media_play {
+                                            let _ = wv.evaluate_script(TOGGLE_ACTIVE_MEDIA_SCRIPT);
+                                        }
+                                    }
+                                }
                             }
                             UiIpcCmd::CloseTab { tab_id } => {
                                 if tab_id == active_tab_id && html_fullscreen {
@@ -3325,6 +3658,7 @@ fn run_windows_frameless_browser(
                                         false,
                                         None,
                                         None,
+                                        false,
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
@@ -3391,6 +3725,7 @@ fn run_windows_frameless_browser(
                                         false,
                                         None,
                                         None,
+                                        false,
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
@@ -3615,6 +3950,11 @@ fn run_windows_frameless_browser(
                                     overlay_open,
                                     html_fullscreen || user_f11_fullscreen,
                                 );
+                                if web_visible && !overlay_open {
+                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
+                                        let _ = wv.focus();
+                                    }
+                                }
                             }
                             UiIpcCmd::SetOverlay { open } => {
                                 overlay_open = open;
@@ -3642,6 +3982,11 @@ fn run_windows_frameless_browser(
                                     overlay_open,
                                     html_fullscreen || user_f11_fullscreen,
                                 );
+                                if web_visible && !overlay_open {
+                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
+                                        let _ = wv.focus();
+                                    }
+                                }
                             }
                             UiIpcCmd::SetPrivateMode { enabled } => {
                                 close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
@@ -3681,6 +4026,7 @@ fn run_windows_frameless_browser(
                                             enabled,
                                             active_sec,
                                             active_sy,
+                                            false,
                                             &proxy,
                                             &shared_shell,
                                             &mut cookies_hydrated,
@@ -3781,6 +4127,7 @@ fn run_windows_frameless_browser(
                                         false,
                                         None,
                                         None,
+                                        false,
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
@@ -3833,6 +4180,7 @@ fn run_windows_frameless_browser(
                                         false,
                                         None,
                                         None,
+                                        false,
                                         &proxy,
                                         &shared_shell,
                                         &mut cookies_hydrated,
@@ -3999,9 +4347,11 @@ fn run_windows_frameless_browser(
                                     if is_only_tab {
                                         let mut shell =
                                             shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                        // Drain pending background writes BEFORE deleting this window's session!
+                                        shell.roaming.flush_async_persistence();
+                                        shell.roaming.delete_window_session();
                                         shell.roaming.unregister_live_window();
                                         shell.roaming.release_ui_webview_slot();
-                                        shell.roaming.flush_async_persistence();
                                         *control_flow = ControlFlow::Exit;
                                     } else {
                                         emit_ui_sync(
@@ -4985,6 +5335,7 @@ fn dispatch_http_request(
                 "saved_tabs": shell.roaming.profile.saved_tabs,
                 "saved_tab_groups": shell.roaming.profile.saved_tab_groups,
                 "merged_windows_count": shell.roaming.merged_windows_count,
+                "restored_windows_count": shell.roaming.restored_windows_count,
                 "is_secondary_live_window": shell.roaming.is_secondary_live_window,
                 "is_detached_handoff": shell.roaming.startup_handoff.is_some(),
                 "active_tab_index": shell.roaming.profile.active_tab_index,

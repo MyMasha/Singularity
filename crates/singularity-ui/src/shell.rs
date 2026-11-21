@@ -47,16 +47,27 @@ pub struct SingularityBrowserShell {
 
 impl SingularityBrowserShell {
     pub fn launch() -> Result<Self, String> {
-        Self::launch_with_options(None, false)
+        Self::launch_with_launch_args(None, None, false)
     }
 
     pub fn launch_with_options(
         detach_handoff_id: Option<&str>,
         force_new_window: bool,
     ) -> Result<Self, String> {
+        Self::launch_with_launch_args(detach_handoff_id, None, force_new_window)
+    }
+
+    pub fn launch_with_launch_args(
+        detach_handoff_id: Option<&str>,
+        restore_session_id: Option<&str>,
+        force_new_window: bool,
+    ) -> Result<Self, String> {
         let mut core = SingularityCoreOrchestrator::boot()?;
-        let roaming =
-            RoamingSingularityStore::open_default_with_options(detach_handoff_id, force_new_window)?;
+        let roaming = RoamingSingularityStore::open_default_with_launch_args(
+            detach_handoff_id,
+            restore_session_id,
+            force_new_window,
+        )?;
 
         // Restore persisted user overrides across the 2,165 settings registry from `%APPDATA%\.singularity\settings.toml`
         if let Some(saved_toml) = roaming.load_settings_toml() {

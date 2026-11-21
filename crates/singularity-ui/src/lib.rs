@@ -27,7 +27,7 @@ pub use roaming_store::{
     ensure_roaming_dir_initialized, is_protected_session_or_functional_cookie, is_valid_theme_id,
     normalize_url_without_media_time, resolve_roaming_singularity_dir, CookieThreatKind,
     EncryptedAuthTokenRecord, RoamingSingularityStore, SavedTabEntry, SavedTabGroup,
-    WindowSessionFile,
+    WindowGeometry, WindowRestorePayload, WindowSessionFile,
 };
 pub use server::run_interactive_browser_app;
 pub use shaders::{BLACK_HOLE_LENSING_WGSL_SHADER, CURSOR_ACCRETION_TRAIL_WGSL_SHADER};
@@ -492,11 +492,12 @@ mod tests {
 
     #[test]
     fn test_v306_multi_window_merge_favicons_groups_context_menu_and_shortcuts() {
-        // 1. Multi-window session merge: 2 previously open Singularity windows with different
-        //    tabs, colliding group IDs, and one shared video at different timestamps MUST combine
-        //    into ONE single session with all tabs, remapped groups, and freshest video second!
+        // 1. Multi-window separate restoration: 2 previously open Singularity windows with different
+        //    tabs, groups, and screen geometry MUST reopen as 2 separate windows (Window #1 loads
+        //    win-a's exact tabs & geometry and queues a single-use `--restore-session` handoff for
+        //    Window #2 carrying win-b's exact tabs & geometry — NEVER merging them into 1 window!).
         let merge_dir = std::env::temp_dir().join(format!(
-            "singularity_multiwin_merge_test_{}_{}",
+            "singularity_multiwin_restore_test_{}_{}",
             std::process::id(),
             roaming_store::unix_now()
         ));
@@ -519,7 +520,7 @@ mod tests {
                     favicon_url: None,
                 },
                 SavedTabEntry {
-                    title: "Video Shared".into(),
+                    title: "Video A".into(),
                     url: "https://www.youtube.com/watch?v=xyz789".into(),
                     media_time_sec: Some(120),
                     scroll_y: Some(50),
@@ -533,6 +534,14 @@ mod tests {
                 color: "#3b82f6".into(),
                 collapsed: false,
             }],
+            geometry: WindowGeometry {
+                pos_x: Some(40),
+                pos_y: Some(40),
+                width: Some(1280),
+                height: Some(800),
+                maximized: false,
+            },
+            closed_while_other_live: false,
         };
 
         let win_b = WindowSessionFile {
@@ -542,8 +551,8 @@ mod tests {
             active_tab_index: 1,
             tabs: vec![
                 SavedTabEntry {
-                    title: "Video Shared (Later)".into(),
-                    url: "https://www.youtube.com/watch?v=xyz789&t=480s".into(),
+                    title: "Video B".into(),
+                    url: "https://www.youtube.com/watch?v=abc123&t=480s".into(),
                     media_time_sec: Some(480),
                     scroll_y: Some(90),
                     group_id: Some("grp-1".into()),
@@ -559,11 +568,19 @@ mod tests {
                 },
             ],
             tab_groups: vec![SavedTabGroup {
-                id: "grp-1".into(), // intentionally collides with win_a's "grp-1"!
+                id: "grp-1".into(),
                 title: "Videos".into(),
                 color: "#ef4444".into(),
                 collapsed: true,
             }],
+            geometry: WindowGeometry {
+                pos_x: Some(1320),
+                pos_y: Some(60),
+                width: Some(1100),
+                height: Some(760),
+                maximized: true,
+            },
+            closed_while_other_live: false,
         };
 
         std::fs::write(
@@ -577,39 +594,41 @@ mod tests {
         )
         .expect("write win_b");
 
-        let merged = RoamingSingularityStore::open_at(merge_dir.clone()).expect("merge sessions");
-        assert_eq!(merged.merged_windows_count, 2);
-        assert!(!merged.is_secondary_live_window);
-        assert_eq!(merged.profile.saved_tabs.len(), 3);
-        assert_eq!(merged.profile.saved_tab_groups.len(), 2);
-        // Colliding group IDs must have been remapped into 2 distinct group IDs
-        assert_ne!(
-            merged.profile.saved_tab_groups[0].id,
-            merged.profile.saved_tab_groups[1].id
-        );
-        // Shared YouTube video keeps the highest media_time_sec (480s)
-        let yt = merged
-            .profile
-            .saved_tabs
-            .iter()
-            .find(|t| t.url.contains("xyz789"))
-            .expect("merged yt tab");
-        assert_eq!(yt.media_time_sec, Some(480));
-        assert_eq!(yt.scroll_y, Some(90));
-        // Twitch tab belongs to the remapped "Videos" group
-        let tw = merged
-            .profile
-            .saved_tabs
-            .iter()
-            .find(|t| t.url.contains("twitch.tv"))
-            .expect("merged twitch tab");
-        assert_eq!(
-            tw.group_id.as_deref(),
-            Some(merged.profile.saved_tab_groups[1].id.as_str())
-        );
-        // Old dead session files are cleaned up after combining
+        let restored_1 = RoamingSingularityStore::open_at(merge_dir.clone()).expect("restore win 1");
+        assert_eq!(restored_1.restored_windows_count, 2);
+        assert!(!restored_1.is_secondary_live_window);
+        assert_eq!(restored_1.profile.saved_tabs.len(), 2);
+        assert_eq!(restored_1.profile.saved_tabs[0].title, "GitHub");
+        assert_eq!(restored_1.profile.saved_tabs[1].media_time_sec, Some(120));
+        assert_eq!(restored_1.profile.saved_tab_groups.len(), 1);
+        assert_eq!(restored_1.profile.saved_tab_groups[0].title, "Dev");
+        assert_eq!(restored_1.window_geometry.pos_x, Some(40));
+        assert_eq!(restored_1.window_geometry.width, Some(1280));
+        assert!(!restored_1.window_geometry.maximized);
+        assert_eq!(restored_1.pending_restore_window_ids.len(), 1);
+        // Old dead session files are cleaned up after claiming
         assert!(!sessions_dir.join("win-a.json").exists());
         assert!(!sessions_dir.join("win-b.json").exists());
+
+        // Sibling Window #2 consumes the single-use `--restore-session <id>` handoff cleanly
+        let sibling_id = restored_1.pending_restore_window_ids[0].clone();
+        let restored_2 = RoamingSingularityStore::open_at_with_launch_args(
+            merge_dir.clone(),
+            None,
+            Some(&sibling_id),
+            false,
+        )
+        .expect("restore win 2");
+        assert!(restored_2.is_secondary_live_window);
+        assert_eq!(restored_2.profile.saved_tabs.len(), 2);
+        assert_eq!(restored_2.profile.saved_tabs[0].media_time_sec, Some(480));
+        assert_eq!(restored_2.profile.saved_tabs[1].title, "Twitch");
+        assert_eq!(restored_2.profile.saved_tab_groups.len(), 1);
+        assert_eq!(restored_2.profile.saved_tab_groups[0].title, "Videos");
+        assert_eq!(restored_2.window_geometry.pos_x, Some(1320));
+        assert!(restored_2.window_geometry.maximized);
+        // Single-use restore handoff cannot be consumed twice
+        assert!(RoamingSingularityStore::consume_window_restore_handoff(&merge_dir, &sibling_id).is_none());
 
         // 2. Verify noisy token-encryption pop-up toast is completely removed
         assert!(!SINGULARITY_UI_HTML.contains("token(s) de connexion chiffré(s) dans .singularity"));
@@ -766,11 +785,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.4");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.5");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.4"));
+        assert!(SINGULARITY_UI_HTML.contains("v1.0.5"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1063,6 +1082,144 @@ mod tests {
         assert!(server_src.contains("CONTENT_BROWSER_ARGS"));
         assert!(server_src.contains("UI_BROWSER_ARGS"));
         assert!(server_src.contains(".with_visible(false)"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_v105_separate_multi_window_restore_start_paused_and_auto_web_focus() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "singularity_v105_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let sessions_dir = test_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        // 1. Stale window manually closed >20s before shutdown MUST be pruned, while 2 windows
+        //    closed together during Windows Restart (within 20s) MUST BOTH reopen separately!
+        let old_closed = WindowSessionFile {
+            window_id: "win-old-manual".into(),
+            pid: 999_981,
+            updated_unix: 1000,
+            active_tab_index: 0,
+            tabs: vec![SavedTabEntry {
+                title: "Old Manually Closed".into(),
+                url: "https://example.org/old".into(),
+                media_time_sec: None,
+                scroll_y: None,
+                group_id: None,
+                favicon_url: None,
+            }],
+            tab_groups: Vec::new(),
+            geometry: WindowGeometry::default(),
+            closed_while_other_live: true,
+        };
+        let restart_win_1 = WindowSessionFile {
+            window_id: "win-restart-1".into(),
+            pid: 999_982,
+            updated_unix: 2000,
+            active_tab_index: 0,
+            tabs: vec![SavedTabEntry {
+                title: "YouTube Watch".into(),
+                url: "https://www.youtube.com/watch?v=paused123".into(),
+                media_time_sec: Some(345),
+                scroll_y: None,
+                group_id: None,
+                favicon_url: None,
+            }],
+            tab_groups: Vec::new(),
+            geometry: WindowGeometry {
+                pos_x: Some(10),
+                pos_y: Some(20),
+                width: Some(1000),
+                height: Some(720),
+                maximized: false,
+            },
+            closed_while_other_live: true, // closed 5s before win-restart-2 during Windows Restart!
+        };
+        let restart_win_2 = WindowSessionFile {
+            window_id: "win-restart-2".into(),
+            pid: 999_983,
+            updated_unix: 2005,
+            active_tab_index: 0,
+            tabs: vec![SavedTabEntry {
+                title: "Docs".into(),
+                url: "https://doc.rust-lang.org".into(),
+                media_time_sec: None,
+                scroll_y: Some(240),
+                group_id: None,
+                favicon_url: None,
+            }],
+            tab_groups: Vec::new(),
+            geometry: WindowGeometry {
+                pos_x: Some(1020),
+                pos_y: Some(20),
+                width: Some(900),
+                height: Some(720),
+                maximized: false,
+            },
+            closed_while_other_live: false,
+        };
+        for (name, s) in [
+            ("win-old-manual.json", &old_closed),
+            ("win-restart-1.json", &restart_win_1),
+            ("win-restart-2.json", &restart_win_2),
+        ] {
+            std::fs::write(sessions_dir.join(name), serde_json::to_vec(s).expect("ser"))
+                .expect("write sess");
+        }
+
+        let w1 = RoamingSingularityStore::open_at(test_dir.clone()).expect("open w1");
+        assert_eq!(w1.restored_windows_count, 2, "must reopen the 2 restart windows and prune old_closed");
+        assert_eq!(w1.profile.saved_tabs.len(), 1);
+        assert_eq!(w1.profile.saved_tabs[0].url, "https://www.youtube.com/watch?v=paused123");
+        assert_eq!(w1.profile.saved_tabs[0].media_time_sec, Some(345));
+        assert_eq!(w1.pending_restore_window_ids.len(), 1);
+
+        let w2 = RoamingSingularityStore::open_at_with_launch_args(
+            test_dir.clone(),
+            None,
+            Some(&w1.pending_restore_window_ids[0]),
+            false,
+        )
+        .expect("open w2");
+        assert_eq!(w2.profile.saved_tabs.len(), 1);
+        assert_eq!(w2.profile.saved_tabs[0].url, "https://doc.rust-lang.org");
+        assert_eq!(w2.window_geometry.pos_x, Some(1020));
+
+        // 2. delete_window_session removes both .json and .json.bak cleanly
+        w2.save_window_session().expect("save w2 session");
+        assert!(w2.window_session_file_path().is_file());
+        w2.delete_window_session();
+        assert!(!w2.window_session_file_path().exists());
+        assert!(!w2.window_session_file_path().with_extension("json.bak").exists());
+
+        // 3. Verify server.rs start-paused video gate, auto-focus, YouTube Spacebar, and multi-window spawn
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("start_paused: bool"));
+        assert!(server_src.contains("__singularityStartPausedLock"));
+        assert!(server_src.contains("__singularityUnlockStartPaused"));
+        assert!(server_src.contains("NotAllowedError"));
+        assert!(server_src.contains("FocusActiveWeb"));
+        assert!(server_src.contains("TOGGLE_ACTIVE_MEDIA_SCRIPT"));
+        assert!(server_src.contains("WindowEvent::Focused(true)"));
+        assert!(server_src.contains("is_cursor_clicking_top_bar"));
+        assert!(server_src.contains("spawn_restored_singularity_window"));
+        assert!(server_src.contains("save_window_session_on_close"));
+        assert!(server_src.contains("delete_window_session"));
+        assert!(server_src.contains("restored_windows_count"));
+        assert!(!server_src.contains("WM_NCPAINT"));
+        assert!(!server_src.contains("SetWindowSubclass"));
+
+        // 4. Verify UI startPaused propagation, active-tab refocus, and top-bar Spacebar forwarding
+        assert!(SINGULARITY_UI_HTML.contains("startPaused: !isDetachedHandoff"));
+        assert!(SINGULARITY_UI_HTML.contains("start_paused: shouldStartPaused"));
+        assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
+        assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
+        assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
+        assert!(SINGULARITY_UI_HTML.contains("v1.0.5"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }

@@ -36,9 +36,14 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--detach-handoff")
         .map(|w| w[1].clone());
+    let restore_session_id = args
+        .windows(2)
+        .find(|w| w[0] == "--restore-session")
+        .map(|w| w[1].clone());
 
-    let shell = match SingularityBrowserShell::launch_with_options(
+    let shell = match SingularityBrowserShell::launch_with_launch_args(
         detach_handoff_id.as_deref(),
+        restore_session_id.as_deref(),
         force_new_window,
     ) {
         Ok(s) => s,
