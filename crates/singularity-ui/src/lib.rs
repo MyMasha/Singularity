@@ -12,8 +12,8 @@ pub mod theme;
 pub mod ui_app;
 pub mod updater;
 pub mod vim;
-#[cfg(all(target_os = "windows", not(target_env = "msvc")))]
-pub mod webview2_gnu_shim;
+#[cfg(target_os = "windows")]
+pub mod cef_runtime;
 pub mod winhttp_client;
 
 pub use browser_import::{
@@ -209,9 +209,9 @@ mod tests {
 
     #[test]
     fn test_ram_unloader_four_modes_and_v302_ui_features() {
-        assert_eq!(roaming_store::tab_unload_timeout_seconds("low", 120), 7 * 24 * 3600);
-        assert_eq!(roaming_store::tab_unload_timeout_seconds("medium", 120), 24 * 3600);
-        assert_eq!(roaming_store::tab_unload_timeout_seconds("hard", 120), 90 * 60);
+        assert_eq!(roaming_store::tab_unload_timeout_seconds("low", 120), 2 * 3600);
+        assert_eq!(roaming_store::tab_unload_timeout_seconds("medium", 120), 15 * 60);
+        assert_eq!(roaming_store::tab_unload_timeout_seconds("hard", 120), 3 * 60);
         assert_eq!(roaming_store::tab_unload_timeout_seconds("custom", 45), 45 * 60);
         assert_eq!(roaming_store::tab_unload_timeout_seconds("custom", 0), 60);
         assert_eq!(
@@ -785,11 +785,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "1.0.5");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.0");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.5"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.0"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -865,18 +865,18 @@ mod tests {
             None
         );
 
-        // 2. Native .exe download handling, dark Win32 background & shared WebView2 environment
+        // 2. Native .exe download handling (Pure Chromium CEF), dark Win32 background & cookie hygiene
         let server_src = include_str!("server.rs");
-        assert!(server_src.contains("with_download_started_handler"));
-        assert!(server_src.contains("with_download_completed_handler"));
-        assert!(server_src.contains("safebrowsing-disable-download-protection"));
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("on_before_download"));
+        assert!(cef_src.contains("on_download_updated"));
+        assert!(cef_src.contains("safebrowsing-disable-download-protection"));
         assert!(server_src.contains("SHGetKnownFolderPath"));
         assert!(server_src.contains("reveal_download_in_explorer"));
         assert!(server_src.contains("apply_win32_black_class_brush"));
         assert!(server_src.contains("enable_win32_immersive_dark_window"));
-        assert!(server_src.contains("with_background_color((0, 0, 0, 255))"));
-        assert!(server_src.contains("with_environment(Clone::clone(env))"));
-        assert!(server_src.contains("run_combined_cookie_hygiene_and_snapshot"));
+        assert!(cef_src.contains("background_color: 0xFF00_0000"));
+        assert!(cef_src.contains("run_cookie_hygiene_cef"));
         assert!(server_src.contains("favicon_ram_cache"));
         assert!(server_src.contains("try_acquire_favicon_fetch_slot"));
         assert!(server_src.contains("record_history_in_memory"));
@@ -1001,7 +1001,7 @@ mod tests {
         let exts_b = extensions::list_extensions_cached(&test_dir, &[]);
         assert_eq!(exts_a.len(), exts_b.len());
 
-        // 2. Real-Rust HTTP, IPC, Win32 & WebView2 performance engine assertions
+        // 2. Real-Rust HTTP, IPC, Win32 & Pure Chromium CEF performance engine assertions
         let server_src = include_str!("server.rs");
         assert!(server_src.contains("struct HttpThreadPool"));
         assert!(server_src.contains("set_nodelay(true)"));
@@ -1009,11 +1009,7 @@ mod tests {
         assert!(server_src.contains("Connection: keep-alive"));
         assert!(server_src.contains("STATE_REVISION"));
         assert!(server_src.contains("struct WebViewLayoutCache"));
-        assert!(server_src.contains("msEdgeTelemetry"));
         assert!(server_src.contains("/api/window/adopt_tab"));
-        assert!(server_src.contains("find_peer_window_at_point"));
-        assert!(server_src.contains("send_adopt_tab_to_peer"));
-        assert!(server_src.contains("spawn_detached_singularity_window"));
         assert!(server_src.contains("schedule_save_profile"));
         assert!(server_src.contains("is_detached_handoff"));
 
@@ -1038,52 +1034,17 @@ mod tests {
     }
 
     #[test]
-    fn test_v103_multi_window_ui_slot_isolation_borderless_dwm_and_http_pool_headroom() {
-        // 1. Two concurrent windows MUST receive two distinct WebView2 UI slots (`slot-0` vs `slot-1`),
-        //    and releasing Window 1's slot immediately makes `slot-0` reusable!
-        let test_dir = std::env::temp_dir().join(format!(
-            "singularity_v103_ui_slots_test_{}_{}",
-            std::process::id(),
-            roaming_store::unix_now()
-        ));
-        let _ = std::fs::remove_dir_all(&test_dir);
-
-        let mut win1 = RoamingSingularityStore::open_at(test_dir.clone()).expect("open win1");
-        let mut win2 = RoamingSingularityStore::open_at_with_options(test_dir.clone(), None, true)
-            .expect("open win2");
-        let slot1 = win1.allocate_ui_webview_slot();
-        let slot2 = win2.allocate_ui_webview_slot();
-        assert_ne!(slot1, slot2, "Simultaneous windows must never share one UI WebView2 slot");
-        assert!(slot1.ends_with("slot-0"));
-        assert!(slot2.ends_with("slot-1"));
-
-        // Dropping/releasing win1 frees slot-0 for reuse by a third window
-        win1.release_ui_webview_slot();
-        let mut win3 = RoamingSingularityStore::open_at_with_options(test_dir.clone(), None, true)
-            .expect("open win3");
-        let slot3 = win3.allocate_ui_webview_slot();
-        assert_eq!(slot3, slot1, "Released UI slot should be reused cleanly");
-        win2.release_ui_webview_slot();
-        win3.release_ui_webview_slot();
-
-        // 2. Verify borderless DWM color-none (zero blue Win98 border regression!), hidden-until-ready
-        //    window creation, startup watchdog, canonical CONTENT_BROWSER_ARGS, and 32-worker pool headroom!
+    fn test_v103_borderless_dwm_and_http_pool_headroom() {
+        // Verify borderless DWM color-none (zero blue Win98 border regression!), hidden-until-ready
+        // window creation, and 32-worker HTTP thread pool headroom.
         let server_src = include_str!("server.rs");
         assert!(server_src.contains("HTTP_WORKER_THREADS: usize = 32"));
         assert!(server_src.contains("DWMWA_BORDER_COLOR"));
         assert!(server_src.contains("DWMWA_COLOR_NONE"));
         assert!(!server_src.contains("WM_NCPAINT"));
         assert!(!server_src.contains("SetWindowSubclass"));
-        assert!(server_src.contains("allocate_ui_webview_slot"));
-        assert!(server_src.contains("release_ui_webview_slot"));
-        assert!(server_src.contains("UiStartupWatchdog"));
-        assert!(server_src.contains("mint_recovery_bootstrap_nonce"));
-        assert!(server_src.contains("invalidate_ui_layout_cache"));
-        assert!(server_src.contains("CONTENT_BROWSER_ARGS"));
-        assert!(server_src.contains("UI_BROWSER_ARGS"));
+        assert!(server_src.contains("WebViewLayoutCache"));
         assert!(server_src.contains(".with_visible(false)"));
-
-        let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     #[test]
@@ -1196,7 +1157,7 @@ mod tests {
         assert!(!w2.window_session_file_path().exists());
         assert!(!w2.window_session_file_path().with_extension("json.bak").exists());
 
-        // 3. Verify server.rs start-paused video gate, auto-focus, YouTube Spacebar, and multi-window spawn
+        // 3. Verify server.rs start-paused video gate, auto-focus, YouTube Spacebar, and multi-window persistence
         let server_src = include_str!("server.rs");
         assert!(server_src.contains("start_paused: bool"));
         assert!(server_src.contains("__singularityStartPausedLock"));
@@ -1206,9 +1167,8 @@ mod tests {
         assert!(server_src.contains("TOGGLE_ACTIVE_MEDIA_SCRIPT"));
         assert!(server_src.contains("WindowEvent::Focused(true)"));
         assert!(server_src.contains("is_cursor_clicking_top_bar"));
-        assert!(server_src.contains("spawn_restored_singularity_window"));
-        assert!(server_src.contains("save_window_session_on_close"));
-        assert!(server_src.contains("delete_window_session"));
+        assert!(server_src.contains("save_window_session_for"));
+        assert!(server_src.contains("delete_window_session_for"));
         assert!(server_src.contains("restored_windows_count"));
         assert!(!server_src.contains("WM_NCPAINT"));
         assert!(!server_src.contains("SetWindowSubclass"));
@@ -1219,8 +1179,54 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v1.0.5"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.0"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_v200_pure_chromium_cef_zero_edge_and_ram_optimizations() {
+        // 1. ZERO Microsoft Edge / WebView2 (`wry`) dependencies in Cargo manifest or runtime sources!
+        let ui_cargo = include_str!("../Cargo.toml");
+        assert!(ui_cargo.contains("cef = "));
+        assert!(!ui_cargo.contains("wry = "));
+
+        let server_src = include_str!("server.rs");
+        assert!(!server_src.contains("msedge.exe"));
+        assert!(!server_src.contains("msedgewebview2"));
+        assert!(!server_src.contains("WebView2Loader"));
+        assert!(!server_src.contains("use wry::"));
+        assert!(server_src.contains("CefRuntimeGuard"));
+        assert!(server_src.contains("window_sessions"));
+        assert!(server_src.contains("x-singularity-window"));
+
+        let main_src = include_str!("main.rs");
+        assert!(main_src.contains("maybe_run_cef_subprocess"));
+
+        // 2. Pure Chromium CEF low-RAM flags, real network-layer uBlock, and Win32 working-set trim
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("process-per-site"));
+        assert!(cef_src.contains("BackForwardCache"));
+        assert!(cef_src.contains("on_before_resource_load"));
+        assert!(cef_src.contains("was_hidden"));
+        assert!(cef_src.contains("K32EmptyWorkingSet"));
+        assert!(cef_src.contains("trim_process_working_set"));
+        assert!(cef_src.contains("on_already_running_app_relaunch"));
+        assert!(cef_src.contains("RuntimeStyle::ALLOY"));
+
+        // 3. UI WebGL2 1x1 framebuffer shrink when hidden, background tab RAM cap, and X-Singularity-Window header
+        assert!(SINGULARITY_UI_HTML.contains("WINDOW_SESSION_ID"));
+        assert!(SINGULARITY_UI_HTML.contains("X-Singularity-Window"));
+        assert!(SINGULARITY_UI_HTML.contains("c.width = 1;"));
+        assert!(SINGULARITY_UI_HTML.contains("maxActiveBackgroundTabsForMode"));
+
+        // 4. Self-updater & installer bundle Pure Chromium CEF ZIP
+        let updater_src = include_str!("updater.rs");
+        assert!(updater_src.contains("Singularity-setup.exe"));
+        assert!(updater_src.contains("\"--launch\""));
+        let installer_src = include_str!("../../singularity-installer/src/main.rs");
+        assert!(installer_src.contains("zip::ZipArchive"));
+        assert!(installer_src.contains("libcef.dll"));
+        assert!(installer_src.contains("--launch"));
     }
 }

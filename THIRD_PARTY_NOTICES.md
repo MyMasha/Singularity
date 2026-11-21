@@ -6,12 +6,12 @@ This software incorporates and/or links against the following third-party open-s
 
 ---
 
-## 1. Platform Runtime Redistributables (Windows)
+## 1. Embedded Browser Engine Runtime (Windows)
 
-### Microsoft Edge WebView2 SDK (`WebView2Loader.dll`)
-- **Copyright**: Copyright (c) Microsoft Corporation. All rights reserved.
-- **License**: Microsoft Edge WebView2 SDK Redistributable License (`webview2-com-sys`).
-- **Usage**: Loaded by Singularity on Windows via `wry` to render web content tabs and Chrome extensions using the system-installed Microsoft Edge WebView2 Runtime.
+### Chromium Embedded Framework (CEF) & Chromium
+- **Copyright**: Copyright (c) 2008–2026 Marshall A. Greenblatt and The Chromium Authors. All rights reserved.
+- **License**: BSD 3-Clause License (CEF) and Chromium open-source licenses (`https://bitbucket.org/chromiumembedded/cef/src/master/LICENSE.txt`).
+- **Usage**: Bundled by Singularity on Windows via `cef` / `cef-dll-sys` (`tauri-apps/cef-rs`, Apache-2.0 OR MIT) to render web content tabs and Chrome extensions using Pure Chromium (zero Microsoft Edge / WebView2 dependency). Official prebuilt CEF binaries from Spotify CDN include open media codecs (VP8/VP9/AV1/Opus/Vorbis/WebM) and exclude proprietary H.264/AAC software decoders.
 
 ---
 
@@ -34,9 +34,8 @@ The complete dependency tree is pinned in [`Cargo.lock`](Cargo.lock). Key direct
 
 | Crate(s) | License |
 | --- | --- |
-| `serde`, `serde_json`, `toml`, `thiserror`, `hex`, `base64`, `rand_core`, `sha1`, `sha2`, `hmac`, `argon2`, `chacha20poly1305`, `zeroize`, `zip`, `tao`, `wry`, `windows`, `windows-sys`, `windows-core` | MIT OR Apache-2.0 |
+| `serde`, `serde_json`, `toml`, `thiserror`, `hex`, `base64`, `rand_core`, `sha1`, `sha2`, `hmac`, `argon2`, `chacha20poly1305`, `zeroize`, `zip`, `tao`, `cef`, `cef-dll-sys`, `windows`, `windows-sys`, `windows-core` | MIT OR Apache-2.0 |
 | `subtle`, `curve25519-dalek`, `ed25519-dalek`, `x25519-dalek` | BSD-3-Clause |
-| `webview2-com`, `webview2-com-sys` | MIT (with Microsoft WebView2 redistributable loader binary) |
 | `unicode-ident`, `unicode-xid`, `icu_*` | MIT / Apache-2.0 / Unicode-3.0 |
 
 To inspect the full license list for your build target, run:

@@ -12,18 +12,17 @@
 //!   redirect validation, opaque `sandbox` CSP isolation, UTF-8-safe `<head>` injection, and HTML escaping.
 
 use crate::browser_import;
+#[cfg(target_os = "windows")]
+use crate::cef_runtime::{
+    self, CefBrowserHandle, CefCallbackEvent, CefDownloadResolver, CefEventSink, CefRuntimeGuard,
+};
 use crate::extensions;
 #[cfg(target_os = "windows")]
-use crate::roaming_store::{
-    apply_media_timestamp_to_url, classify_auth_cookie, classify_tracker_or_malicious_cookie,
-    is_protected_session_or_functional_cookie, normalize_url_without_media_time, CookieThreatKind,
-};
+use crate::roaming_store::{apply_media_timestamp_to_url, normalize_url_without_media_time};
 use crate::roaming_store::{
     is_valid_language, is_valid_theme_id, unix_now, BookmarkEntry, EncryptedAuthTokenRecord,
-    SavedTabEntry, SavedTabGroup, TabHandoffPayload,
+    SavedTabEntry, SavedTabGroup, TabHandoffPayload, WindowGeometry,
 };
-#[cfg(target_os = "windows")]
-use crate::roaming_store::LiveWindowDescriptor;
 use crate::shell::SingularityBrowserShell;
 use crate::ui_app::SINGULARITY_UI_HTML;
 use rand_core::{OsRng, RngCore};
@@ -36,7 +35,7 @@ use singularity_core::{
 };
 use singularity_settings_registry::schema::{SettingCategory, SettingValue};
 use singularity_vault::{generate_totp_code, TotpAlgorithm, VaultCredentialEntry};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 #[cfg(target_os = "windows")]
@@ -57,15 +56,6 @@ const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
 const MAX_PROXY_REDIRECTS: usize = 5;
 const MAX_PROXY_BODY_BYTES: usize = 5 * 1024 * 1024;
 
-#[cfg(target_os = "windows")]
-const UI_BROWSER_ARGS: &str =
-    "--disable-features=msWebOOUI,msPdfOOUI,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections";
-#[cfg(target_os = "windows")]
-const CONTENT_BROWSER_ARGS: &str =
-    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msEdgeTelemetry,msEdgeShoppingAssistant,msEdgeCollections \
-     --safebrowsing-disable-download-protection \
-     --autoplay-policy=no-user-gesture-required";
-
 static STATE_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn bump_state_revision() -> u64 {
@@ -79,6 +69,20 @@ const APPLE_BAR_LOGICAL_HEIGHT: f64 = 46.0;
 
 type AdoptTabCallback = Arc<Mutex<Option<Box<dyn Fn(TabHandoffPayload) + Send + Sync>>>>;
 
+/// Per-window session state stored inside our single low-RAM Chromium (CEF) browser process so
+/// multiple open Singularity windows each keep independent tabs, tab groups, active tab, and
+/// screen geometry without spawning duplicate Chromium browser/GPU/network trees.
+#[derive(Clone, Default)]
+struct WindowTabSession {
+    saved_tabs: Vec<SavedTabEntry>,
+    saved_tab_groups: Vec<SavedTabGroup>,
+    active_tab_index: usize,
+    geometry: WindowGeometry,
+    is_detached_handoff: bool,
+    is_secondary_live_window: bool,
+    restored_windows_count: usize,
+}
+
 #[derive(Clone)]
 struct ServerConfig {
     bind_port: u16,
@@ -86,7 +90,8 @@ struct ServerConfig {
     transfer_token: Arc<String>,
     bootstrap_nonce: Arc<String>,
     bootstrap_consumed: Arc<AtomicBool>,
-    recovery_bootstrap_nonce: Arc<Mutex<Option<String>>>,
+    extra_bootstrap_nonces: Arc<Mutex<HashSet<String>>>,
+    window_sessions: Arc<Mutex<HashMap<String, WindowTabSession>>>,
     rendered_html: Arc<Vec<u8>>,
     adopt_tab_tx: AdoptTabCallback,
 }
@@ -111,19 +116,23 @@ impl ServerConfig {
             transfer_token: Arc::new(transfer_token),
             bootstrap_nonce: Arc::new(bootstrap_nonce),
             bootstrap_consumed: Arc::new(AtomicBool::new(false)),
-            recovery_bootstrap_nonce: Arc::new(Mutex::new(None)),
+            extra_bootstrap_nonces: Arc::new(Mutex::new(HashSet::new())),
+            window_sessions: Arc::new(Mutex::new(HashMap::new())),
             rendered_html: Arc::new(rendered_html),
             adopt_tab_tx: Arc::new(Mutex::new(None)),
         }
     }
 
     #[cfg(target_os = "windows")]
-    fn mint_recovery_bootstrap_nonce(&self) -> String {
+    fn mint_bootstrap_nonce(&self) -> String {
         let mut boot_raw = [0u8; 24];
         OsRng.fill_bytes(&mut boot_raw);
         let fresh = hex::encode(boot_raw);
-        if let Ok(mut guard) = self.recovery_bootstrap_nonce.lock() {
-            *guard = Some(fresh.clone());
+        if let Ok(mut guard) = self.extra_bootstrap_nonces.lock() {
+            if guard.len() > 64 {
+                guard.clear();
+            }
+            guard.insert(fresh.clone());
         }
         fresh
     }
@@ -152,18 +161,20 @@ impl ServerConfig {
         let Some(nonce) = provided else {
             return false;
         };
-        let actual = nonce.trim().as_bytes();
+        let trimmed = nonce.trim();
+        let actual = trimmed.as_bytes();
         let expected = self.bootstrap_nonce.as_bytes();
         if expected.len() == actual.len() && bool::from(expected.ct_eq(actual)) {
             return !self.bootstrap_consumed.swap(true, Ordering::AcqRel);
         }
-        if let Ok(mut guard) = self.recovery_bootstrap_nonce.lock() {
-            if let Some(ref rec) = *guard {
-                let rec_bytes = rec.as_bytes();
-                if rec_bytes.len() == actual.len() && bool::from(rec_bytes.ct_eq(actual)) {
-                    *guard = None;
-                    return true;
-                }
+        if let Ok(mut guard) = self.extra_bootstrap_nonces.lock() {
+            if let Some(found) = guard
+                .iter()
+                .find(|n| n.len() == actual.len() && bool::from(n.as_bytes().ct_eq(actual)))
+                .cloned()
+            {
+                guard.remove(&found);
+                return true;
             }
         }
         false
@@ -348,14 +359,12 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
             })
             .map_err(|e| format!("Failed spawning HTTP accept thread: {}", e))?;
 
-        if run_windows_frameless_browser(
-            &app_url,
+        if let Err(err) = run_windows_frameless_browser(
             local_addr.port(),
             &cfg,
             Arc::clone(&shared_shell),
-        )
-        .is_err()
-        {
+        ) {
+            eprintln!("Singularity Chromium CEF error: {}", err);
             launch_native_chromium_window(&app_url);
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
@@ -376,7 +385,6 @@ pub fn run_interactive_browser_app(shell: SingularityBrowserShell) -> Result<(),
 
 #[cfg(target_os = "windows")]
 fn run_windows_frameless_browser(
-    app_url: &str,
     bind_port: u16,
     server_cfg: &ServerConfig,
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
@@ -384,58 +392,26 @@ fn run_windows_frameless_browser(
     use tao::dpi::{
         LogicalSize, PhysicalPosition as TaoPhysicalPosition, PhysicalSize as TaoPhysicalSize, Size,
     };
-    use tao::event::{Event, WindowEvent};
-    use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+    use tao::event::{Event, StartCause, WindowEvent};
+    use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
     use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
     use tao::window::{Fullscreen, Icon, ResizeDirection, Window, WindowBuilder, WindowId};
-    use wry::cookie::Cookie;
-    use wry::dpi::{PhysicalPosition, PhysicalSize};
-    use wry::{
-        MemoryUsageLevel, NewWindowResponse, PageLoadEvent, Rect, Theme, WebContext, WebView,
-        WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows,
-    };
 
     #[derive(Debug)]
     enum WinEvent {
-        UiIpc(String),
-        WebPageStarted(u64, String),
-        WebPageFinished(u64, String),
-        WebTitleChanged(u64, String),
-        WebFavicon {
-            tab_id: u64,
-            favicon_url: String,
-        },
-        WebShortcut {
-            tab_id: u64,
-            action: String,
-            index: Option<u8>,
-        },
-        WebFullscreen {
-            tab_id: u64,
-            enabled: bool,
-        },
-        WebMediaProgress {
-            tab_id: u64,
-            time_sec: u64,
-            scroll_y: u32,
-        },
-        OpenNewTab {
-            url: String,
-            title: Option<String>,
-            background: bool,
-        },
-        DownloadStarted {
-            filename: String,
-            path: String,
-        },
-        DownloadCompleted {
-            filename: String,
-            path: String,
-            success: bool,
-        },
+        CefPump(i64),
+        CefCallback(WindowId, CefCallbackEvent),
+        OpenNewWindowInProcess,
         AdoptExternalTab(TabHandoffPayload),
-        CloseExtensionPopup,
-        UiStartupWatchdog,
+        UiStartupWatchdog(WindowId),
+        CookieHygieneDone {
+            win_id: WindowId,
+            mode: &'static str,
+            trackers: usize,
+            ads: usize,
+            malicious: usize,
+            synced: usize,
+        },
     }
 
     #[derive(Debug, Deserialize)]
@@ -580,425 +556,23 @@ fn run_windows_frameless_browser(
         ui_bounds: Option<(i32, i32, u32, u32)>,
         tab_visible: HashMap<u64, bool>,
         tab_bounds: HashMap<u64, (i32, i32, u32, u32)>,
-        tab_low_mem: HashMap<u64, bool>,
     }
 
-    thread_local! {
-        static LAYOUT_CACHE: std::cell::RefCell<WebViewLayoutCache> =
-            std::cell::RefCell::new(WebViewLayoutCache::default());
-    }
+    impl WebViewLayoutCache {
+        fn invalidate_ui(&mut self) {
+            self.ui_visible = None;
+            self.ui_bounds = None;
+        }
 
-    fn invalidate_ui_layout_cache() {
-        LAYOUT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            cache.ui_visible = None;
-            cache.ui_bounds = None;
-        });
-    }
-
-    fn invalidate_tab_layout_cache(tab_id: Option<u64>) {
-        LAYOUT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
+        fn invalidate_tab(&mut self, tab_id: Option<u64>) {
             if let Some(tid) = tab_id {
-                cache.tab_visible.remove(&tid);
-                cache.tab_bounds.remove(&tid);
-                cache.tab_low_mem.remove(&tid);
+                self.tab_visible.remove(&tid);
+                self.tab_bounds.remove(&tid);
             } else {
-                cache.tab_visible.clear();
-                cache.tab_bounds.clear();
-                cache.tab_low_mem.clear();
-            }
-        });
-    }
-
-    fn emit_ui_sync(ui_wv: &WebView, payload: &serde_json::Value) {
-        let _ = ui_wv.evaluate_script(&format!(
-            "window.__singularitySyncWeb && window.__singularitySyncWeb({});",
-            payload
-        ));
-    }
-
-    fn read_live_http_url(wv: &WebView) -> Option<String> {
-        let u = wv.url().ok()?;
-        if u.starts_with("https://") || u.starts_with("http://") {
-            Some(u)
-        } else {
-            None
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn sync_webview_bounds(
-        window: &Window,
-        ui_wv: &WebView,
-        tab_webviews: &HashMap<u64, WebView>,
-        active_tab_id: u64,
-        web_visible: bool,
-        overlay_open: bool,
-        in_fullscreen: bool,
-    ) {
-        let phys = window.inner_size();
-        // Never shrink WebView2 surfaces to 1x1 while the window is minimized (0x0 client area).
-        if phys.width == 0 || phys.height == 0 {
-            return;
-        }
-        let w = phys.width;
-        let h = phys.height;
-        let scale = window.scale_factor();
-        let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(h);
-        let content_h = h.saturating_sub(bar_h).max(1);
-
-        let show_active_web =
-            web_visible && !overlay_open && tab_webviews.contains_key(&active_tab_id);
-
-        LAYOUT_CACHE.with(|cell| {
-            let mut cache = cell.borrow_mut();
-            cache.tab_visible.retain(|tid, _| tab_webviews.contains_key(tid));
-            cache.tab_bounds.retain(|tid, _| tab_webviews.contains_key(tid));
-            cache.tab_low_mem.retain(|tid, _| tab_webviews.contains_key(tid));
-
-            fn apply_ui_layout(
-                cache: &mut WebViewLayoutCache,
-                ui_wv: &WebView,
-                vis: bool,
-                rect: Option<(i32, i32, u32, u32)>,
-            ) {
-                if let Some(r) = rect {
-                    if cache.ui_bounds != Some(r) {
-                        if ui_wv
-                            .set_bounds(Rect {
-                                position: PhysicalPosition::new(r.0, r.1).into(),
-                                size: PhysicalSize::new(r.2, r.3).into(),
-                            })
-                            .is_ok()
-                        {
-                            cache.ui_bounds = Some(r);
-                        }
-                    }
-                }
-                if cache.ui_visible != Some(vis) {
-                    if ui_wv.set_visible(vis).is_ok() {
-                        cache.ui_visible = Some(vis);
-                    }
-                }
-            }
-
-            fn apply_tab_layout(
-                cache: &mut WebViewLayoutCache,
-                tid: u64,
-                wv: &WebView,
-                vis: bool,
-                rect: Option<(i32, i32, u32, u32)>,
-            ) {
-                if let Some(r) = rect {
-                    if cache.tab_bounds.get(&tid).copied() != Some(r) {
-                        if wv
-                            .set_bounds(Rect {
-                                position: PhysicalPosition::new(r.0, r.1).into(),
-                                size: PhysicalSize::new(r.2, r.3).into(),
-                            })
-                            .is_ok()
-                        {
-                            cache.tab_bounds.insert(tid, r);
-                        }
-                    }
-                }
-                if cache.tab_visible.get(&tid).copied() != Some(vis) {
-                    if wv.set_visible(vis).is_ok() {
-                        cache.tab_visible.insert(tid, vis);
-                    }
-                }
-                let want_low = !vis;
-                if cache.tab_low_mem.get(&tid).copied() != Some(want_low) {
-                    if wv
-                        .set_memory_usage_level(if want_low {
-                            MemoryUsageLevel::Low
-                        } else {
-                            MemoryUsageLevel::Normal
-                        })
-                        .is_ok()
-                    {
-                        cache.tab_low_mem.insert(tid, want_low);
-                    }
-                }
-            }
-
-            if show_active_web && in_fullscreen {
-                // True borderless fullscreen (HTML5 video or F11): hide the 46px chrome bar
-                // and stretch the active WebView edge-to-edge across the entire display!
-                for (&tid, wv) in tab_webviews {
-                    if tid == active_tab_id {
-                        apply_tab_layout(&mut cache, tid, wv, true, Some((0, 0, w, h)));
-                    } else {
-                        apply_tab_layout(&mut cache, tid, wv, false, None);
-                    }
-                }
-                apply_ui_layout(&mut cache, ui_wv, false, None);
-            } else if show_active_web {
-                apply_ui_layout(&mut cache, ui_wv, true, Some((0, 0, w, bar_h.max(1))));
-                for (&tid, wv) in tab_webviews {
-                    if tid == active_tab_id {
-                        apply_tab_layout(&mut cache, tid, wv, true, Some((0, bar_h as i32, w, content_h)));
-                    } else {
-                        apply_tab_layout(&mut cache, tid, wv, false, None);
-                    }
-                }
-            } else {
-                // Expand and show the dark UI WebView BEFORE hiding content tabs so no blank/white
-                // parent surface frame is ever exposed during New Tab / Settings transitions.
-                apply_ui_layout(&mut cache, ui_wv, true, Some((0, 0, w, h)));
-                for (&tid, wv) in tab_webviews {
-                    apply_tab_layout(&mut cache, tid, wv, false, None);
-                }
-                let _ = ui_wv.focus();
-            }
-        });
-    }
-
-    fn sync_maximized_state(
-        window: &Window,
-        ui_wv: &WebView,
-        last_maximized: &mut Option<bool>,
-        force: bool,
-    ) {
-        let is_max = window.is_maximized() || window.fullscreen().is_some();
-        if force || *last_maximized != Some(is_max) {
-            *last_maximized = Some(is_max);
-            emit_ui_sync(ui_wv, &serde_json::json!({ "maximized": is_max }));
-        }
-    }
-
-    fn hydrate_cookies_from_roaming(
-        content_wv: &WebView,
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-    ) {
-        let sessions = {
-            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-            if shell.private_browsing_active {
-                return;
-            }
-            shell.roaming.tokens.sessions.clone()
-        };
-        if sessions.is_empty() {
-            return;
-        }
-
-        // WebView2's persistent `browser-engine/` profile already stores fresher live cookies
-        // (including exact SameSite, PartitionKey, and `__Host-` invariants). NEVER overwrite
-        // an existing live cookie and NEVER re-inject `__Host-` cookies via `set_cookie` (which
-        // sets Domain= and breaks Google's cookie integrity checks).
-        let existing: std::collections::HashSet<(String, String)> = content_wv
-            .cookies()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| {
-                (
-                    c.domain()
-                        .unwrap_or("")
-                        .trim_start_matches('.')
-                        .to_ascii_lowercase(),
-                    c.name().to_ascii_lowercase(),
-                )
-            })
-            .collect();
-
-        for rec in sessions {
-            if rec.kind != "cookie_session" || rec.domain.is_empty() || rec.token_name.is_empty() {
-                continue;
-            }
-            let lower_name = rec.token_name.to_ascii_lowercase();
-            if lower_name.starts_with("__host-") {
-                continue;
-            }
-            let key = (
-                rec.domain.trim_start_matches('.').to_ascii_lowercase(),
-                lower_name,
-            );
-            if existing.contains(&key) {
-                continue;
-            }
-
-            let mut builder = Cookie::build((rec.token_name.clone(), rec.secret_value.clone()))
-                .domain(rec.domain.clone())
-                .path(if rec.path.is_empty() {
-                    "/".to_string()
-                } else {
-                    rec.path.clone()
-                })
-                .http_only(rec.http_only)
-                .secure(rec.secure);
-
-            if let Some(exp) = rec.expires_unix {
-                if let Ok(dt) = wry::cookie::time::OffsetDateTime::from_unix_timestamp(exp) {
-                    builder = builder.expires(dt);
-                }
-            }
-            let built = builder.build();
-            let _ = content_wv.set_cookie(&built);
-        }
-    }
-
-    /// Surgically deletes ONLY tracking, advertising, and malicious/injected cookies from the
-    /// WebView2 cookie jar while preserving 100% of user login tokens, sessions, consent cookies,
-    /// CSRF/Cloudflare tokens, and functional site cookies.
-    /// Returns `(trackers_removed, ads_removed, malicious_removed)`.
-    fn purge_tracker_and_malicious_cookies(
-        content_wv: &WebView,
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-    ) -> (usize, usize, usize) {
-        let Ok(cookies) = content_wv.cookies() else {
-            return (0, 0, 0);
-        };
-        purge_cookie_slice(content_wv, &cookies, shared_shell)
-    }
-
-    fn purge_cookie_slice(
-        content_wv: &WebView,
-        cookies: &[Cookie<'static>],
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-    ) -> (usize, usize, usize) {
-        let mut to_delete: Vec<(&Cookie<'static>, CookieThreatKind)> = Vec::new();
-        {
-            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-            for c in cookies {
-                let domain = c.domain().unwrap_or("");
-                let name = c.name();
-                let value = c.value();
-
-                let mut threat = classify_tracker_or_malicious_cookie(domain, name, value);
-                if threat.is_none()
-                    && !domain.is_empty()
-                    && !is_protected_session_or_functional_cookie(domain, name)
-                {
-                    let clean_dom = domain.trim_start_matches('.');
-                    let probe_url = format!("https://{}/", clean_dom);
-                    let blocked_by_ublock = matches!(
-                        shell.core.adblocker.evaluate_request(
-                            &probe_url,
-                            clean_dom,
-                            "singularity.local",
-                            NetworkResourceType::Image,
-                        ),
-                        FilterDecision::BlockedByDomainRule(_)
-                    );
-                    if blocked_by_ublock {
-                        threat = Some(CookieThreatKind::Tracker);
-                    }
-                }
-
-                if let Some(kind) = threat {
-                    to_delete.push((c, kind));
-                }
+                self.tab_visible.clear();
+                self.tab_bounds.clear();
             }
         }
-
-        let mut trackers = 0usize;
-        let mut ads = 0usize;
-        let mut malicious = 0usize;
-        for (c, kind) in to_delete {
-            if content_wv.delete_cookie(c).is_ok() {
-                match kind {
-                    CookieThreatKind::Tracker => trackers += 1,
-                    CookieThreatKind::Advertising => ads += 1,
-                    CookieThreatKind::Malicious => malicious += 1,
-                }
-            }
-        }
-        (trackers, ads, malicious)
-    }
-
-    fn snapshot_cookie_slice(
-        cookies: &[Cookie<'static>],
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-    ) -> usize {
-        {
-            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-            if shell.private_browsing_active {
-                return 0;
-            }
-        }
-
-        let now = unix_now();
-        let mut captured = Vec::new();
-        for c in cookies {
-            let name = c.name().to_string();
-            let val = c.value().to_string();
-            if val.is_empty() {
-                continue;
-            }
-            let domain = c.domain().unwrap_or("").to_string();
-            if domain.is_empty() {
-                continue;
-            }
-            let Some(provider) = classify_auth_cookie(&domain, &name) else {
-                continue;
-            };
-            let path = c.path().unwrap_or("/").to_string();
-            let exp_unix = c.expires_datetime().map(|dt| dt.unix_timestamp());
-
-            captured.push(EncryptedAuthTokenRecord {
-                id: format!("{}::{}::{}", provider, domain, name),
-                provider: provider.to_string(),
-                domain,
-                path,
-                token_name: name,
-                secret_value: val,
-                http_only: c.http_only().unwrap_or(false),
-                secure: c.secure().unwrap_or(true),
-                expires_unix: exp_unix,
-                updated_unix: now,
-                kind: "cookie_session".to_string(),
-            });
-        }
-
-        if captured.is_empty() {
-            return 0;
-        }
-
-        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-        shell.roaming.upsert_tokens_batch(captured).unwrap_or(0)
-    }
-
-    /// Single-pass cookie purge + encrypted auth token snapshot (calls `wv.cookies()` ONCE).
-    fn run_combined_cookie_hygiene_and_snapshot(
-        content_wv: &WebView,
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-        save_tokens: bool,
-    ) -> usize {
-        let Ok(cookies) = content_wv.cookies() else {
-            return 0;
-        };
-        let _ = purge_cookie_slice(content_wv, &cookies, shared_shell);
-        if save_tokens {
-            snapshot_cookie_slice(&cookies, shared_shell)
-        } else {
-            0
-        }
-    }
-
-    fn snapshot_and_encrypt_auth_cookies(
-        content_wv: &WebView,
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-    ) -> usize {
-        {
-            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-            if shell.private_browsing_active {
-                return 0;
-            }
-        }
-        let Ok(cookies) = content_wv.cookies() else {
-            return 0;
-        };
-        snapshot_cookie_slice(&cookies, shared_shell)
-    }
-
-    fn has_installed_extensions(dir: &Path) -> bool {
-        std::fs::read_dir(dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|e| e.path().is_dir() && e.path().join("manifest.json").is_file())
     }
 
     #[derive(Debug, Clone)]
@@ -1009,10 +583,233 @@ fn run_windows_frameless_browser(
         at: std::time::Instant,
     }
 
+    struct BrowserWindowState {
+        session_id: String,
+        window: Window,
+        ui_browser: CefBrowserHandle,
+        tab_browsers: HashMap<u64, CefBrowserHandle>,
+        tab_last_urls: HashMap<u64, String>,
+        tab_media_times: HashMap<u64, u64>,
+        tab_scroll_ys: HashMap<u64, u32>,
+        tab_bg_intents: HashMap<u64, BgLinkIntent>,
+        last_favicon_at: HashMap<u64, std::time::Instant>,
+        layout_cache: WebViewLayoutCache,
+        active_tab_id: u64,
+        web_visible: bool,
+        overlay_open: bool,
+        html_fullscreen: bool,
+        user_f11_fullscreen: bool,
+        was_maximized_before_fs: bool,
+        last_maximized: Option<bool>,
+        ui_ready_received: bool,
+        was_minimized: bool,
+        ext_popup: Option<(String, WindowId, bool, Window, CefBrowserHandle)>,
+        last_ext_popup_closed: Option<(String, std::time::Instant)>,
+    }
+
+    impl BrowserWindowState {
+        fn close_ext_popup(&mut self) {
+            if let Some((eid, _, _, pwin, pb)) = self.ext_popup.take() {
+                self.last_ext_popup_closed = Some((eid, std::time::Instant::now()));
+                drop(pb);
+                drop(pwin);
+            }
+        }
+
+        fn sync_layout(&mut self) {
+            let phys = self.window.inner_size();
+            if phys.width == 0 || phys.height == 0 {
+                return;
+            }
+            let w = phys.width;
+            let h = phys.height;
+            let scale = self.window.scale_factor();
+            let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(h);
+            let content_h = h.saturating_sub(bar_h).max(1);
+            let in_fs = self.html_fullscreen || self.user_f11_fullscreen;
+            let show_active_web = self.web_visible
+                && !self.overlay_open
+                && self.tab_browsers.contains_key(&self.active_tab_id);
+
+            self.layout_cache
+                .tab_visible
+                .retain(|tid, _| self.tab_browsers.contains_key(tid));
+            self.layout_cache
+                .tab_bounds
+                .retain(|tid, _| self.tab_browsers.contains_key(tid));
+
+            fn apply_ui(
+                cache: &mut WebViewLayoutCache,
+                ui_b: &CefBrowserHandle,
+                vis: bool,
+                rect: Option<(i32, i32, u32, u32)>,
+            ) {
+                if let Some(r) = rect {
+                    if cache.ui_bounds != Some(r) {
+                        ui_b.set_bounds(r.0, r.1, r.2, r.3);
+                        cache.ui_bounds = Some(r);
+                    }
+                }
+                if cache.ui_visible != Some(vis) {
+                    ui_b.set_visible(vis);
+                    cache.ui_visible = Some(vis);
+                }
+            }
+
+            fn apply_tab(
+                cache: &mut WebViewLayoutCache,
+                tid: u64,
+                b: &CefBrowserHandle,
+                vis: bool,
+                rect: Option<(i32, i32, u32, u32)>,
+            ) {
+                if let Some(r) = rect {
+                    if cache.tab_bounds.get(&tid).copied() != Some(r) {
+                        b.set_bounds(r.0, r.1, r.2, r.3);
+                        cache.tab_bounds.insert(tid, r);
+                    }
+                }
+                if cache.tab_visible.get(&tid).copied() != Some(vis) {
+                    b.set_visible(vis);
+                    cache.tab_visible.insert(tid, vis);
+                }
+            }
+
+            if show_active_web && in_fs {
+                for (&tid, b) in &self.tab_browsers {
+                    if tid == self.active_tab_id {
+                        apply_tab(&mut self.layout_cache, tid, b, true, Some((0, 0, w, h)));
+                    } else {
+                        apply_tab(&mut self.layout_cache, tid, b, false, None);
+                    }
+                }
+                apply_ui(&mut self.layout_cache, &self.ui_browser, false, None);
+            } else if show_active_web {
+                apply_ui(
+                    &mut self.layout_cache,
+                    &self.ui_browser,
+                    true,
+                    Some((0, 0, w, bar_h.max(1))),
+                );
+                for (&tid, b) in &self.tab_browsers {
+                    if tid == self.active_tab_id {
+                        apply_tab(
+                            &mut self.layout_cache,
+                            tid,
+                            b,
+                            true,
+                            Some((0, bar_h as i32, w, content_h)),
+                        );
+                    } else {
+                        apply_tab(&mut self.layout_cache, tid, b, false, None);
+                    }
+                }
+            } else {
+                // Show & expand dark OLED UI browser BEFORE hiding content tabs (zero white flash).
+                apply_ui(&mut self.layout_cache, &self.ui_browser, true, Some((0, 0, w, h)));
+                for (&tid, b) in &self.tab_browsers {
+                    apply_tab(&mut self.layout_cache, tid, b, false, None);
+                }
+                self.ui_browser.focus();
+            }
+        }
+
+        fn sync_maximized(&mut self, force: bool) {
+            let is_max = self.window.is_maximized() || self.window.fullscreen().is_some();
+            if force || self.last_maximized != Some(is_max) {
+                self.last_maximized = Some(is_max);
+                emit_ui_sync(&self.ui_browser, &serde_json::json!({ "maximized": is_max }));
+            }
+        }
+
+        fn apply_fullscreen(&mut self, prev_fs: bool, next_fs: bool) {
+            if !prev_fs && next_fs {
+                self.was_maximized_before_fs = self.window.is_maximized();
+                self.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            } else if prev_fs && !next_fs {
+                self.window.set_fullscreen(None);
+                if self.was_maximized_before_fs {
+                    self.window.set_maximized(true);
+                }
+            }
+            self.layout_cache.invalidate_ui();
+            self.sync_layout();
+            self.sync_maximized(false);
+            emit_ui_sync(&self.ui_browser, &serde_json::json!({ "fullscreen": next_fs }));
+        }
+
+        fn capture_geometry(
+            &self,
+            server_cfg: &ServerConfig,
+            shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        ) {
+            if self.window.fullscreen().is_some() {
+                return;
+            }
+            let phys = self.window.inner_size();
+            if phys.width == 0 || phys.height == 0 {
+                return;
+            }
+            let is_max = self.window.is_maximized();
+            let pos = self.window.outer_position().ok();
+
+            if let Ok(mut map) = server_cfg.window_sessions.lock() {
+                if let Some(sess) = map.get_mut(&self.session_id) {
+                    sess.geometry.maximized = is_max;
+                    if !is_max {
+                        if let Some(p) = pos {
+                            sess.geometry.pos_x = Some(p.x);
+                            sess.geometry.pos_y = Some(p.y);
+                        }
+                        sess.geometry.width = Some(phys.width.max(480));
+                        sess.geometry.height = Some(phys.height.max(360));
+                    }
+                }
+            }
+            if let Ok(mut shell) = shared_shell.lock() {
+                if shell.roaming.window_id() == self.session_id {
+                    shell.roaming.window_geometry.maximized = is_max;
+                    if !is_max {
+                        if let Some(p) = pos {
+                            shell.roaming.window_geometry.pos_x = Some(p.x);
+                            shell.roaming.window_geometry.pos_y = Some(p.y);
+                        }
+                        shell.roaming.window_geometry.width = Some(phys.width.max(480));
+                        shell.roaming.window_geometry.height = Some(phys.height.max(360));
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit_ui_sync(ui_b: &CefBrowserHandle, payload: &serde_json::Value) {
+        ui_b.evaluate_script(&format!(
+            "window.__singularitySyncWeb && window.__singularitySyncWeb({});",
+            payload
+        ));
+    }
+
+    fn read_live_http_url(b: &CefBrowserHandle) -> Option<String> {
+        let u = b.url()?;
+        if u.starts_with("https://") || u.starts_with("http://") {
+            Some(u)
+        } else {
+            None
+        }
+    }
+
     #[repr(C)]
     struct WinPoint {
         x: i32,
         y: i32,
+    }
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
     }
 
     #[link(name = "user32")]
@@ -1042,6 +839,12 @@ fn run_windows_frameless_browser(
             wparam: usize,
             lparam: isize,
         ) -> i32;
+        fn GetWindowRect(hwnd: *mut core::ffi::c_void, lp_rect: *mut WinRect) -> i32;
+        fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
+        fn IsIconic(hwnd: *mut core::ffi::c_void) -> i32;
+        fn ShowWindow(hwnd: *mut core::ffi::c_void, n_cmd_show: i32) -> i32;
+        fn WindowFromPoint(pt: WinPoint) -> *mut core::ffi::c_void;
+        fn GetAncestor(hwnd: *mut core::ffi::c_void, ga_flags: u32) -> *mut core::ffi::c_void;
     }
 
     fn enable_win32_dark_menus() {
@@ -1068,8 +871,6 @@ fn run_windows_frameless_browser(
             if hmod.is_null() {
                 return;
             }
-            // Windows 10 1903+ / Windows 11 dark mode for native popup menus:
-            // Ordinal 135 = SetPreferredAppMode(ForceDark = 2), Ordinal 136 = FlushMenuThemes()
             let p135 = GetProcAddress(hmod, 135usize as *const u8);
             if !p135.is_null() {
                 let set_mode: extern "system" fn(i32) -> i32 = core::mem::transmute(p135);
@@ -1083,8 +884,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    /// Forces the Win32 window class background brush to pure `#000000` (`BLACK_BRUSH`)
-    /// so `WM_ERASEBKGND` on the main window or `WRY_WEBVIEW` child containers NEVER flashes white.
     fn apply_win32_black_class_brush(hwnd: *mut core::ffi::c_void) {
         if hwnd.is_null() {
             return;
@@ -1111,7 +910,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    /// Enables Windows 10/11 DWM immersive dark mode and black background brush on a window HWND.
     fn enable_win32_immersive_dark_window(hwnd: *mut core::ffi::c_void) {
         apply_win32_black_class_brush(hwnd);
         if hwnd.is_null() {
@@ -1147,8 +945,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    /// Resolves the user's real Windows Downloads folder via `SHGetKnownFolderPath(FOLDERID_Downloads)`
-    /// with `%USERPROFILE%\Downloads` fallback.
     fn resolve_user_downloads_dir() -> std::path::PathBuf {
         #[repr(C)]
         struct Guid {
@@ -1157,7 +953,6 @@ fn run_windows_frameless_browser(
             data3: u16,
             data4: [u8; 8],
         }
-        // FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
         const FOLDERID_DOWNLOADS: Guid = Guid {
             data1: 0x374D_E290,
             data2: 0x123F,
@@ -1202,26 +997,21 @@ fn run_windows_frameless_browser(
         fallback
     }
 
-    /// Sanitizes a download filename and deduplicates (`name (1).exe`) so saving any `.exe`/`.zip`
-    /// never fails due to illegal Windows chars or existing locked files.
     fn choose_unique_download_path(
         downloads_dir: &Path,
-        suggested_path: &Path,
+        suggested_name: &str,
         uri: &str,
     ) -> (std::path::PathBuf, String) {
-        let raw_name = suggested_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                uri.split('?')
-                    .next()
-                    .and_then(|base| base.rsplit('/').next())
-                    .filter(|s| !s.trim().is_empty())
-                    .map(url_decode)
-            })
-            .unwrap_or_else(|| "download.bin".to_string());
+        let raw_name = if !suggested_name.trim().is_empty() {
+            suggested_name.trim().to_string()
+        } else {
+            uri.split('?')
+                .next()
+                .and_then(|base| base.rsplit('/').next())
+                .filter(|s| !s.trim().is_empty())
+                .map(url_decode)
+                .unwrap_or_else(|| "download.bin".to_string())
+        };
 
         let clean: String = raw_name
             .chars()
@@ -1257,7 +1047,6 @@ fn run_windows_frameless_browser(
         (candidate, safe_base)
     }
 
-    /// Safely opens Windows Explorer highlighting a downloaded file (zero `cmd.exe` / zero console).
     fn reveal_download_in_explorer(raw_path: &str) {
         let trimmed = raw_path.trim();
         if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f || b == b'"') {
@@ -1321,24 +1110,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    #[repr(C)]
-    struct WinRect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetWindowRect(hwnd: *mut core::ffi::c_void, lp_rect: *mut WinRect) -> i32;
-        fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
-        fn IsIconic(hwnd: *mut core::ffi::c_void) -> i32;
-        fn ShowWindow(hwnd: *mut core::ffi::c_void, n_cmd_show: i32) -> i32;
-        fn WindowFromPoint(pt: WinPoint) -> *mut core::ffi::c_void;
-        fn GetAncestor(hwnd: *mut core::ffi::c_void, ga_flags: u32) -> *mut core::ffi::c_void;
-    }
-
     fn get_win32_cursor_pos() -> (i32, i32) {
         let mut pt = WinPoint { x: 0, y: 0 };
         unsafe {
@@ -1361,124 +1132,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    /// Detects whether screen point `(px, py)` lands on another visible live Singularity window
-    /// (preferring exact topmost Z-order match via `WindowFromPoint` + `GetAncestor(GA_ROOT)`,
-    /// with a generous 28px top-bar snap zone for effortless tab drops).
-    fn find_peer_window_at_point(
-        peers: &[LiveWindowDescriptor],
-        px: i32,
-        py: i32,
-    ) -> Option<LiveWindowDescriptor> {
-        if peers.is_empty() {
-            return None;
-        }
-        const GA_ROOT: u32 = 2;
-        let hit_root = unsafe {
-            let raw = WindowFromPoint(WinPoint { x: px, y: py });
-            if raw.is_null() {
-                0isize
-            } else {
-                let root = GetAncestor(raw, GA_ROOT);
-                (if root.is_null() { raw } else { root }) as isize
-            }
-        };
-        if hit_root != 0 {
-            if let Some(exact) = peers.iter().find(|p| p.hwnd == hit_root) {
-                return Some(exact.clone());
-            }
-        }
-        // Fallback: check bounding rects (with a 28px top grace strip) for visible peer windows.
-        for peer in peers.iter().rev() {
-            if peer.hwnd == 0 {
-                continue;
-            }
-            let ptr = peer.hwnd as *mut core::ffi::c_void;
-            let mut r = WinRect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            let ok = unsafe {
-                IsWindowVisible(ptr) != 0
-                    && IsIconic(ptr) == 0
-                    && GetWindowRect(ptr, &mut r) != 0
-            };
-            if ok && px >= r.left - 8 && px <= r.right + 8 && py >= r.top - 28 && py <= r.bottom + 8
-            {
-                return Some(peer.clone());
-            }
-        }
-        None
-    }
-
-    /// Transfers a detached tab over `127.0.0.1:<peer.port>` (`TCP_NODELAY`) using the peer's
-    /// dedicated 256-bit CSPRNG `X-Singularity-Transfer` token.
-    fn send_adopt_tab_to_peer(peer: &LiveWindowDescriptor, payload: &TabHandoffPayload) -> bool {
-        let Ok(body) = serde_json::to_vec(payload) else {
-            return false;
-        };
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], peer.port));
-        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(750)) else {
-            return false;
-        };
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(1200)));
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-        let req_hdr = format!(
-            "POST /api/window/adopt_tab HTTP/1.1\r\n\
-             Host: 127.0.0.1:{}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             X-Singularity-Transfer: {}\r\n\
-             Connection: close\r\n\r\n",
-            peer.port,
-            body.len(),
-            peer.transfer_token
-        );
-        let mut wire = Vec::with_capacity(req_hdr.len() + body.len());
-        wire.extend_from_slice(req_hdr.as_bytes());
-        wire.extend_from_slice(&body);
-        if stream.write_all(&wire).is_err() {
-            return false;
-        }
-        let mut resp_buf = [0u8; 256];
-        let n = stream.read(&mut resp_buf).unwrap_or(0);
-        let first_line = std::str::from_utf8(&resp_buf[..n]).unwrap_or("");
-        first_line.starts_with("HTTP/1.1 200")
-    }
-
-    /// Spawns a brand-new Singularity GUI window (zero console window) with either a detached
-    /// tab handoff ID (`--detach-handoff <id>`) or a clean New Tab (`--new-window`).
-    fn spawn_detached_singularity_window(handoff_id: Option<&str>) -> bool {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        let mut cmd = Command::new(exe);
-        if let Some(id) = handoff_id {
-            cmd.arg("--detach-handoff").arg(id);
-        } else {
-            cmd.arg("--new-window");
-        }
-        cmd.spawn().is_ok()
-    }
-
-    /// Spawns a restored sibling Singularity GUI window (`--restore-session <id>`) on multi-window
-    /// restart so each previously open window reopens separately with its own tabs & screen geometry.
-    fn spawn_restored_singularity_window(restore_id: &str) -> bool {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        Command::new(exe)
-            .arg("--restore-session")
-            .arg(restore_id)
-            .spawn()
-            .is_ok()
-    }
-
-    /// Returns `true` if the user is actively left-clicking inside the top 46px Singularity bar
-    /// (omnibar, tabs, toolbar buttons), so `WindowEvent::Focused(true)` never steals focus from
-    /// `#omnibar-input` while Alt+Tab / taskbar / webpage clicks immediately focus the active page.
     fn is_cursor_clicking_top_bar(window: &Window) -> bool {
         const VK_LBUTTON: i32 = 0x01;
         let lbutton_down = unsafe { ((GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000) != 0 };
@@ -1496,6 +1149,54 @@ fn run_windows_frameless_browser(
             && cx <= inner_pos.x + size.width as i32
             && cy >= inner_pos.y
             && cy < inner_pos.y + bar_h
+    }
+
+    /// Detects whether screen point `(px, py)` lands on another visible in-process Singularity window.
+    fn find_peer_in_process_window(
+        windows: &HashMap<WindowId, BrowserWindowState>,
+        exclude: WindowId,
+        px: i32,
+        py: i32,
+    ) -> Option<WindowId> {
+        const GA_ROOT: u32 = 2;
+        let hit_root = unsafe {
+            let raw = WindowFromPoint(WinPoint { x: px, y: py });
+            if raw.is_null() {
+                0isize
+            } else {
+                let root = GetAncestor(raw, GA_ROOT);
+                (if root.is_null() { raw } else { root }) as isize
+            }
+        };
+        if hit_root != 0 {
+            for (&wid, st) in windows {
+                if wid != exclude && st.window.hwnd() == hit_root {
+                    return Some(wid);
+                }
+            }
+        }
+        for (&wid, st) in windows {
+            if wid == exclude {
+                continue;
+            }
+            let ptr = st.window.hwnd() as *mut core::ffi::c_void;
+            let mut r = WinRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            let ok = unsafe {
+                IsWindowVisible(ptr) != 0
+                    && IsIconic(ptr) == 0
+                    && GetWindowRect(ptr, &mut r) != 0
+            };
+            if ok && px >= r.left - 8 && px <= r.right + 8 && py >= r.top - 28 && py <= r.bottom + 8
+            {
+                return Some(wid);
+            }
+        }
+        None
     }
 
     fn encode_menu_wide(label: &str) -> Vec<u16> {
@@ -1525,9 +1226,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    /// Displays a native Win32 dark-mode popup menu right at the cursor over the frameless
-    /// window (never clipped by the 46px `ui_webview` top bar and never hides the active webpage).
-    /// Returns `(action_name, optional_target_id)`.
     #[allow(clippy::too_many_arguments)]
     fn show_native_tab_context_menu(
         hwnd: *mut core::ffi::c_void,
@@ -1537,7 +1235,7 @@ fn run_windows_frameless_browser(
         is_unloaded: bool,
         group_collapsed: bool,
         groups: &[CtxGroupItem],
-        other_windows: &[LiveWindowDescriptor],
+        other_window_ids: &[String],
         is_fr: bool,
     ) -> Option<(&'static str, Option<String>)> {
         const MF_STRING: u32 = 0x0000;
@@ -1589,17 +1287,16 @@ fn run_windows_frameless_browser(
                         false,
                     );
                     add_sep(hmenu);
-
                     add_item(
                         hmenu,
                         109,
                         t("Move tab to new window", "Déplacer dans une nouvelle fenêtre"),
                         false,
                     );
-                    if !other_windows.is_empty() {
+                    if !other_window_ids.is_empty() {
                         let wsub = CreatePopupMenu();
                         if !wsub.is_null() {
-                            for (idx, w) in other_windows.iter().take(12).enumerate() {
+                            for (idx, wid_str) in other_window_ids.iter().take(12).enumerate() {
                                 let cmd_id = 601 + idx;
                                 let label = if is_fr {
                                     format!("Fenêtre Singularity #{}", idx + 1)
@@ -1607,7 +1304,7 @@ fn run_windows_frameless_browser(
                                     format!("Singularity Window #{}", idx + 1)
                                 };
                                 add_item(wsub, cmd_id, &label, false);
-                                win_id_map.push((cmd_id, w.window_id.clone()));
+                                win_id_map.push((cmd_id, wid_str.clone()));
                             }
                             let wsub_label = encode_menu_wide(t(
                                 "Move tab to another window",
@@ -1810,22 +1507,6 @@ fn run_windows_frameless_browser(
         }
     }
 
-    fn is_ctrl_or_mbutton_down() -> bool {
-        const VK_MBUTTON: i32 = 0x04;
-        const VK_CONTROL: i32 = 0x11;
-        unsafe {
-            ((GetAsyncKeyState(VK_MBUTTON) as u16) & 0x8000) != 0
-                || ((GetAsyncKeyState(VK_CONTROL) as u16) & 0x8000) != 0
-        }
-    }
-
-    fn same_url_host(a: &str, b: &str) -> bool {
-        match (parse_http_url_authority(a), parse_http_url_authority(b)) {
-            (Ok((ha, _)), Ok((hb, _))) => ha.eq_ignore_ascii_case(&hb),
-            _ => false,
-        }
-    }
-
     const EXT_POPUP_INIT_SCRIPT: &str = r##"(function(){
   if (window.__sgExtPopupHooked) return;
   window.__sgExtPopupHooked = true;
@@ -1889,7 +1570,6 @@ fn run_windows_frameless_browser(
     report("context_link", e);
   }, true);
 
-  // Global browser keyboard shortcuts inside web pages (never intercepts copy/paste/text editing)
   function sendShortcut(action, idx, e) {
     try {
       e.preventDefault();
@@ -1946,8 +1626,6 @@ fn run_windows_frameless_browser(
       && window.top === window
       && /(^|\.)youtube\.com$/i.test(String(location.hostname || ""))
     ) {
-      // Ergonomic Spacebar play/pause on YouTube after switching windows or tabs even when
-      // document.activeElement is <body> (never interferes with search, comments, buttons, or #movie_player).
       const ae = document.activeElement;
       const tag = ae && ae.tagName ? ae.tagName.toUpperCase() : "";
       const isInteractive = !!(ae && (
@@ -1979,10 +1657,8 @@ fn run_windows_frameless_browser(
     }
   }, true);
 
-  // Never attach fullscreen, favicon, or media polling timers inside sub-iframes!
   if (window.top !== window) return;
 
-  // True OS borderless fullscreen sync (YouTube, Twitch, HTML5 <video>, embedded players)
   let lastFsState = null;
   function reportFullscreen() {
     try {
@@ -1996,7 +1672,6 @@ fn run_windows_frameless_browser(
   document.addEventListener("fullscreenchange", reportFullscreen, true);
   document.addEventListener("webkitfullscreenchange", reportFullscreen, true);
 
-  // Live top-frame favicon discovery for crisp Chrome/Brave-style tab icons
   let lastFaviconSent = "";
   function reportFavicon() {
     try {
@@ -2023,7 +1698,6 @@ fn run_windows_frameless_browser(
   }
   window.addEventListener("load", function() { setTimeout(reportFavicon, 250); }, { once: true });
 
-  // Zero-reflow crash-proof video timestamp & scroll tracker (skips YouTube ad overlays)
   let lastSentSec = -1;
   let lastSentScroll = -1;
   let lastSentUrl = "";
@@ -2083,9 +1757,6 @@ fn run_windows_frameless_browser(
   window.addEventListener("pagehide", function() { reportMediaProgress(true); }, true);
 })();"##;
 
-    /// Executed on the active content WebView2 when the user presses Spacebar while keyboard
-    /// focus was still resting on the non-input 46px Singularity top bar (e.g. right after
-    /// dragging the window or clicking a tab pill).
     const TOGGLE_ACTIVE_MEDIA_SCRIPT: &str = r##"(function(){
   try {
     const ae = document.activeElement;
@@ -2108,13 +1779,6 @@ fn run_windows_frameless_browser(
   } catch (_) {}
 })();"##;
 
-    /// Builds a strictly one-shot initialization script that resumes a restored/unloaded tab's
-    /// HTML5 `<video>`/`<audio>` playback position and vertical scroll offset right where the
-    /// user left off (even after an abrupt PC power-off or RAM unload), and when `start_paused`
-    /// is `true` keeps restored YouTube/video tabs cleanly PAUSED until the user explicitly clicks
-    /// Play or presses Space/`k` (zero audio blip, exact saved timestamp preserved). Bound strictly
-    /// to `target_url` + a unique per-spawn nonce so subsequent navigations or manual reloads in
-    /// the same tab are never hijacked.
     fn build_resume_init_script(
         target_url: &str,
         resume_time_sec: Option<u64>,
@@ -2324,362 +1988,6 @@ fn run_windows_frameless_browser(
         ))
     }
 
-    /// Creates an isolated child WebView2 for a specific browser tab sharing `content_web_context`
-    /// (shared cookies/profile & native Chrome extensions). Content IPC is strictly non-privileged:
-    /// it can only record a short-lived background-click intent hint (consumed by WebView2's trusted
-    /// `NewWindowRequested` callback), signal top-frame HTML5 fullscreen transitions, or report
-    /// numeric playback progress (`media_state`) for crash-proof session resume. Navigation to
-    /// Singularity's own loopback IPC port and `file:` URIs is blocked at the WebView2 layer.
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_tab_webview_with_env<F>(
-        tab_id: u64,
-        url: &str,
-        bind_port: u16,
-        window: &Window,
-        content_web_context: &mut WebContext,
-        extensions_dir: &Path,
-        load_extensions_now: bool,
-        incognito: bool,
-        resume_time_sec: Option<u64>,
-        resume_scroll_y: Option<u32>,
-        start_paused: bool,
-        proxy: &EventLoopProxy<WinEvent>,
-        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
-        cookies_hydrated: &mut bool,
-        attach_shared_env: F,
-    ) -> Result<WebView, String>
-    where
-        F: Fn(WebViewBuilder<'_>) -> WebViewBuilder<'_>,
-    {
-        let phys = window.inner_size();
-        let scale = window.scale_factor();
-        let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(phys.height.max(1));
-        let bounds = Rect {
-            position: PhysicalPosition::new(0, bar_h as i32).into(),
-            size: PhysicalSize::new(
-                phys.width.max(1),
-                phys.height.saturating_sub(bar_h).max(1),
-            )
-            .into(),
-        };
-
-        let effective_url = resume_time_sec
-            .filter(|&t| t >= 3)
-            .map(|t| apply_media_timestamp_to_url(url, t))
-            .unwrap_or_else(|| url.to_string());
-        let resume_script =
-            build_resume_init_script(url, resume_time_sec, resume_scroll_y, start_paused);
-
-        let build_once = |ctx: &mut WebContext,
-                          with_ext_path: bool,
-                          with_custom_args: bool|
-         -> wry::Result<WebView> {
-            let load_proxy = proxy.clone();
-            let title_proxy = proxy.clone();
-            let newwin_proxy = proxy.clone();
-            let media_proxy = proxy.clone();
-            let dl_start_proxy = proxy.clone();
-            let dl_done_proxy = proxy.clone();
-            let bg_intent: Arc<Mutex<Option<BgLinkIntent>>> = Arc::new(Mutex::new(None));
-            let bg_intent_ipc = Arc::clone(&bg_intent);
-            let bg_intent_newwin = Arc::clone(&bg_intent);
-
-            let mut builder = WebViewBuilder::new_with_web_context(ctx)
-                .with_bounds(bounds)
-                .with_visible(false)
-                .with_background_color((0, 0, 0, 255))
-                .with_autoplay(true)
-                .with_incognito(incognito)
-                .with_browser_extensions_enabled(true);
-            if with_custom_args {
-                builder = builder.with_additional_browser_args(CONTENT_BROWSER_ARGS);
-            }
-            let mut builder = builder
-                .with_download_started_handler(move |uri, path| {
-                    let downloads_dir = resolve_user_downloads_dir();
-                    let (dest_path, filename) =
-                        choose_unique_download_path(&downloads_dir, path.as_path(), &uri);
-                    let dest_str = dest_path.to_string_lossy().to_string();
-                    *path = dest_path;
-                    let _ = dl_start_proxy.send_event(WinEvent::DownloadStarted {
-                        filename,
-                        path: dest_str,
-                    });
-                    true
-                })
-                .with_download_completed_handler(move |uri, path_opt, success| {
-                    let (filename, path_str) = if let Some(p) = path_opt {
-                        let name = p
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("download")
-                            .to_string();
-                        (name, p.to_string_lossy().to_string())
-                    } else {
-                        let name = uri
-                            .split('?')
-                            .next()
-                            .and_then(|b| b.rsplit('/').next())
-                            .filter(|s| !s.is_empty())
-                            .map(url_decode)
-                            .unwrap_or_else(|| "download".to_string());
-                        (name, String::new())
-                    };
-                    let _ = dl_done_proxy.send_event(WinEvent::DownloadCompleted {
-                        filename,
-                        path: path_str,
-                        success,
-                    });
-                })
-                .with_navigation_handler(move |nav_url| {
-                    let lower = nav_url.trim().to_ascii_lowercase();
-                    if lower.starts_with("file:") {
-                        return false;
-                    }
-                    if let Ok((host, port)) = parse_http_url_authority(&nav_url) {
-                        if port == bind_port {
-                            let h = host
-                                .trim_start_matches('[')
-                                .trim_end_matches(']')
-                                .trim_end_matches('.');
-                            let is_local = h == "localhost"
-                                || h.ends_with(".localhost")
-                                || h.starts_with("127.")
-                                || h == "::1"
-                                || h == "0.0.0.0"
-                                || h.starts_with("0x")
-                                || h.chars().all(|c| c.is_ascii_digit())
-                                || h.parse::<IpAddr>()
-                                    .map(|ip| ip.is_loopback() || ip.is_unspecified())
-                                    .unwrap_or(false);
-                            if is_local {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
-                .with_initialization_script(CONTENT_LINK_INTENT_SCRIPT)
-                .with_ipc_handler(move |req: wry::http::Request<String>| {
-                    let raw = req.body();
-                    if raw.len() > 2048 {
-                        return;
-                    }
-                    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-                        return;
-                    };
-                    let Some(kind) = v.get("k").and_then(|x| x.as_str()) else {
-                        return;
-                    };
-                    if kind == "fullscreen" {
-                        if tab_id == 0 {
-                            return;
-                        }
-                        if let Some(enabled) = v.get("fs").and_then(|x| x.as_bool()) {
-                            let _ = media_proxy
-                                .send_event(WinEvent::WebFullscreen { tab_id, enabled });
-                        }
-                        return;
-                    }
-                    if kind == "shortcut" {
-                        if tab_id == 0 {
-                            return;
-                        }
-                        let Some(action) = v.get("a").and_then(|x| x.as_str()) else {
-                            return;
-                        };
-                        let allowed = matches!(
-                            action,
-                            "toggle_fullscreen"
-                                | "reopen_closed_tab"
-                                | "new_tab"
-                                | "close_active_tab"
-                                | "next_tab"
-                                | "prev_tab"
-                                | "focus_omnibar"
-                                | "reload_tab"
-                                | "toggle_bookmark"
-                                | "open_history"
-                                | "open_settings"
-                                | "jump_tab"
-                                | "web_back"
-                                | "web_forward"
-                        );
-                        if !allowed {
-                            return;
-                        }
-                        let idx = v
-                            .get("n")
-                            .and_then(|x| x.as_u64())
-                            .filter(|&n| (1..=9).contains(&n))
-                            .map(|n| n as u8);
-                        let _ = media_proxy.send_event(WinEvent::WebShortcut {
-                            tab_id,
-                            action: action.to_string(),
-                            index: idx,
-                        });
-                        return;
-                    }
-                    if kind == "favicon" {
-                        if tab_id == 0 {
-                            return;
-                        }
-                        let Some(icon_url) = v.get("u").and_then(|x| x.as_str()) else {
-                            return;
-                        };
-                        if icon_url.len() <= 512 && parse_http_url_authority(icon_url).is_ok() {
-                            let _ = media_proxy.send_event(WinEvent::WebFavicon {
-                                tab_id,
-                                favicon_url: icon_url.to_string(),
-                            });
-                        }
-                        return;
-                    }
-                    if kind == "media_state" {
-                        if tab_id == 0 {
-                            return;
-                        }
-                        let time_sec = v
-                            .get("s")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0)
-                            .min(864_000);
-                        let scroll_y = v
-                            .get("sy")
-                            .and_then(|x| x.as_u64())
-                            .unwrap_or(0)
-                            .min(10_000_000) as u32;
-                        let _ = media_proxy.send_event(WinEvent::WebMediaProgress {
-                            tab_id,
-                            time_sec,
-                            scroll_y,
-                        });
-                        return;
-                    }
-                    if kind != "bg_click" && kind != "context_link" {
-                        return;
-                    }
-                    let Some(href) = v.get("u").and_then(|x| x.as_str()) else {
-                        return;
-                    };
-                    if parse_http_url_authority(href).is_err() {
-                        return;
-                    }
-                    let title: String = v
-                        .get("t")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(120)
-                        .collect::<String>()
-                        .trim()
-                        .to_string();
-                    if let Ok(mut guard) = bg_intent_ipc.lock() {
-                        *guard = Some(BgLinkIntent {
-                            kind: kind.to_string(),
-                            href: href.to_string(),
-                            title,
-                            at: std::time::Instant::now(),
-                        });
-                    }
-                })
-                .with_url(&effective_url)
-                .with_on_page_load_handler(move |evt, loaded_url| {
-                    if loaded_url.starts_with("https://") || loaded_url.starts_with("http://") {
-                        match evt {
-                            PageLoadEvent::Started => {
-                                let _ = load_proxy
-                                    .send_event(WinEvent::WebPageStarted(tab_id, loaded_url));
-                            }
-                            PageLoadEvent::Finished => {
-                                let _ = load_proxy
-                                    .send_event(WinEvent::WebPageFinished(tab_id, loaded_url));
-                            }
-                        }
-                    }
-                })
-                .with_document_title_changed_handler(move |title| {
-                    let _ = title_proxy.send_event(WinEvent::WebTitleChanged(tab_id, title));
-                })
-                .with_new_window_req_handler(move |new_url, features| {
-                    if parse_http_url_authority(&new_url).is_ok() {
-                        let is_explicit_popup = features.size.is_some();
-                        let mut background = false;
-                        let mut title: Option<String> = None;
-
-                        if !is_explicit_popup {
-                            let recent = bg_intent_newwin
-                                .lock()
-                                .ok()
-                                .and_then(|mut g| g.take());
-                            if let Some(intent) = recent {
-                                let age = intent.at.elapsed();
-                                if intent.kind == "bg_click"
-                                    && age <= std::time::Duration::from_millis(1800)
-                                {
-                                    background = true;
-                                    if !intent.title.is_empty()
-                                        && (intent.href == new_url
-                                            || same_url_host(&intent.href, &new_url))
-                                    {
-                                        title = Some(intent.title);
-                                    }
-                                } else if intent.kind == "context_link"
-                                    && age <= std::time::Duration::from_secs(15)
-                                    && intent.href == new_url
-                                {
-                                    background = true;
-                                    if !intent.title.is_empty() {
-                                        title = Some(intent.title);
-                                    }
-                                }
-                            }
-                            if !background
-                                && features.position.is_none()
-                                && is_ctrl_or_mbutton_down()
-                            {
-                                background = true;
-                            }
-                        }
-
-                        let _ = newwin_proxy.send_event(WinEvent::OpenNewTab {
-                            url: new_url,
-                            title,
-                            background,
-                        });
-                    }
-                    NewWindowResponse::Deny
-                });
-            builder = attach_shared_env(builder);
-            if let Some(ref script) = resume_script {
-                builder = builder.with_initialization_script(script);
-            }
-            if with_ext_path {
-                builder = builder.with_extensions_path(extensions_dir.to_path_buf());
-            }
-            builder.build_as_child(window)
-        };
-
-        let want_ext = load_extensions_now && has_installed_extensions(extensions_dir);
-        let wv = match build_once(content_web_context, want_ext, true) {
-            Ok(w) => w,
-            Err(_) if want_ext => match build_once(content_web_context, false, true) {
-                Ok(w) => w,
-                Err(_) => build_once(content_web_context, false, false)
-                    .map_err(|e| format!("Content WebView error: {}", e))?,
-            },
-            Err(_) => build_once(content_web_context, false, false)
-                .map_err(|e| format!("Content WebView error: {}", e))?,
-        };
-        let _ = wv.set_theme(Theme::Dark);
-        if !incognito && !*cookies_hydrated {
-            hydrate_cookies_from_roaming(&wv, shared_shell);
-            *cookies_hydrated = true;
-        }
-        Ok(wv)
-    }
-
     enable_win32_dark_menus();
 
     let event_loop = EventLoopBuilder::<WinEvent>::with_user_event().build();
@@ -2690,8 +1998,8 @@ fn run_windows_frameless_browser(
         let _ = adopt_proxy.send_event(WinEvent::AdoptExternalTab(payload));
     });
 
-    let win_icon = Icon::from_rgba(WINDOW_ICON_64_RGBA.to_vec(), 64, 64).ok();
-    let (startup_pos, saved_geom, pending_restore_ids) = {
+    // 1. Initialize ONE single Pure Chromium (CEF) runtime shared across ALL windows & tabs!
+    let (cef_profile_dir, extensions_dir, root_dir, primary_session_id, primary_session, pending_restore_ids, startup_pos) = {
         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
         let detach_pos = shell
             .roaming
@@ -2701,354 +2009,472 @@ fn run_windows_frameless_browser(
                 (Some(x), Some(y)) => Some((x, y)),
                 _ => None,
             });
-        let geom = shell.roaming.window_geometry;
+        let p_sess = WindowTabSession {
+            saved_tabs: shell.roaming.profile.saved_tabs.clone(),
+            saved_tab_groups: shell.roaming.profile.saved_tab_groups.clone(),
+            active_tab_index: shell.roaming.profile.active_tab_index,
+            geometry: shell.roaming.window_geometry,
+            is_detached_handoff: shell.roaming.startup_handoff.is_some(),
+            is_secondary_live_window: shell.roaming.is_secondary_live_window,
+            restored_windows_count: shell.roaming.restored_windows_count,
+        };
         let restore_ids = std::mem::take(&mut shell.roaming.pending_restore_window_ids);
-        (detach_pos, geom, restore_ids)
-    };
-    let effective_pos = startup_pos.or_else(|| match (saved_geom.pos_x, saved_geom.pos_y) {
-        (Some(x), Some(y)) if !saved_geom.maximized => Some((x, y)),
-        _ => None,
-    });
-    let initial_size = if startup_pos.is_none() {
-        match (saved_geom.width, saved_geom.height) {
-            (Some(w), Some(h)) if w >= 480 && h >= 360 => {
-                Size::Physical(TaoPhysicalSize::new(w.min(7680), h.min(4320)))
-            }
-            _ => Size::Logical(LogicalSize::new(1440.0, 880.0)),
-        }
-    } else {
-        Size::Logical(LogicalSize::new(1440.0, 880.0))
-    };
-
-    let mut win_builder = WindowBuilder::new()
-        .with_title("Singularity")
-        .with_window_icon(win_icon)
-        .with_visible(false)
-        .with_decorations(false)
-        .with_undecorated_shadow(true)
-        .with_background_color((0, 0, 0, 255))
-        .with_inner_size(initial_size)
-        // Minimum width <= 500 logical px is required by Windows 11 Snap Bar / Snap Layouts
-        // so the window fits half, third, and quarter zones across 100%-200% DPI scaling.
-        .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)));
-    if let Some((px, py)) = effective_pos {
-        win_builder = win_builder.with_position(TaoPhysicalPosition::new(
-            px.max(-32000),
-            py.max(-32000),
-        ));
-    }
-    let window = win_builder
-        .build(&event_loop)
-        .map_err(|e| format!("Window creation error: {}", e))?;
-    let main_hwnd = window.hwnd() as *mut core::ffi::c_void;
-    enable_win32_immersive_dark_window(main_hwnd);
-    // Clamp detached or restored window cleanly inside its current monitor so an unplugged
-    // secondary display or screen-edge drop never strands a window off-screen.
-    if let (Some((px, py)), Some(mon)) = (effective_pos, window.current_monitor()) {
-        let mpos = mon.position();
-        let msize = mon.size();
-        let wsize = window.outer_size();
-        let max_x = (mpos.x + msize.width as i32 - 360).max(mpos.x);
-        let max_y = (mpos.y + msize.height as i32 - 200).max(mpos.y);
-        let cx = px.clamp(mpos.x - (wsize.width as i32 / 3), max_x);
-        let cy = py.clamp(mpos.y, max_y);
-        window.set_outer_position(TaoPhysicalPosition::new(cx, cy));
-    }
-
-    // Separate WebView2 contexts:
-    // - `browser-ui-slots/slot-<N>` : isolated per-live-window UI shell (zero multi-window collision!)
-    // - `browser-engine`            : shared browsing tabs profile (Chrome extensions natively enabled)
-    let (ui_data_dir, content_data_dir, extensions_dir, fallback_ui_dir) = {
-        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-        shell
-            .roaming
-            .register_live_window(bind_port, window.hwnd(), &server_cfg.transfer_token);
-        let ui_slot = shell.roaming.allocate_ui_webview_slot();
-        let fallback_dir = shell
-            .roaming
-            .root_dir()
-            .join("browser-ui-slots")
-            .join(format!("fallback-{}", std::process::id()));
         (
-            ui_slot,
-            shell.roaming.webview_engine_dir(),
+            shell.roaming.chromium_profile_dir(),
             shell.roaming.extensions_dir(),
-            fallback_dir,
+            shell.roaming.root_dir().to_path_buf(),
+            shell.roaming.window_id().to_string(),
+            p_sess,
+            restore_ids,
+            detach_pos,
         )
     };
-    let _ = std::fs::create_dir_all(&ui_data_dir);
-    let _ = std::fs::create_dir_all(&content_data_dir);
+    let _ = std::fs::create_dir_all(&cef_profile_dir);
     let _ = std::fs::create_dir_all(&extensions_dir);
 
-    let mut ui_web_context = WebContext::new(Some(ui_data_dir));
-    let mut content_web_context = WebContext::new(Some(content_data_dir));
+    let pump_proxy = proxy.clone();
+    let relaunch_proxy = proxy.clone();
+    let cef_guard_res = CefRuntimeGuard::initialize(
+        &cef_profile_dir,
+        &extensions_dir,
+        Arc::new(move |delay_ms| {
+            let _ = pump_proxy.send_event(WinEvent::CefPump(delay_ms));
+        }),
+        Arc::new(move || {
+            let _ = relaunch_proxy.send_event(WinEvent::OpenNewWindowInProcess);
+        }),
+    );
+    let cef_guard = match cef_guard_res {
+        Ok(g) => g,
+        Err(e) => {
+            // If another Singularity instance already owns the CEF profile, CEF forwarded our
+            // relaunch via `on_already_running_app_relaunch` (opening a new window in-process).
+            let has_other_live = shared_shell
+                .lock()
+                .map(|s| !s.roaming.list_other_live_windows().is_empty())
+                .unwrap_or(false);
+            if has_other_live {
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
 
-    let phys = window.inner_size();
+    // Hydrate any missing encrypted Roaming auth cookies into Chromium's CookieManager
+    cef_runtime::hydrate_cookies_from_roaming_cef(&shared_shell);
 
-    let build_ui_webview = |ctx: &mut WebContext, use_custom_args: bool| -> wry::Result<WebView> {
-        let ui_proxy = proxy.clone();
-        let mut b = WebViewBuilder::new_with_web_context(ctx)
-            .with_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(phys.width.max(1), phys.height.max(1)).into(),
-            })
+    let download_resolver: CefDownloadResolver = Arc::new(|suggested: &str, uri: &str| {
+        let dir = resolve_user_downloads_dir();
+        choose_unique_download_path(&dir, suggested, uri)
+    });
+
+    let mut incognito_ctx: Option<cef::RequestContext> = None;
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_browser_window(
+        elwt: &EventLoopWindowTarget<WinEvent>,
+        bind_port: u16,
+        server_cfg: &ServerConfig,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        proxy: &EventLoopProxy<WinEvent>,
+        download_resolver: &CefDownloadResolver,
+        session_id: String,
+        session: WindowTabSession,
+        override_pos: Option<(i32, i32)>,
+    ) -> Result<(WindowId, BrowserWindowState), String> {
+        let saved_geom = session.geometry;
+        if let Ok(mut map) = server_cfg.window_sessions.lock() {
+            map.insert(session_id.clone(), session);
+        }
+
+        let effective_pos = override_pos.or_else(|| match (saved_geom.pos_x, saved_geom.pos_y) {
+            (Some(x), Some(y)) if !saved_geom.maximized => Some((x, y)),
+            _ => None,
+        });
+        let initial_size = if override_pos.is_none() {
+            match (saved_geom.width, saved_geom.height) {
+                (Some(w), Some(h)) if w >= 480 && h >= 360 => {
+                    Size::Physical(TaoPhysicalSize::new(w.min(7680), h.min(4320)))
+                }
+                _ => Size::Logical(LogicalSize::new(1440.0, 880.0)),
+            }
+        } else {
+            Size::Logical(LogicalSize::new(1440.0, 880.0))
+        };
+
+        let win_icon = Icon::from_rgba(WINDOW_ICON_64_RGBA.to_vec(), 64, 64).ok();
+        let mut win_builder = WindowBuilder::new()
+            .with_title("Singularity")
+            .with_window_icon(win_icon)
+            .with_visible(false)
+            .with_decorations(false)
+            .with_undecorated_shadow(true)
             .with_background_color((0, 0, 0, 255))
-            .with_autoplay(true)
-            .with_devtools(false)
-            .with_default_context_menus(false)
-            .with_url(app_url)
-            .with_ipc_handler(move |req: wry::http::Request<String>| {
-                let _ = ui_proxy.send_event(WinEvent::UiIpc(req.body().clone()));
-            });
-        if use_custom_args {
-            b = b.with_additional_browser_args(UI_BROWSER_ARGS);
+            .with_inner_size(initial_size)
+            .with_min_inner_size(Size::Logical(LogicalSize::new(480.0, 360.0)));
+        if let Some((px, py)) = effective_pos {
+            win_builder = win_builder.with_position(TaoPhysicalPosition::new(
+                px.max(-32000),
+                py.max(-32000),
+            ));
         }
-        b.build_as_child(&window)
-    };
+        let window = win_builder
+            .build(elwt)
+            .map_err(|e| format!("Window creation error: {}", e))?;
+        let win_id = window.id();
+        enable_win32_immersive_dark_window(window.hwnd() as *mut core::ffi::c_void);
 
-    let ui_webview = match build_ui_webview(&mut ui_web_context, true) {
-        Ok(wv) => wv,
-        Err(_) => {
-            let _ = std::fs::create_dir_all(&fallback_ui_dir);
-            ui_web_context = WebContext::new(Some(fallback_ui_dir));
-            build_ui_webview(&mut ui_web_context, false)
-                .map_err(|e| format!("UI WebView error: {}", e))?
+        if let (Some((px, py)), Some(mon)) = (effective_pos, window.current_monitor()) {
+            let mpos = mon.position();
+            let msize = mon.size();
+            let wsize = window.outer_size();
+            let max_x = (mpos.x + msize.width as i32 - 360).max(mpos.x);
+            let max_y = (mpos.y + msize.height as i32 - 200).max(mpos.y);
+            let cx = px.clamp(mpos.x - (wsize.width as i32 / 3), max_x);
+            let cy = py.clamp(mpos.y, max_y);
+            window.set_outer_position(TaoPhysicalPosition::new(cx, cy));
         }
-    };
-    let _ = ui_webview.set_theme(Theme::Dark);
-    apply_win32_black_class_brush(ui_webview.hwnd().0 as *mut core::ffi::c_void);
 
-    // Show the window only AFTER `ui_webview` exists & its black brush is active so Windows
-    // never flashes a raw black parent frame or classic Win98 blue caption bar.
-    window.set_visible(true);
-    if startup_pos.is_none() && saved_geom.maximized {
-        window.set_maximized(true);
-    }
-    let _ = ui_webview.set_visible(true);
-    let _ = ui_webview.focus();
+        let phys = window.inner_size();
+        let nonce = server_cfg.mint_bootstrap_nonce();
+        let ui_url = format!(
+            "http://127.0.0.1:{}/?boot={}&win={}",
+            bind_port, nonce, session_id
+        );
+        let ui_proxy = proxy.clone();
+        let ui_sink: CefEventSink = Arc::new(move |evt| {
+            let _ = ui_proxy.send_event(WinEvent::CefCallback(win_id, evt));
+        });
+        let ui_browser = cef_runtime::spawn_cef_child_browser(
+            window.hwnd(),
+            0,
+            0,
+            phys.width.max(1),
+            phys.height.max(1),
+            &ui_url,
+            true,
+            false,
+            0,
+            bind_port,
+            None,
+            None,
+            None,
+            ui_sink,
+            Arc::clone(shared_shell),
+            Arc::clone(download_resolver),
+        )?;
 
-    // Multi-window restart: spawn every sibling window separately (each gets its own tabs,
-    // tab groups, active tab, saved screen geometry, and isolated `browser-ui-slots/slot-<N>`).
-    if !pending_restore_ids.is_empty() {
+        apply_win32_black_class_brush(ui_browser.hwnd());
+        window.set_visible(true);
+        if override_pos.is_none() && saved_geom.maximized {
+            window.set_maximized(true);
+        }
+        ui_browser.set_visible(true);
+        ui_browser.focus();
+
+        // One-shot startup watchdog per window
+        let wd_proxy = proxy.clone();
         let _ = std::thread::Builder::new()
-            .name("singularity-restore-siblings".into())
+            .name("singularity-ui-watchdog".into())
             .stack_size(128 * 1024)
             .spawn(move || {
-                for (idx, rid) in pending_restore_ids.into_iter().enumerate() {
-                    if idx > 0 {
-                        std::thread::sleep(Duration::from_millis(180));
-                    }
-                    let _ = spawn_restored_singularity_window(&rid);
-                }
+                std::thread::sleep(Duration::from_secs(4));
+                let _ = wd_proxy.send_event(WinEvent::UiStartupWatchdog(win_id));
             });
+
+        let mut st = BrowserWindowState {
+            session_id,
+            window,
+            ui_browser,
+            tab_browsers: HashMap::new(),
+            tab_last_urls: HashMap::new(),
+            tab_media_times: HashMap::new(),
+            tab_scroll_ys: HashMap::new(),
+            tab_bg_intents: HashMap::new(),
+            last_favicon_at: HashMap::new(),
+            layout_cache: WebViewLayoutCache::default(),
+            active_tab_id: 1,
+            web_visible: false,
+            overlay_open: false,
+            html_fullscreen: false,
+            user_f11_fullscreen: false,
+            was_maximized_before_fs: false,
+            last_maximized: None,
+            ui_ready_received: false,
+            was_minimized: false,
+            ext_popup: None,
+            last_ext_popup_closed: None,
+        };
+        st.capture_geometry(server_cfg, shared_shell);
+        st.sync_layout();
+        Ok((win_id, st))
     }
 
-    // One-shot startup watchdog: if the UI WebView ever stalls during initial navigation on a
-    // secondary window, automatically re-bootstrap with a fresh single-use nonce after 4s.
-    let watchdog_proxy = proxy.clone();
-    let _ = std::thread::Builder::new()
-        .name("singularity-ui-watchdog".into())
-        .stack_size(128 * 1024)
-        .spawn(move || {
-            std::thread::sleep(Duration::from_secs(4));
-            let _ = watchdog_proxy.send_event(WinEvent::UiStartupWatchdog);
-        });
+    let mut windows: HashMap<WindowId, BrowserWindowState> = HashMap::new();
 
-    let watchdog_cfg = server_cfg.clone();
-    let main_win_id: WindowId = window.id();
+    // Create Primary Window #1 inside our single Chromium CEF process
+    let (primary_win_id, primary_state) = create_browser_window(
+        &event_loop,
+        bind_port,
+        server_cfg,
+        &shared_shell,
+        &proxy,
+        &download_resolver,
+        primary_session_id,
+        primary_session,
+        startup_pos,
+    )?;
+    {
+        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+        shell.roaming.register_live_window(
+            bind_port,
+            primary_state.window.hwnd(),
+            &server_cfg.transfer_token,
+        );
+    }
+    windows.insert(primary_win_id, primary_state);
 
-    // Per-tab WebView2 pool: preserves exact DOM, YouTube playback, SPA state, and enables real RAM unloading.
-    let mut tab_webviews: HashMap<u64, WebView> = HashMap::new();
-    // Reuse a single ICoreWebView2Environment across all content tabs for instant tab creation!
-    let mut shared_content_env = None;
-    let mut tab_last_urls: HashMap<u64, String> = HashMap::new();
-    let mut tab_media_times: HashMap<u64, u64> = HashMap::new();
-    let mut tab_scroll_ys: HashMap<u64, u32> = HashMap::new();
+    // Multi-window restart: open EVERY restored sibling window separately right inside this
+    // SAME single low-RAM Chromium process (zero duplicate Chromium Browser/GPU/Network trees!)
+    for rid in pending_restore_ids {
+        if let Some(rp) =
+            crate::roaming_store::RoamingSingularityStore::consume_window_restore_handoff(
+                &root_dir, &rid,
+            )
+        {
+            let sid = crate::roaming_store::RoamingSingularityStore::new_window_session_id();
+            let sess = WindowTabSession {
+                saved_tabs: rp.tabs,
+                saved_tab_groups: rp.tab_groups,
+                active_tab_index: rp.active_tab_index,
+                geometry: rp.geometry,
+                is_detached_handoff: false,
+                is_secondary_live_window: true,
+                restored_windows_count: 1,
+            };
+            if let Ok((swid, sst)) = create_browser_window(
+                &event_loop,
+                bind_port,
+                server_cfg,
+                &shared_shell,
+                &proxy,
+                &download_resolver,
+                sid,
+                sess,
+                None,
+            ) {
+                windows.insert(swid, sst);
+            }
+        }
+    }
+
+    let cfg_clone = server_cfg.clone();
+    let mut cef_guard = Some(cef_guard);
+    let mut next_cef_pump: Option<std::time::Instant> =
+        Some(std::time::Instant::now() + Duration::from_millis(8));
     let mut last_media_disk_flush = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(10))
+        .checked_sub(Duration::from_secs(10))
         .unwrap_or_else(std::time::Instant::now);
     let mut last_history_disk_flush = std::time::Instant::now();
     let mut history_dirty = false;
     let mut last_cookie_hygiene_at: Option<std::time::Instant> = None;
     let mut last_shortcut_at = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(1))
+        .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(std::time::Instant::now);
-    let mut last_favicon_at: HashMap<u64, std::time::Instant> = HashMap::new();
-    let mut active_tab_id: u64 = 1;
-    let mut web_visible = false;
-    let mut overlay_open = false;
-    let mut html_fullscreen = false;
-    let mut user_f11_fullscreen = false;
-    let mut was_maximized_before_fs = false;
-    let mut last_maximized: Option<bool> = None;
-    let mut ui_ready_received = false;
-    let mut was_minimized = false;
-    let mut cookies_hydrated = false;
-    let mut extensions_need_load = true;
-    // Active floating Chrome extension popup: (ext_id, window_id, auto_close_on_blur, Window, WebView)
-    let mut ext_popup: Option<(String, WindowId, bool, Window, WebView)> = None;
-    let mut last_ext_popup_closed: Option<(String, std::time::Instant)> = None;
 
-    let capture_window_geometry = |win: &Window, shared: &Arc<Mutex<SingularityBrowserShell>>| {
-        if win.fullscreen().is_some() {
+    let persist_window_on_close = |st: &BrowserWindowState,
+                                   other_windows_alive: bool,
+                                   cfg: &ServerConfig,
+                                   shared: &Arc<Mutex<SingularityBrowserShell>>| {
+        st.capture_geometry(cfg, shared);
+        let sess_opt = cfg
+            .window_sessions
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&st.session_id));
+        let mut shell = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if shell.private_browsing_active || !shell.roaming.profile.restore_session {
             return;
         }
-        let phys = win.inner_size();
-        if phys.width == 0 || phys.height == 0 {
-            return;
-        }
-        let is_max = win.is_maximized();
-        if let Ok(mut shell) = shared.lock() {
-            shell.roaming.window_geometry.maximized = is_max;
-            if !is_max {
-                if let Ok(pos) = win.outer_position() {
-                    shell.roaming.window_geometry.pos_x = Some(pos.x);
-                    shell.roaming.window_geometry.pos_y = Some(pos.y);
-                }
-                shell.roaming.window_geometry.width = Some(phys.width.max(480));
-                shell.roaming.window_geometry.height = Some(phys.height.max(360));
-            }
-        }
-    };
-    capture_window_geometry(&window, &shared_shell);
-
-    invalidate_ui_layout_cache();
-    sync_webview_bounds(
-        &window,
-        &ui_webview,
-        &tab_webviews,
-        active_tab_id,
-        web_visible,
-        overlay_open,
-        false,
-    );
-
-    let close_ext_popup = |slot: &mut Option<(String, WindowId, bool, Window, WebView)>,
-                           last_closed: &mut Option<(String, std::time::Instant)>| {
-        if let Some((eid, _, _, pwin, pwv)) = slot.take() {
-            *last_closed = Some((eid, std::time::Instant::now()));
-            drop(pwv);
-            drop(pwin);
-        }
-    };
-
-    let apply_fullscreen_state = |win: &Window,
-                                  ui_wv: &WebView,
-                                  tab_wvs: &HashMap<u64, WebView>,
-                                  active_tid: u64,
-                                  web_vis: bool,
-                                  ov_open: bool,
-                                  prev_fs: bool,
-                                  next_fs: bool,
-                                  was_max: &mut bool,
-                                  last_max: &mut Option<bool>| {
-        if !prev_fs && next_fs {
-            *was_max = win.is_maximized();
-            win.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        } else if prev_fs && !next_fs {
-            win.set_fullscreen(None);
-            if *was_max {
-                win.set_maximized(true);
-            }
-        }
-        invalidate_ui_layout_cache();
-        sync_webview_bounds(win, ui_wv, tab_wvs, active_tid, web_vis, ov_open, next_fs);
-        sync_maximized_state(win, ui_wv, last_max, false);
-        emit_ui_sync(ui_wv, &serde_json::json!({ "fullscreen": next_fs }));
-    };
-
-    let flush_all_media_to_disk =
-        |shared: &Arc<Mutex<SingularityBrowserShell>>,
-         urls: &HashMap<u64, String>,
-         times: &HashMap<u64, u64>,
-         scrolls: &HashMap<u64, u32>| {
-            let mut shell = shared.lock().unwrap_or_else(|e| e.into_inner());
-            if shell.private_browsing_active || !shell.roaming.profile.restore_session {
-                return;
-            }
-            let mut any_changed = false;
-            for (&tid, u) in urls {
-                let t = times.get(&tid).copied().unwrap_or(0);
-                let sy = scrolls.get(&tid).copied().unwrap_or(0);
+        if let Some(mut sess) = sess_opt {
+            // Apply latest in-memory media timestamps & scroll offsets before writing close snapshot
+            for (&tid, u) in &st.tab_last_urls {
+                let t = st.tab_media_times.get(&tid).copied().unwrap_or(0);
+                let sy = st.tab_scroll_ys.get(&tid).copied().unwrap_or(0);
                 if t >= 2 || sy > 0 {
-                    if shell.roaming.update_saved_tab_media_progress(u, t, sy) {
-                        any_changed = true;
+                    let norm_u = normalize_url_without_media_time(u);
+                    for entry in &mut sess.saved_tabs {
+                        if normalize_url_without_media_time(&entry.url) == norm_u {
+                            if t >= 2 {
+                                entry.media_time_sec = Some(t);
+                            }
+                            if sy > 0 {
+                                entry.scroll_y = Some(sy);
+                            }
+                        }
                     }
                 }
             }
-            if any_changed {
-                let _ = shell.roaming.save_profile();
+            if sess.saved_tabs.is_empty() {
+                shell.roaming.delete_window_session_for(&st.session_id);
+            } else {
+                let _ = shell.roaming.save_window_session_for(
+                    &st.session_id,
+                    &sess.saved_tabs,
+                    &sess.saved_tab_groups,
+                    sess.active_tab_index,
+                    sess.geometry,
+                    other_windows_alive,
+                    true,
+                );
+                if shell.roaming.window_id() == st.session_id {
+                    shell.roaming.profile.saved_tabs = sess.saved_tabs;
+                    shell.roaming.profile.saved_tab_groups = sess.saved_tab_groups;
+                    shell.roaming.profile.active_tab_index = sess.active_tab_index;
+                    shell.roaming.window_geometry = sess.geometry;
+                    let _ = shell.roaming.save_profile();
+                }
             }
+        }
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_content_tab_cef(
+        win_id: WindowId,
+        st: &mut BrowserWindowState,
+        tab_id: u64,
+        url: &str,
+        bind_port: u16,
+        is_private: bool,
+        incognito_ctx: &mut Option<cef::RequestContext>,
+        resume_time_sec: Option<u64>,
+        resume_scroll_y: Option<u32>,
+        start_paused: bool,
+        proxy: &EventLoopProxy<WinEvent>,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        download_resolver: &CefDownloadResolver,
+    ) {
+        let phys = st.window.inner_size();
+        let scale = st.window.scale_factor();
+        let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(phys.height.max(1));
+        let effective_url = resume_time_sec
+            .filter(|&t| t >= 3)
+            .map(|t| apply_media_timestamp_to_url(url, t))
+            .unwrap_or_else(|| url.to_string());
+        let resume_script =
+            build_resume_init_script(url, resume_time_sec, resume_scroll_y, start_paused);
+
+        let req_ctx = if is_private {
+            if incognito_ctx.is_none() {
+                *incognito_ctx = cef_runtime::create_incognito_request_context();
+            }
+            incognito_ctx.clone()
+        } else {
+            None
         };
 
+        let tab_proxy = proxy.clone();
+        let sink: CefEventSink = Arc::new(move |evt| {
+            let _ = tab_proxy.send_event(WinEvent::CefCallback(win_id, evt));
+        });
+
+        if let Ok(browser_handle) = cef_runtime::spawn_cef_child_browser(
+            st.window.hwnd(),
+            0,
+            bar_h as i32,
+            phys.width.max(1),
+            phys.height.saturating_sub(bar_h).max(1),
+            &effective_url,
+            false,
+            false,
+            tab_id,
+            bind_port,
+            Some(CONTENT_LINK_INTENT_SCRIPT),
+            resume_script.as_deref(),
+            req_ctx,
+            sink,
+            Arc::clone(shared_shell),
+            Arc::clone(download_resolver),
+        ) {
+            st.tab_browsers.insert(tab_id, browser_handle);
+        }
+    }
+
     event_loop.run(move |event, elwt, control_flow| {
-        let _keep_ui_ctx = &ui_web_context;
-        let _keep_content_ctx = &content_web_context;
-        *control_flow = ControlFlow::Wait;
+        *control_flow = match next_cef_pump {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        };
 
         match event {
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                next_cef_pump = None;
+                cef_runtime::pump_cef_message_loop();
+            }
+            Event::MainEventsCleared => {
+                if let Some(deadline) = next_cef_pump {
+                    if std::time::Instant::now() >= deadline {
+                        next_cef_pump = None;
+                        cef_runtime::pump_cef_message_loop();
+                    }
+                }
+                *control_flow = match next_cef_pump {
+                    Some(deadline) => ControlFlow::WaitUntil(deadline),
+                    None => ControlFlow::Wait,
+                };
+            }
             Event::WindowEvent {
                 window_id,
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                if window_id != main_win_id {
-                    if ext_popup
-                        .as_ref()
-                        .map(|p| p.1 == window_id)
-                        .unwrap_or(false)
-                    {
-                        close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
+                if let Some(mut st) = windows.remove(&window_id) {
+                    st.close_ext_popup();
+                    let others_alive = !windows.is_empty();
+                    persist_window_on_close(&st, others_alive, &cfg_clone, &shared_shell);
+                    drop(st);
+                    if windows.is_empty() {
+                        if history_dirty {
+                            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = shell.roaming.save_profile();
+                            history_dirty = false;
+                        }
+                        cef_runtime::run_cookie_hygiene_cef(&shared_shell, true, true, None);
+                        for _ in 0..8 {
+                            cef_runtime::pump_cef_message_loop();
+                            std::thread::sleep(Duration::from_millis(8));
+                        }
+                        {
+                            let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                            shell.roaming.flush_async_persistence();
+                            shell.roaming.unregister_live_window();
+                        }
+                        drop(incognito_ctx.take());
+                        drop(cef_guard.take());
+                        *control_flow = ControlFlow::Exit;
                     }
-                    return;
+                } else {
+                    for st in windows.values_mut() {
+                        if st.ext_popup.as_ref().map(|p| p.1 == window_id).unwrap_or(false) {
+                            st.close_ext_popup();
+                            break;
+                        }
+                    }
                 }
-                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                capture_window_geometry(&window, &shared_shell);
-                let is_private = shared_shell
-                    .lock()
-                    .map(|s| s.private_browsing_active)
-                    .unwrap_or(false);
-                if !is_private {
-                    flush_all_media_to_disk(
-                        &shared_shell,
-                        &tab_last_urls,
-                        &tab_media_times,
-                        &tab_scroll_ys,
-                    );
-                    if history_dirty {
-                        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = shell.roaming.save_profile();
-                        history_dirty = false;
-                    }
-                    if let Some(any_wv) = tab_webviews.values().next() {
-                        let _ =
-                            run_combined_cookie_hygiene_and_snapshot(any_wv, &shared_shell, true);
-                    }
-                }
-                {
-                    let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                    // Drain pending background writes BEFORE writing/deleting final close session!
-                    shell.roaming.flush_async_persistence();
-                    if !shell.private_browsing_active && shell.roaming.profile.restore_session {
-                        shell.roaming.save_window_session_on_close();
-                    }
-                    shell.roaming.unregister_live_window();
-                    shell.roaming.release_ui_webview_slot();
-                }
-                *control_flow = ControlFlow::Exit;
             }
             Event::WindowEvent {
                 window_id,
                 event: WindowEvent::Focused(true),
                 ..
             } => {
-                if window_id == main_win_id
-                    && web_visible
-                    && !overlay_open
-                    && !is_cursor_clicking_top_bar(&window)
-                {
-                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                        let _ = wv.focus();
+                if let Some(st) = windows.get(&window_id) {
+                    if st.web_visible
+                        && !st.overlay_open
+                        && !is_cursor_clicking_top_bar(&st.window)
+                    {
+                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                            b.focus();
+                        }
                     }
                 }
             }
@@ -3057,13 +2483,17 @@ fn run_windows_frameless_browser(
                 event: WindowEvent::Focused(false),
                 ..
             } => {
-                if window_id != main_win_id {
-                    let should_close = ext_popup
-                        .as_ref()
-                        .map(|p| p.1 == window_id && p.2)
-                        .unwrap_or(false);
-                    if should_close {
-                        close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
+                if !windows.contains_key(&window_id) {
+                    for st in windows.values_mut() {
+                        let should_close = st
+                            .ext_popup
+                            .as_ref()
+                            .map(|p| p.1 == window_id && p.2)
+                            .unwrap_or(false);
+                        if should_close {
+                            st.close_ext_popup();
+                            break;
+                        }
                     }
                 }
             }
@@ -3072,37 +2502,35 @@ fn run_windows_frameless_browser(
                 event: WindowEvent::Resized(new_size),
                 ..
             } => {
-                if window_id == main_win_id {
+                if let Some(st) = windows.get_mut(&window_id) {
                     if new_size.width == 0 || new_size.height == 0 {
-                        was_minimized = true;
+                        st.was_minimized = true;
+                        // Inform Chromium to release GPU surfaces & trim OS working set while minimized!
+                        st.ui_browser.set_visible(false);
+                        st.layout_cache.ui_visible = Some(false);
+                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                            b.set_visible(false);
+                            st.layout_cache.tab_visible.insert(st.active_tab_id, false);
+                        }
+                        cef_runtime::trim_process_working_set();
                         return;
                     }
-                    if was_minimized {
-                        was_minimized = false;
-                        invalidate_ui_layout_cache();
-                        invalidate_tab_layout_cache(None);
+                    if st.was_minimized {
+                        st.was_minimized = false;
+                        st.layout_cache.invalidate_ui();
+                        st.layout_cache.invalidate_tab(None);
                     }
-                    capture_window_geometry(&window, &shared_shell);
-                    sync_webview_bounds(
-                        &window,
-                        &ui_webview,
-                        &tab_webviews,
-                        active_tab_id,
-                        web_visible,
-                        overlay_open,
-                        html_fullscreen || user_f11_fullscreen,
-                    );
-                    sync_maximized_state(&window, &ui_webview, &mut last_maximized, false);
-                } else if let Some((_, pid, _, _, pwv)) = ext_popup.as_ref() {
-                    if *pid == window_id {
-                        let _ = pwv.set_bounds(Rect {
-                            position: PhysicalPosition::new(0, 0).into(),
-                            size: PhysicalSize::new(
-                                new_size.width.max(1),
-                                new_size.height.max(1),
-                            )
-                            .into(),
-                        });
+                    st.capture_geometry(&cfg_clone, &shared_shell);
+                    st.sync_layout();
+                    st.sync_maximized(false);
+                } else {
+                    for st in windows.values() {
+                        if let Some((_, pid, _, _, pb)) = st.ext_popup.as_ref() {
+                            if *pid == window_id {
+                                pb.set_bounds(0, 0, new_size.width.max(1), new_size.height.max(1));
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -3111,20 +2539,12 @@ fn run_windows_frameless_browser(
                 event: WindowEvent::ScaleFactorChanged { .. },
                 ..
             } => {
-                if window_id == main_win_id {
-                    invalidate_ui_layout_cache();
-                    invalidate_tab_layout_cache(None);
-                    capture_window_geometry(&window, &shared_shell);
-                    sync_webview_bounds(
-                        &window,
-                        &ui_webview,
-                        &tab_webviews,
-                        active_tab_id,
-                        web_visible,
-                        overlay_open,
-                        html_fullscreen || user_f11_fullscreen,
-                    );
-                    sync_maximized_state(&window, &ui_webview, &mut last_maximized, false);
+                if let Some(st) = windows.get_mut(&window_id) {
+                    st.layout_cache.invalidate_ui();
+                    st.layout_cache.invalidate_tab(None);
+                    st.capture_geometry(&cfg_clone, &shared_shell);
+                    st.sync_layout();
+                    st.sync_maximized(false);
                 }
             }
             Event::WindowEvent {
@@ -3132,290 +2552,846 @@ fn run_windows_frameless_browser(
                 event: WindowEvent::Moved(_),
                 ..
             } => {
-                if window_id == main_win_id {
-                    if ext_popup.as_ref().map(|p| p.2).unwrap_or(false) {
-                        close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
+                if let Some(st) = windows.get_mut(&window_id) {
+                    if st.ext_popup.as_ref().map(|p| p.2).unwrap_or(false) {
+                        st.close_ext_popup();
                     }
-                    capture_window_geometry(&window, &shared_shell);
-                    sync_maximized_state(&window, &ui_webview, &mut last_maximized, false);
+                    st.capture_geometry(&cfg_clone, &shared_shell);
+                    st.sync_maximized(false);
                 }
             }
             Event::UserEvent(win_evt) => match win_evt {
-                WinEvent::UiIpc(raw) => {
-                    if let Ok(cmd) = serde_json::from_str::<UiIpcCmd>(&raw) {
+                WinEvent::CefPump(delay_ms) => {
+                    if delay_ms <= 0 {
+                        next_cef_pump = None;
+                        cef_runtime::pump_cef_message_loop();
+                    } else {
+                        let target = std::time::Instant::now()
+                            + Duration::from_millis((delay_ms as u64).min(50));
+                        next_cef_pump = Some(match next_cef_pump {
+                            Some(existing) if existing < target => existing,
+                            _ => target,
+                        });
+                    }
+                }
+                WinEvent::OpenNewWindowInProcess => {
+                    let sid = crate::roaming_store::RoamingSingularityStore::new_window_session_id();
+                    let sess = WindowTabSession {
+                        is_secondary_live_window: true,
+                        ..Default::default()
+                    };
+                    if let Ok((nwid, nst)) = create_browser_window(
+                        elwt,
+                        bind_port,
+                        &cfg_clone,
+                        &shared_shell,
+                        &proxy,
+                        &download_resolver,
+                        sid,
+                        sess,
+                        None,
+                    ) {
+                        bring_win32_window_to_front(nst.window.hwnd());
+                        windows.insert(nwid, nst);
+                    }
+                }
+                WinEvent::AdoptExternalTab(handoff) => {
+                    if let Some(st) = windows.values().next() {
+                        bring_win32_window_to_front(st.window.hwnd());
+                        emit_ui_sync(
+                            &st.ui_browser,
+                            &serde_json::json!({
+                                "adopt_external_tab": {
+                                    "url": handoff.url,
+                                    "title": handoff.title,
+                                    "favicon_url": handoff.favicon_url,
+                                    "media_time_sec": handoff.media_time_sec,
+                                    "scroll_y": handoff.scroll_y
+                                }
+                            }),
+                        );
+                    }
+                }
+                WinEvent::UiStartupWatchdog(wid) => {
+                    if let Some(st) = windows.get_mut(&wid) {
+                        if !st.ui_ready_received {
+                            let fresh_nonce = cfg_clone.mint_bootstrap_nonce();
+                            let fresh_url = format!(
+                                "http://127.0.0.1:{}/?boot={}&win={}",
+                                bind_port, fresh_nonce, st.session_id
+                            );
+                            st.ui_browser.load_url(&fresh_url);
+                            st.layout_cache.invalidate_ui();
+                            st.sync_layout();
+                            st.ui_browser.focus();
+                        }
+                    }
+                }
+                WinEvent::CookieHygieneDone {
+                    win_id,
+                    mode,
+                    trackers,
+                    ads,
+                    malicious,
+                    synced,
+                } => {
+                    if synced > 0 {
+                        bump_state_revision();
+                    }
+                    if let Some(st) = windows.get(&win_id) {
+                        if mode == "sync_tokens" {
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({ "tokens_synced": synced }),
+                            );
+                        } else if mode == "trackers_only" {
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({
+                                    "browsing_cleared": true,
+                                    "mode": "trackers_only",
+                                    "trackers_removed": trackers,
+                                    "ads_removed": ads,
+                                    "malicious_removed": malicious
+                                }),
+                            );
+                        } else if synced > 0 {
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({ "tokens_synced": synced }),
+                            );
+                        }
+                    }
+                }
+                WinEvent::CefCallback(wid, cb_evt) => match cb_evt {
+                    CefCallbackEvent::CloseExtensionPopup => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            st.close_ext_popup();
+                        }
+                    }
+                    CefCallbackEvent::PageStarted { tab_id, url } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if tab_id == 0 {
+                                return;
+                            }
+                            if st
+                                .tab_last_urls
+                                .get(&tab_id)
+                                .map(|prev| {
+                                    normalize_url_without_media_time(prev)
+                                        != normalize_url_without_media_time(&url)
+                                })
+                                .unwrap_or(false)
+                            {
+                                st.tab_media_times.remove(&tab_id);
+                                st.tab_scroll_ys.remove(&tab_id);
+                            }
+                            st.tab_last_urls.insert(tab_id, url.clone());
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({ "tab_id": tab_id, "url": url }),
+                            );
+                        }
+                    }
+                    CefCallbackEvent::AddressChanged { tab_id, url } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if tab_id == 0 {
+                                return;
+                            }
+                            let changed = st
+                                .tab_last_urls
+                                .get(&tab_id)
+                                .map(|p| p != &url)
+                                .unwrap_or(true);
+                            if changed {
+                                if st
+                                    .tab_last_urls
+                                    .get(&tab_id)
+                                    .map(|prev| {
+                                        normalize_url_without_media_time(prev)
+                                            != normalize_url_without_media_time(&url)
+                                    })
+                                    .unwrap_or(false)
+                                {
+                                    st.tab_media_times.remove(&tab_id);
+                                    st.tab_scroll_ys.remove(&tab_id);
+                                }
+                                st.tab_last_urls.insert(tab_id, url.clone());
+                                emit_ui_sync(
+                                    &st.ui_browser,
+                                    &serde_json::json!({ "tab_id": tab_id, "url": url }),
+                                );
+                            }
+                        }
+                    }
+                    CefCallbackEvent::PageFinished { tab_id, url } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if tab_id == 0 {
+                                return;
+                            }
+                            let final_url = st
+                                .tab_browsers
+                                .get(&tab_id)
+                                .and_then(read_live_http_url)
+                                .unwrap_or(url);
+                            st.tab_last_urls.insert(tab_id, final_url.clone());
+                            let is_private = shared_shell
+                                .lock()
+                                .map(|s| s.private_browsing_active)
+                                .unwrap_or(false);
+                            let cookie_hygiene_due = last_cookie_hygiene_at
+                                .map(|t| t.elapsed() >= Duration::from_secs(90))
+                                .unwrap_or(true);
+                            if cookie_hygiene_due {
+                                last_cookie_hygiene_at = Some(std::time::Instant::now());
+                                let done_proxy = proxy.clone();
+                                cef_runtime::run_cookie_hygiene_cef(
+                                    &shared_shell,
+                                    true,
+                                    !is_private,
+                                    Some(Arc::new(move |tr, ad, mal, synced| {
+                                        let _ = done_proxy.send_event(WinEvent::CookieHygieneDone {
+                                            win_id: wid,
+                                            mode: "auto",
+                                            trackers: tr,
+                                            ads: ad,
+                                            malicious: mal,
+                                            synced,
+                                        });
+                                    })),
+                                );
+                            }
+                            if !is_private {
+                                let mut shell =
+                                    shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                shell.roaming.record_history_in_memory("", &final_url);
+                                history_dirty = true;
+                                if last_history_disk_flush.elapsed() >= Duration::from_secs(10) {
+                                    shell.roaming.schedule_save_profile();
+                                    history_dirty = false;
+                                    last_history_disk_flush = std::time::Instant::now();
+                                }
+                            }
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({
+                                    "tab_id": tab_id,
+                                    "url": final_url
+                                }),
+                            );
+                        }
+                    }
+                    CefCallbackEvent::TitleChanged { tab_id, title } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if tab_id == 0 {
+                                return;
+                            }
+                            let live_url = st
+                                .tab_browsers
+                                .get(&tab_id)
+                                .and_then(read_live_http_url)
+                                .or_else(|| st.tab_last_urls.get(&tab_id).cloned());
+                            if let Some(ref u) = live_url {
+                                st.tab_last_urls.insert(tab_id, u.clone());
+                                let mut shell =
+                                    shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                                if !shell.private_browsing_active {
+                                    shell.roaming.record_history_in_memory(&title, u);
+                                    history_dirty = true;
+                                    if last_history_disk_flush.elapsed() >= Duration::from_secs(10)
+                                    {
+                                        shell.roaming.schedule_save_profile();
+                                        history_dirty = false;
+                                        last_history_disk_flush = std::time::Instant::now();
+                                    }
+                                }
+                            }
+                            let mut payload = serde_json::json!({
+                                "tab_id": tab_id,
+                                "title": title
+                            });
+                            if let Some(u) = live_url {
+                                payload["url"] = serde_json::Value::String(u);
+                            }
+                            emit_ui_sync(&st.ui_browser, &payload);
+                        }
+                    }
+                    CefCallbackEvent::FaviconChanged {
+                        tab_id,
+                        favicon_url,
+                    } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if tab_id == 0 {
+                                return;
+                            }
+                            let now = std::time::Instant::now();
+                            if let Some(prev) = st.last_favicon_at.get(&tab_id) {
+                                if now.duration_since(*prev) < Duration::from_millis(1000) {
+                                    return;
+                                }
+                            }
+                            st.last_favicon_at.insert(tab_id, now);
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({
+                                    "tab_id": tab_id,
+                                    "favicon_url": favicon_url
+                                }),
+                            );
+                        }
+                    }
+                    CefCallbackEvent::FullscreenChanged { tab_id, enabled } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if enabled
+                                && (tab_id != st.active_tab_id
+                                    || !st.web_visible
+                                    || st.overlay_open)
+                            {
+                                return;
+                            }
+                            if enabled {
+                                st.close_ext_popup();
+                            }
+                            let prev_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                            st.html_fullscreen = enabled;
+                            let next_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                            st.apply_fullscreen(prev_fs, next_fs);
+                        }
+                    }
+                    CefCallbackEvent::OpenNewTab { url, background } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            let mut bg = background;
+                            let mut title: Option<String> = None;
+                            if let Some(intent) = st.tab_bg_intents.remove(&st.active_tab_id) {
+                                let age = intent.at.elapsed();
+                                if intent.kind == "bg_click" && age <= Duration::from_millis(1800) {
+                                    bg = true;
+                                    if !intent.title.is_empty() {
+                                        title = Some(intent.title);
+                                    }
+                                } else if intent.kind == "context_link"
+                                    && age <= Duration::from_secs(15)
+                                    && intent.href == url
+                                {
+                                    bg = true;
+                                    if !intent.title.is_empty() {
+                                        title = Some(intent.title);
+                                    }
+                                }
+                            }
+                            let mut payload = serde_json::json!({
+                                "new_tab_url": url,
+                                "new_tab_background": bg
+                            });
+                            if let Some(t) = title {
+                                payload["new_tab_title"] = serde_json::Value::String(t);
+                            }
+                            emit_ui_sync(&st.ui_browser, &payload);
+                        }
+                    }
+                    CefCallbackEvent::DownloadStarted { filename, path, .. } => {
+                        if let Some(st) = windows.get(&wid) {
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({
+                                    "download_started": { "filename": filename, "path": path }
+                                }),
+                            );
+                        }
+                    }
+                    CefCallbackEvent::DownloadCompleted {
+                        filename,
+                        path,
+                        success,
+                        ..
+                    } => {
+                        if let Some(st) = windows.get(&wid) {
+                            emit_ui_sync(
+                                &st.ui_browser,
+                                &serde_json::json!({
+                                    "download_completed": {
+                                        "filename": filename,
+                                        "path": path,
+                                        "success": success
+                                    }
+                                }),
+                            );
+                        }
+                    }
+                    CefCallbackEvent::ContentIpc { tab_id, body } => {
+                        if body.len() > 2048 || tab_id == 0 {
+                            return;
+                        }
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+                            return;
+                        };
+                        let Some(kind) = v.get("k").and_then(|x| x.as_str()) else {
+                            return;
+                        };
+                        match kind {
+                            "fullscreen" => {
+                                if let (Some(st), Some(enabled)) = (
+                                    windows.get_mut(&wid),
+                                    v.get("fs").and_then(|x| x.as_bool()),
+                                ) {
+                                    if enabled
+                                        && (tab_id != st.active_tab_id
+                                            || !st.web_visible
+                                            || st.overlay_open)
+                                    {
+                                        return;
+                                    }
+                                    if enabled {
+                                        st.close_ext_popup();
+                                    }
+                                    let prev_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                                    st.html_fullscreen = enabled;
+                                    let next_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                                    st.apply_fullscreen(prev_fs, next_fs);
+                                }
+                            }
+                            "shortcut" => {
+                                let Some(action) = v.get("a").and_then(|x| x.as_str()) else {
+                                    return;
+                                };
+                                let allowed = matches!(
+                                    action,
+                                    "toggle_fullscreen"
+                                        | "reopen_closed_tab"
+                                        | "new_tab"
+                                        | "new_window"
+                                        | "close_active_tab"
+                                        | "next_tab"
+                                        | "prev_tab"
+                                        | "focus_omnibar"
+                                        | "reload_tab"
+                                        | "toggle_bookmark"
+                                        | "open_history"
+                                        | "open_settings"
+                                        | "jump_tab"
+                                        | "web_back"
+                                        | "web_forward"
+                                );
+                                if !allowed {
+                                    return;
+                                }
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_shortcut_at) < Duration::from_millis(80)
+                                {
+                                    return;
+                                }
+                                last_shortcut_at = now;
+                                if action == "new_window" {
+                                    let _ = proxy.send_event(WinEvent::OpenNewWindowInProcess);
+                                    return;
+                                }
+                                let idx = v
+                                    .get("n")
+                                    .and_then(|x| x.as_u64())
+                                    .filter(|&n| (1..=9).contains(&n))
+                                    .map(|n| n as u8);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if tab_id != st.active_tab_id
+                                        || !st.web_visible
+                                        || st.overlay_open
+                                    {
+                                        return;
+                                    }
+                                    match action {
+                                        "toggle_fullscreen" => {
+                                            st.close_ext_popup();
+                                            let prev_fs =
+                                                st.html_fullscreen || st.user_f11_fullscreen;
+                                            if prev_fs {
+                                                st.html_fullscreen = false;
+                                                st.user_f11_fullscreen = false;
+                                                if let Some(b) =
+                                                    st.tab_browsers.get(&st.active_tab_id)
+                                                {
+                                                    b.evaluate_script("document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});");
+                                                }
+                                            } else {
+                                                st.user_f11_fullscreen = true;
+                                            }
+                                            let next_fs =
+                                                st.html_fullscreen || st.user_f11_fullscreen;
+                                            st.apply_fullscreen(prev_fs, next_fs);
+                                            return;
+                                        }
+                                        "web_back" => {
+                                            if let Some(b) = st.tab_browsers.get(&st.active_tab_id)
+                                            {
+                                                b.go_back();
+                                            }
+                                            return;
+                                        }
+                                        "web_forward" => {
+                                            if let Some(b) = st.tab_browsers.get(&st.active_tab_id)
+                                            {
+                                                b.go_forward();
+                                            }
+                                            return;
+                                        }
+                                        "reload_tab" => {
+                                            if let Some(b) = st.tab_browsers.get(&st.active_tab_id)
+                                            {
+                                                b.reload();
+                                                return;
+                                            }
+                                        }
+                                        "focus_omnibar"
+                                        | "new_tab"
+                                        | "open_settings"
+                                        | "open_history" => {
+                                            if st.html_fullscreen || st.user_f11_fullscreen {
+                                                st.html_fullscreen = false;
+                                                st.user_f11_fullscreen = false;
+                                                st.apply_fullscreen(true, false);
+                                            }
+                                            st.ui_browser.focus();
+                                        }
+                                        _ => {}
+                                    }
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({
+                                            "shortcut": action,
+                                            "shortcut_index": idx
+                                        }),
+                                    );
+                                }
+                            }
+                            "favicon" => {
+                                if let Some(icon_url) = v.get("u").and_then(|x| x.as_str()) {
+                                    if icon_url.len() <= 512
+                                        && parse_http_url_authority(icon_url).is_ok()
+                                    {
+                                        if let Some(st) = windows.get_mut(&wid) {
+                                            let now = std::time::Instant::now();
+                                            if st
+                                                .last_favicon_at
+                                                .get(&tab_id)
+                                                .is_some_and(|p| {
+                                                    now.duration_since(*p)
+                                                        < Duration::from_millis(1000)
+                                                })
+                                            {
+                                                return;
+                                            }
+                                            st.last_favicon_at.insert(tab_id, now);
+                                            emit_ui_sync(
+                                                &st.ui_browser,
+                                                &serde_json::json!({
+                                                    "tab_id": tab_id,
+                                                    "favicon_url": icon_url
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            "media_state" => {
+                                let time_sec = v
+                                    .get("s")
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(0)
+                                    .min(864_000);
+                                let scroll_y = v
+                                    .get("sy")
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(0)
+                                    .min(10_000_000) as u32;
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    let Some(trusted_url) = st
+                                        .tab_browsers
+                                        .get(&tab_id)
+                                        .and_then(read_live_http_url)
+                                        .or_else(|| st.tab_last_urls.get(&tab_id).cloned())
+                                    else {
+                                        return;
+                                    };
+                                    if time_sec >= 2 {
+                                        st.tab_media_times.insert(tab_id, time_sec);
+                                    }
+                                    if scroll_y > 0 {
+                                        st.tab_scroll_ys.insert(tab_id, scroll_y);
+                                    }
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({
+                                            "tab_id": tab_id,
+                                            "media_time_sec": time_sec,
+                                            "scroll_y": scroll_y
+                                        }),
+                                    );
+                                    if last_media_disk_flush.elapsed() >= Duration::from_secs(6) {
+                                        let mut shell = shared_shell
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        if !shell.private_browsing_active
+                                            && shell.roaming.profile.restore_session
+                                            && shell.roaming.update_saved_tab_media_progress(
+                                                &trusted_url,
+                                                time_sec,
+                                                scroll_y,
+                                            )
+                                        {
+                                            shell.roaming.schedule_save_profile();
+                                            history_dirty = false;
+                                            last_history_disk_flush = std::time::Instant::now();
+                                            last_media_disk_flush = std::time::Instant::now();
+                                        }
+                                    }
+                                }
+                            }
+                            "bg_click" | "context_link" => {
+                                let Some(href) = v.get("u").and_then(|x| x.as_str()) else {
+                                    return;
+                                };
+                                if parse_http_url_authority(href).is_err() {
+                                    return;
+                                }
+                                let title: String = v
+                                    .get("t")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .chars()
+                                    .filter(|c| !c.is_control())
+                                    .take(120)
+                                    .collect::<String>()
+                                    .trim()
+                                    .to_string();
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.tab_bg_intents.insert(
+                                        tab_id,
+                                        BgLinkIntent {
+                                            kind: kind.to_string(),
+                                            href: href.to_string(),
+                                            title,
+                                            at: std::time::Instant::now(),
+                                        },
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    CefCallbackEvent::UiIpc(raw) => {
+                        let Ok(cmd) = serde_json::from_str::<UiIpcCmd>(&raw) else {
+                            return;
+                        };
                         match cmd {
                             UiIpcCmd::UiReady => {
-                                ui_ready_received = true;
-                                invalidate_ui_layout_cache();
-                                sync_webview_bounds(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    html_fullscreen || user_f11_fullscreen,
-                                );
-                                sync_maximized_state(&window, &ui_webview, &mut last_maximized, true);
-                                emit_ui_sync(
-                                    &ui_webview,
-                                    &serde_json::json!({ "ram_active_count": tab_webviews.len() }),
-                                );
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.ui_ready_received = true;
+                                    st.layout_cache.invalidate_ui();
+                                    st.sync_layout();
+                                    st.sync_maximized(true);
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({ "ram_active_count": st.tab_browsers.len() }),
+                                    );
+                                }
                             }
                             UiIpcCmd::DragWindow => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                let _ = window.drag_window();
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    let _ = st.window.drag_window();
+                                }
                             }
                             UiIpcCmd::DragResize { direction } => {
-                                // Never allow shrinking or resizing the window while maximized or fullscreen.
-                                if window.is_maximized() || window.fullscreen().is_some() {
-                                    sync_maximized_state(
-                                        &window,
-                                        &ui_webview,
-                                        &mut last_maximized,
-                                        true,
-                                    );
-                                } else {
-                                    let dir = match direction.as_str() {
-                                        "North" => Some(ResizeDirection::North),
-                                        "South" => Some(ResizeDirection::South),
-                                        "East" => Some(ResizeDirection::East),
-                                        "West" => Some(ResizeDirection::West),
-                                        "NorthEast" => Some(ResizeDirection::NorthEast),
-                                        "NorthWest" => Some(ResizeDirection::NorthWest),
-                                        "SouthEast" => Some(ResizeDirection::SouthEast),
-                                        "SouthWest" => Some(ResizeDirection::SouthWest),
-                                        _ => None,
-                                    };
-                                    if let Some(d) = dir {
-                                        let _ = window.drag_resize_window(d);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if st.window.is_maximized() || st.window.fullscreen().is_some()
+                                    {
+                                        st.sync_maximized(true);
+                                    } else {
+                                        let dir = match direction.as_str() {
+                                            "North" => Some(ResizeDirection::North),
+                                            "South" => Some(ResizeDirection::South),
+                                            "East" => Some(ResizeDirection::East),
+                                            "West" => Some(ResizeDirection::West),
+                                            "NorthEast" => Some(ResizeDirection::NorthEast),
+                                            "NorthWest" => Some(ResizeDirection::NorthWest),
+                                            "SouthEast" => Some(ResizeDirection::SouthEast),
+                                            "SouthWest" => Some(ResizeDirection::SouthWest),
+                                            _ => None,
+                                        };
+                                        if let Some(d) = dir {
+                                            let _ = st.window.drag_resize_window(d);
+                                        }
                                     }
                                 }
                             }
                             UiIpcCmd::Minimize => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                window.set_minimized(true);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    st.window.set_minimized(true);
+                                }
                             }
                             UiIpcCmd::ToggleMaximize => {
-                                let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                if prev_fs || window.fullscreen().is_some() {
-                                    html_fullscreen = false;
-                                    user_f11_fullscreen = false;
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.evaluate_script(
-                                            "document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});",
-                                        );
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    let prev_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                                    if prev_fs || st.window.fullscreen().is_some() {
+                                        st.html_fullscreen = false;
+                                        st.user_f11_fullscreen = false;
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.evaluate_script("document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});");
+                                        }
+                                        st.apply_fullscreen(true, false);
+                                    } else {
+                                        st.window.set_maximized(!st.window.is_maximized());
+                                        st.capture_geometry(&cfg_clone, &shared_shell);
+                                        st.sync_maximized(false);
                                     }
-                                    apply_fullscreen_state(
-                                        &window,
-                                        &ui_webview,
-                                        &tab_webviews,
-                                        active_tab_id,
-                                        web_visible,
-                                        overlay_open,
-                                        true,
-                                        false,
-                                        &mut was_maximized_before_fs,
-                                        &mut last_maximized,
-                                    );
-                                } else {
-                                    window.set_maximized(!window.is_maximized());
-                                    capture_window_geometry(&window, &shared_shell);
-                                    sync_maximized_state(
-                                        &window,
-                                        &ui_webview,
-                                        &mut last_maximized,
-                                        false,
-                                    );
                                 }
                             }
                             UiIpcCmd::ToggleFullscreen => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                if prev_fs {
-                                    html_fullscreen = false;
-                                    user_f11_fullscreen = false;
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.evaluate_script(
-                                            "document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});",
-                                        );
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    let prev_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                                    if prev_fs {
+                                        st.html_fullscreen = false;
+                                        st.user_f11_fullscreen = false;
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.evaluate_script("document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});");
+                                        }
+                                    } else {
+                                        st.user_f11_fullscreen = true;
                                     }
-                                } else {
-                                    user_f11_fullscreen = true;
+                                    let next_fs = st.html_fullscreen || st.user_f11_fullscreen;
+                                    st.apply_fullscreen(prev_fs, next_fs);
                                 }
-                                let next_fs = html_fullscreen || user_f11_fullscreen;
-                                apply_fullscreen_state(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    prev_fs,
-                                    next_fs,
-                                    &mut was_maximized_before_fs,
-                                    &mut last_maximized,
-                                );
                             }
                             UiIpcCmd::Close => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                capture_window_geometry(&window, &shared_shell);
-                                let is_private = shared_shell
-                                    .lock()
-                                    .map(|s| s.private_browsing_active)
-                                    .unwrap_or(false);
-                                if !is_private {
-                                    flush_all_media_to_disk(
+                                if let Some(mut st) = windows.remove(&wid) {
+                                    st.close_ext_popup();
+                                    let others_alive = !windows.is_empty();
+                                    persist_window_on_close(
+                                        &st,
+                                        others_alive,
+                                        &cfg_clone,
                                         &shared_shell,
-                                        &tab_last_urls,
-                                        &tab_media_times,
-                                        &tab_scroll_ys,
                                     );
-                                    if history_dirty {
-                                        let shell =
-                                            shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                        let _ = shell.roaming.save_profile();
-                                        history_dirty = false;
-                                    }
-                                    if let Some(any_wv) = tab_webviews.values().next() {
-                                        let _ = run_combined_cookie_hygiene_and_snapshot(
-                                            any_wv,
+                                    drop(st);
+                                    if windows.is_empty() {
+                                        if history_dirty {
+                                            let shell = shared_shell
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            let _ = shell.roaming.save_profile();
+                                            history_dirty = false;
+                                        }
+                                        cef_runtime::run_cookie_hygiene_cef(
                                             &shared_shell,
                                             true,
+                                            true,
+                                            None,
                                         );
+                                        for _ in 0..8 {
+                                            cef_runtime::pump_cef_message_loop();
+                                            std::thread::sleep(Duration::from_millis(8));
+                                        }
+                                        {
+                                            let shell = shared_shell
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            shell.roaming.flush_async_persistence();
+                                            shell.roaming.unregister_live_window();
+                                        }
+                                        drop(incognito_ctx.take());
+                                        drop(cef_guard.take());
+                                        *control_flow = ControlFlow::Exit;
                                     }
                                 }
-                                {
-                                    let mut shell =
-                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                    shell.roaming.flush_async_persistence();
-                                    if !shell.private_browsing_active
-                                        && shell.roaming.profile.restore_session
-                                    {
-                                        shell.roaming.save_window_session_on_close();
-                                    }
-                                    shell.roaming.unregister_live_window();
-                                    shell.roaming.release_ui_webview_slot();
-                                }
-                                *control_flow = ControlFlow::Exit;
                             }
                             UiIpcCmd::NavigateWeb {
                                 tab_id,
                                 url,
                                 overlay_open: ov,
                             } => {
-                                // Strict scheme & authority validation: block file://, javascript://, data://, ms-msdt:, etc.
                                 if parse_http_url_authority(&url).is_err() {
                                     return;
                                 }
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                let tid = if tab_id == 0 { active_tab_id } else { tab_id };
-
-                                // Exit HTML5 fullscreen if navigating to another URL or tab
-                                if html_fullscreen {
-                                    let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                    html_fullscreen = false;
-                                    let next_fs = user_f11_fullscreen;
-                                    if prev_fs && !next_fs {
-                                        window.set_fullscreen(None);
-                                        if was_maximized_before_fs {
-                                            window.set_maximized(true);
-                                        }
-                                        emit_ui_sync(&ui_webview, &serde_json::json!({ "fullscreen": false }));
-                                    }
-                                }
-
-                                // Before switching away from another tab, capture its exact live SPA URL.
-                                if tid != active_tab_id {
-                                    if let Some(prev_wv) = tab_webviews.get(&active_tab_id) {
-                                        if let Some(live_url) = read_live_http_url(prev_wv) {
-                                            tab_last_urls.insert(active_tab_id, live_url.clone());
-                                            emit_ui_sync(
-                                                &ui_webview,
-                                                &serde_json::json!({
-                                                    "tab_id": active_tab_id,
-                                                    "url": live_url
-                                                }),
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Navigating explicitly to a new URL resets any prior video timestamp for this tab.
-                                if tab_last_urls
-                                    .get(&tid)
-                                    .map(|prev| {
-                                        normalize_url_without_media_time(prev)
-                                            != normalize_url_without_media_time(&url)
-                                    })
-                                    .unwrap_or(true)
-                                {
-                                    tab_media_times.remove(&tid);
-                                    tab_scroll_ys.remove(&tid);
-                                }
-
-                                active_tab_id = tid;
-                                web_visible = true;
-                                overlay_open = ov;
-                                tab_last_urls.insert(tid, url.clone());
                                 let is_private = shared_shell
                                     .lock()
                                     .map(|s| s.private_browsing_active)
                                     .unwrap_or(false);
-
-                                if let Some(existing) = tab_webviews.get(&tid) {
-                                    let _ = existing.load_url(&url);
-                                } else if let Ok(new_wv) = spawn_tab_webview_with_env(
-                                    tid,
-                                    &url,
-                                    bind_port,
-                                    &window,
-                                    &mut content_web_context,
-                                    &extensions_dir,
-                                    extensions_need_load,
-                                    is_private,
-                                    None,
-                                    None,
-                                    false,
-                                    &proxy,
-                                    &shared_shell,
-                                    &mut cookies_hydrated,
-                                    |mut b| {
-                                        if let Some(ref env) = shared_content_env {
-                                            b = b.with_environment(Clone::clone(env));
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    let tid = if tab_id == 0 { st.active_tab_id } else { tab_id };
+                                    if st.html_fullscreen {
+                                        st.html_fullscreen = false;
+                                        if !st.user_f11_fullscreen {
+                                            st.apply_fullscreen(true, false);
                                         }
-                                        b
-                                    },
-                                ) {
-                                    if shared_content_env.is_none() {
-                                        shared_content_env = Some(new_wv.environment());
                                     }
-                                    extensions_need_load = false;
-                                    tab_webviews.insert(tid, new_wv);
-                                }
+                                    if tid != st.active_tab_id {
+                                        if let Some(prev_b) = st.tab_browsers.get(&st.active_tab_id)
+                                        {
+                                            if let Some(live_url) = read_live_http_url(prev_b) {
+                                                st.tab_last_urls
+                                                    .insert(st.active_tab_id, live_url.clone());
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": st.active_tab_id,
+                                                        "url": live_url
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if st
+                                        .tab_last_urls
+                                        .get(&tid)
+                                        .map(|prev| {
+                                            normalize_url_without_media_time(prev)
+                                                != normalize_url_without_media_time(&url)
+                                        })
+                                        .unwrap_or(true)
+                                    {
+                                        st.tab_media_times.remove(&tid);
+                                        st.tab_scroll_ys.remove(&tid);
+                                    }
+                                    st.active_tab_id = tid;
+                                    st.web_visible = true;
+                                    st.overlay_open = ov;
+                                    st.tab_last_urls.insert(tid, url.clone());
 
-                                sync_webview_bounds(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    html_fullscreen || user_f11_fullscreen,
-                                );
-                                if web_visible && !overlay_open {
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.focus();
+                                    if let Some(existing) = st.tab_browsers.get(&tid) {
+                                        existing.load_url(&url);
+                                    } else {
+                                        spawn_content_tab_cef(
+                                            wid,
+                                            st,
+                                            tid,
+                                            &url,
+                                            bind_port,
+                                            is_private,
+                                            &mut incognito_ctx,
+                                            None,
+                                            None,
+                                            false,
+                                            &proxy,
+                                            &shared_shell,
+                                            &download_resolver,
+                                        );
                                     }
+                                    st.sync_layout();
+                                    if st.web_visible && !st.overlay_open {
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.focus();
+                                        }
+                                    }
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({
+                                            "tab_id": tid,
+                                            "unloaded": false,
+                                            "ram_active_count": st.tab_browsers.len()
+                                        }),
+                                    );
                                 }
-                                emit_ui_sync(
-                                    &ui_webview,
-                                    &serde_json::json!({
-                                        "tab_id": tid,
-                                        "unloaded": false,
-                                        "ram_active_count": tab_webviews.len()
-                                    }),
-                                );
                             }
                             UiIpcCmd::ActivateTab {
                                 tab_id,
@@ -3426,258 +3402,199 @@ fn run_windows_frameless_browser(
                                 resume_scroll_y,
                                 start_paused,
                             } => {
-                                // Save exact live SPA URL of the tab we are leaving (e.g. YouTube watch?v=...).
-                                if tab_id != active_tab_id {
-                                    if html_fullscreen {
-                                        let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                        html_fullscreen = false;
-                                        let next_fs = user_f11_fullscreen;
-                                        if prev_fs && !next_fs {
-                                            window.set_fullscreen(None);
-                                            if was_maximized_before_fs {
-                                                window.set_maximized(true);
+                                let is_private = shared_shell
+                                    .lock()
+                                    .map(|s| s.private_browsing_active)
+                                    .unwrap_or(false);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if tab_id != st.active_tab_id {
+                                        if st.html_fullscreen {
+                                            st.html_fullscreen = false;
+                                            if !st.user_f11_fullscreen {
+                                                st.apply_fullscreen(true, false);
                                             }
-                                            emit_ui_sync(&ui_webview, &serde_json::json!({ "fullscreen": false }));
+                                        }
+                                        if let Some(prev_b) = st.tab_browsers.get(&st.active_tab_id)
+                                        {
+                                            if let Some(live_url) = read_live_http_url(prev_b) {
+                                                st.tab_last_urls
+                                                    .insert(st.active_tab_id, live_url.clone());
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": st.active_tab_id,
+                                                        "url": live_url
+                                                    }),
+                                                );
+                                            }
                                         }
                                     }
-                                    if let Some(prev_wv) = tab_webviews.get(&active_tab_id) {
-                                        if let Some(live_url) = read_live_http_url(prev_wv) {
-                                            tab_last_urls.insert(active_tab_id, live_url.clone());
-                                            emit_ui_sync(
-                                                &ui_webview,
-                                                &serde_json::json!({
-                                                    "tab_id": active_tab_id,
-                                                    "url": live_url
-                                                }),
+                                    st.active_tab_id = tab_id;
+                                    st.web_visible = wv_vis;
+                                    st.overlay_open = ov;
+
+                                    if st.web_visible {
+                                        if let Some(existing) = st.tab_browsers.get(&tab_id) {
+                                            if let Some(live_url) = read_live_http_url(existing) {
+                                                st.tab_last_urls.insert(tab_id, live_url.clone());
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": tab_id,
+                                                        "url": live_url,
+                                                        "unloaded": false,
+                                                        "ram_active_count": st.tab_browsers.len()
+                                                    }),
+                                                );
+                                            }
+                                        } else if parse_http_url_authority(&url).is_ok() {
+                                            let target_sec = resume_time_sec
+                                                .filter(|&t| t >= 3)
+                                                .or_else(|| {
+                                                    st.tab_media_times
+                                                        .get(&tab_id)
+                                                        .copied()
+                                                        .filter(|&t| t >= 3)
+                                                });
+                                            let target_scroll = resume_scroll_y
+                                                .filter(|&sy| sy >= 40)
+                                                .or_else(|| {
+                                                    st.tab_scroll_ys
+                                                        .get(&tab_id)
+                                                        .copied()
+                                                        .filter(|&sy| sy >= 40)
+                                                });
+                                            st.tab_last_urls.insert(tab_id, url.clone());
+                                            if let Some(t) = target_sec {
+                                                st.tab_media_times.insert(tab_id, t);
+                                            }
+                                            if let Some(sy) = target_scroll {
+                                                st.tab_scroll_ys.insert(tab_id, sy);
+                                            }
+                                            spawn_content_tab_cef(
+                                                wid,
+                                                st,
+                                                tab_id,
+                                                &url,
+                                                bind_port,
+                                                is_private,
+                                                &mut incognito_ctx,
+                                                target_sec,
+                                                target_scroll,
+                                                start_paused,
+                                                &proxy,
+                                                &shared_shell,
+                                                &download_resolver,
                                             );
-                                        }
-                                    }
-                                }
-
-                                active_tab_id = tab_id;
-                                web_visible = wv_vis;
-                                overlay_open = ov;
-
-                                if web_visible {
-                                    if let Some(existing) = tab_webviews.get(&tab_id) {
-                                        // Zero-reload instant tab switch: sync its real live URL to the omnibar.
-                                        if let Some(live_url) = read_live_http_url(existing) {
-                                            tab_last_urls.insert(tab_id, live_url.clone());
                                             emit_ui_sync(
-                                                &ui_webview,
+                                                &st.ui_browser,
                                                 &serde_json::json!({
                                                     "tab_id": tab_id,
-                                                    "url": live_url,
                                                     "unloaded": false,
-                                                    "ram_active_count": tab_webviews.len()
+                                                    "ram_active_count": st.tab_browsers.len()
                                                 }),
                                             );
                                         }
-                                    } else if parse_http_url_authority(&url).is_ok() {
-                                        // Tab was restored from a previous session/power-off or unloaded from RAM:
-                                        // recreate WebView2 cleanly right at its saved video timestamp & scroll offset!
-                                        let is_private = shared_shell
-                                            .lock()
-                                            .map(|s| s.private_browsing_active)
-                                            .unwrap_or(false);
-                                        let target_sec = resume_time_sec
-                                            .filter(|&t| t >= 3)
-                                            .or_else(|| tab_media_times.get(&tab_id).copied().filter(|&t| t >= 3));
-                                        let target_scroll = resume_scroll_y
-                                            .filter(|&sy| sy >= 40)
-                                            .or_else(|| tab_scroll_ys.get(&tab_id).copied().filter(|&sy| sy >= 40));
-                                        tab_last_urls.insert(tab_id, url.clone());
-                                        if let Some(t) = target_sec {
-                                            tab_media_times.insert(tab_id, t);
-                                        }
-                                        if let Some(sy) = target_scroll {
-                                            tab_scroll_ys.insert(tab_id, sy);
-                                        }
-                                        if let Ok(new_wv) = spawn_tab_webview_with_env(
-                                            tab_id,
-                                            &url,
-                                            bind_port,
-                                            &window,
-                                            &mut content_web_context,
-                                            &extensions_dir,
-                                            extensions_need_load,
-                                            is_private,
-                                            target_sec,
-                                            target_scroll,
-                                            start_paused,
-                                            &proxy,
-                                            &shared_shell,
-                                            &mut cookies_hydrated,
-                                            |mut b| {
-                                                if let Some(ref env) = shared_content_env {
-                                                    b = b.with_environment(Clone::clone(env));
-                                                }
-                                                b
-                                            },
-                                        ) {
-                                            if shared_content_env.is_none() {
-                                                shared_content_env = Some(new_wv.environment());
-                                            }
-                                            extensions_need_load = false;
-                                            tab_webviews.insert(tab_id, new_wv);
-                                        }
-                                        emit_ui_sync(
-                                            &ui_webview,
-                                            &serde_json::json!({
-                                                "tab_id": tab_id,
-                                                "unloaded": false,
-                                                "ram_active_count": tab_webviews.len()
-                                            }),
-                                        );
                                     }
-                                }
-
-                                sync_webview_bounds(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    html_fullscreen || user_f11_fullscreen,
-                                );
-                                if web_visible && !overlay_open {
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.focus();
+                                    st.sync_layout();
+                                    if st.web_visible && !st.overlay_open {
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.focus();
+                                        }
                                     }
                                 }
                             }
                             UiIpcCmd::FocusActiveWeb { toggle_media_play } => {
-                                if web_visible && !overlay_open {
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.focus();
-                                        if toggle_media_play {
-                                            let _ = wv.evaluate_script(TOGGLE_ACTIVE_MEDIA_SCRIPT);
+                                if let Some(st) = windows.get(&wid) {
+                                    if st.web_visible && !st.overlay_open {
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.focus();
+                                            if toggle_media_play {
+                                                b.evaluate_script(TOGGLE_ACTIVE_MEDIA_SCRIPT);
+                                            }
                                         }
                                     }
                                 }
                             }
                             UiIpcCmd::CloseTab { tab_id } => {
-                                if tab_id == active_tab_id && html_fullscreen {
-                                    let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                    html_fullscreen = false;
-                                    let next_fs = user_f11_fullscreen;
-                                    if prev_fs && !next_fs {
-                                        window.set_fullscreen(None);
-                                        if was_maximized_before_fs {
-                                            window.set_maximized(true);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if tab_id == st.active_tab_id && st.html_fullscreen {
+                                        st.html_fullscreen = false;
+                                        if !st.user_f11_fullscreen {
+                                            st.apply_fullscreen(true, false);
                                         }
-                                        emit_ui_sync(&ui_webview, &serde_json::json!({ "fullscreen": false }));
                                     }
+                                    st.tab_browsers.remove(&tab_id);
+                                    st.layout_cache.invalidate_tab(Some(tab_id));
+                                    st.tab_last_urls.remove(&tab_id);
+                                    st.tab_media_times.remove(&tab_id);
+                                    st.tab_scroll_ys.remove(&tab_id);
+                                    st.tab_bg_intents.remove(&tab_id);
+                                    st.last_favicon_at.remove(&tab_id);
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({ "ram_active_count": st.tab_browsers.len() }),
+                                    );
                                 }
-                                if let Some(wv) = tab_webviews.remove(&tab_id) {
-                                    let _ = snapshot_and_encrypt_auth_cookies(&wv, &shared_shell);
-                                    drop(wv);
-                                }
-                                tab_last_urls.remove(&tab_id);
-                                tab_media_times.remove(&tab_id);
-                                tab_scroll_ys.remove(&tab_id);
-                                last_favicon_at.remove(&tab_id);
-                                emit_ui_sync(
-                                    &ui_webview,
-                                    &serde_json::json!({ "ram_active_count": tab_webviews.len() }),
-                                );
                             }
                             UiIpcCmd::UnloadTab { tab_id } => {
-                                // Never unload the currently visible foreground tab.
-                                if tab_id == active_tab_id && web_visible && !overlay_open {
-                                    return;
-                                }
-                                if let Some(wv) = tab_webviews.remove(&tab_id) {
-                                    let exact_url = read_live_http_url(&wv)
-                                        .or_else(|| tab_last_urls.get(&tab_id).cloned());
-                                    let _ = snapshot_and_encrypt_auth_cookies(&wv, &shared_shell);
-                                    drop(wv); // Reclaims 100% of this tab's WebView2 renderer RAM.
-                                    let mut payload = serde_json::json!({
-                                        "tab_id": tab_id,
-                                        "unloaded": true,
-                                        "ram_active_count": tab_webviews.len()
-                                    });
-                                    if let Some(u) = exact_url {
-                                        tab_last_urls.insert(tab_id, u.clone());
-                                        payload["url"] = serde_json::Value::String(u);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if tab_id == st.active_tab_id
+                                        && st.web_visible
+                                        && !st.overlay_open
+                                    {
+                                        return;
                                     }
-                                    if let Some(&t) = tab_media_times.get(&tab_id) {
-                                        payload["media_time_sec"] = serde_json::Value::from(t);
+                                    if let Some(b) = st.tab_browsers.remove(&tab_id) {
+                                        let exact_url = read_live_http_url(&b)
+                                            .or_else(|| st.tab_last_urls.get(&tab_id).cloned());
+                                        drop(b); // Force-closes CEF browser & reclaims 100% renderer RAM!
+                                        st.layout_cache.invalidate_tab(Some(tab_id));
+                                        let mut payload = serde_json::json!({
+                                            "tab_id": tab_id,
+                                            "unloaded": true,
+                                            "ram_active_count": st.tab_browsers.len()
+                                        });
+                                        if let Some(u) = exact_url {
+                                            st.tab_last_urls.insert(tab_id, u.clone());
+                                            payload["url"] = serde_json::Value::String(u);
+                                        }
+                                        if let Some(&t) = st.tab_media_times.get(&tab_id) {
+                                            payload["media_time_sec"] = serde_json::Value::from(t);
+                                        }
+                                        emit_ui_sync(&st.ui_browser, &payload);
                                     }
-                                    emit_ui_sync(&ui_webview, &payload);
                                 }
                             }
                             UiIpcCmd::SyncTabUrl { tab_id } => {
-                                if let Some(wv) = tab_webviews.get(&tab_id) {
-                                    if let Some(live_url) = read_live_http_url(wv) {
-                                        let changed = tab_last_urls
-                                            .get(&tab_id)
-                                            .map(|prev| prev != &live_url)
-                                            .unwrap_or(true);
-                                        if changed {
-                                            let nav_changed = tab_last_urls
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&tab_id) {
+                                        if let Some(live_url) = read_live_http_url(b) {
+                                            let changed = st
+                                                .tab_last_urls
                                                 .get(&tab_id)
-                                                .map(|prev| {
-                                                    normalize_url_without_media_time(prev)
-                                                        != normalize_url_without_media_time(
-                                                            &live_url,
-                                                        )
-                                                })
-                                                .unwrap_or(false);
-                                            if nav_changed {
-                                                tab_media_times.remove(&tab_id);
-                                                tab_scroll_ys.remove(&tab_id);
+                                                .map(|prev| prev != &live_url)
+                                                .unwrap_or(true);
+                                            if changed {
+                                                st.tab_last_urls.insert(tab_id, live_url.clone());
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": tab_id,
+                                                        "url": live_url
+                                                    }),
+                                                );
                                             }
-                                            tab_last_urls.insert(tab_id, live_url.clone());
-                                            emit_ui_sync(
-                                                &ui_webview,
-                                                &serde_json::json!({
-                                                    "tab_id": tab_id,
-                                                    "url": live_url
-                                                }),
-                                            );
                                         }
                                     }
                                 }
                             }
                             UiIpcCmd::ReloadExtensions => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                extensions_need_load = true;
-                                // Load newly installed extensions into the shared WebView2 profile immediately
-                                // by instantiating a transient helper WebView when extensions are present.
-                                if has_installed_extensions(&extensions_dir) {
-                                    if let Ok(helper_wv) = spawn_tab_webview_with_env(
-                                        0,
-                                        "about:blank",
-                                        bind_port,
-                                        &window,
-                                        &mut content_web_context,
-                                        &extensions_dir,
-                                        true,
-                                        false,
-                                        None,
-                                        None,
-                                        false,
-                                        &proxy,
-                                        &shared_shell,
-                                        &mut cookies_hydrated,
-                                        |mut b| {
-                                            if let Some(ref env) = shared_content_env {
-                                                b = b.with_environment(Clone::clone(env));
-                                            }
-                                            b
-                                        },
-                                    ) {
-                                        if shared_content_env.is_none() {
-                                            shared_content_env = Some(helper_wv.environment());
-                                        }
-                                        extensions_need_load = false;
-                                        drop(helper_wv);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.reload();
                                     }
-                                }
-                                if let Some(active_wv) = tab_webviews.get(&active_tab_id) {
-                                    let _ = active_wv.reload();
                                 }
                             }
                             UiIpcCmd::ToggleExtensionPopup {
@@ -3688,76 +3605,37 @@ fn run_windows_frameless_browser(
                                 if !extensions::is_valid_extension_dir_id(&ext_id) {
                                     return;
                                 }
-                                // Clicking the same extension icon while its popup is open closes it.
-                                if let Some((open_id, _, _, pwin, pwv)) = ext_popup.take() {
-                                    drop(pwv);
+                                let Some(st) = windows.get_mut(&wid) else {
+                                    return;
+                                };
+                                if let Some((open_id, _, _, pwin, pb)) = st.ext_popup.take() {
+                                    drop(pb);
                                     drop(pwin);
                                     if open_id == ext_id && !open_options {
-                                        last_ext_popup_closed = None;
+                                        st.last_ext_popup_closed = None;
                                         return;
                                     }
                                 }
-                                // Debounce focus-loss auto-close when the user clicked the same toolbar button.
                                 if !open_options {
-                                    if let Some((ref prev_id, at)) = last_ext_popup_closed {
-                                        if prev_id == &ext_id
-                                            && at.elapsed() < std::time::Duration::from_millis(350)
+                                    if let Some((ref prev_id, at)) = st.last_ext_popup_closed {
+                                        if prev_id == &ext_id && at.elapsed() < Duration::from_millis(350)
                                         {
-                                            last_ext_popup_closed = None;
+                                            st.last_ext_popup_closed = None;
                                             return;
                                         }
                                     }
                                 }
-                                last_ext_popup_closed = None;
+                                st.last_ext_popup_closed = None;
 
-                                // Ensure extensions are registered in the shared WebView2 profile before
-                                // opening `chrome-extension://<id>/<popup>` (even on New Tab before any page loads).
-                                if extensions_need_load && has_installed_extensions(&extensions_dir)
-                                {
-                                    if let Ok(helper_wv) = spawn_tab_webview_with_env(
-                                        0,
-                                        "about:blank",
-                                        bind_port,
-                                        &window,
-                                        &mut content_web_context,
-                                        &extensions_dir,
-                                        true,
-                                        false,
-                                        None,
-                                        None,
-                                        false,
-                                        &proxy,
-                                        &shared_shell,
-                                        &mut cookies_hydrated,
-                                        |mut b| {
-                                            if let Some(ref env) = shared_content_env {
-                                                b = b.with_environment(Clone::clone(env));
-                                            }
-                                            b
-                                        },
-                                    ) {
-                                        if shared_content_env.is_none() {
-                                            shared_content_env = Some(helper_wv.environment());
-                                        }
-                                        extensions_need_load = false;
-                                        drop(helper_wv);
-                                    }
-                                }
-
-                                let roaming_root = {
-                                    let shell =
-                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                    shell.roaming.root_dir().to_path_buf()
-                                };
                                 let Some((popup_url, ext_name)) =
                                     extensions::resolve_extension_runtime_url(
-                                        &roaming_root,
+                                        &root_dir,
                                         &ext_id,
                                         open_options,
                                     )
                                 else {
                                     emit_ui_sync(
-                                        &ui_webview,
+                                        &st.ui_browser,
                                         &serde_json::json!({ "ext_popup_fallback": ext_id }),
                                     );
                                     return;
@@ -3768,16 +3646,16 @@ fn run_windows_frameless_browser(
                                 } else {
                                     (400.0_f64, 540.0_f64)
                                 };
-                                let scale = window.scale_factor();
-                                let win_pos = window
+                                let scale = st.window.scale_factor();
+                                let win_pos = st
+                                    .window
                                     .outer_position()
                                     .unwrap_or(TaoPhysicalPosition::new(80, 80));
-                                let win_size = window.inner_size();
+                                let win_size = st.window.inner_size();
                                 let pop_phys_w = (pop_w * scale).round() as i32;
                                 let pop_phys_h = (pop_h * scale).round() as i32;
                                 let bar_phys_h = (APPLE_BAR_LOGICAL_HEIGHT * scale).round() as i32;
                                 let margin = (8.0 * scale).round() as i32;
-
                                 let anchor_phys_x = anchor_x
                                     .map(|ax| (ax * scale).round() as i32)
                                     .unwrap_or(
@@ -3790,8 +3668,7 @@ fn run_windows_frameless_browser(
                                         .max(min_x);
                                 let mut px = raw_x.clamp(min_x, max_x);
                                 let mut py = win_pos.y + bar_phys_h + (4.0 * scale).round() as i32;
-
-                                if let Some(mon) = window.current_monitor() {
+                                if let Some(mon) = st.window.current_monitor() {
                                     let mpos = mon.position();
                                     let msize = mon.size();
                                     let mon_max_x =
@@ -3807,7 +3684,7 @@ fn run_windows_frameless_browser(
                                 let popup_title = format!("{} — Singularity", ext_name);
                                 let Ok(popup_win) = WindowBuilder::new()
                                     .with_title(&popup_title)
-                                    .with_owner_window(window.hwnd())
+                                    .with_owner_window(st.window.hwnd())
                                     .with_decorations(open_options)
                                     .with_undecorated_shadow(true)
                                     .with_skip_taskbar(true)
@@ -3818,7 +3695,7 @@ fn run_windows_frameless_browser(
                                     .build(elwt)
                                 else {
                                     emit_ui_sync(
-                                        &ui_webview,
+                                        &st.ui_browser,
                                         &serde_json::json!({ "ext_popup_fallback": ext_id }),
                                     );
                                     return;
@@ -3826,63 +3703,37 @@ fn run_windows_frameless_browser(
                                 enable_win32_immersive_dark_window(
                                     popup_win.hwnd() as *mut core::ffi::c_void,
                                 );
-
                                 let pphys = popup_win.inner_size();
-                                let close_proxy = proxy.clone();
-                                let newwin_proxy = proxy.clone();
-                                let mut popup_builder = WebViewBuilder::new_with_web_context(
-                                    &mut content_web_context,
-                                )
-                                .with_bounds(Rect {
-                                    position: PhysicalPosition::new(0, 0).into(),
-                                    size: PhysicalSize::new(
-                                        pphys.width.max(1),
-                                        pphys.height.max(1),
-                                    )
-                                    .into(),
-                                })
-                                .with_background_color((16, 17, 22, 255))
-                                .with_browser_extensions_enabled(true)
-                                .with_additional_browser_args(CONTENT_BROWSER_ARGS)
-                                .with_initialization_script(EXT_POPUP_INIT_SCRIPT)
-                                .with_ipc_handler(move |req: wry::http::Request<String>| {
-                                    if req.body().contains("close_ext_popup") {
-                                        let _ = close_proxy
-                                            .send_event(WinEvent::CloseExtensionPopup);
-                                    }
-                                })
-                                .with_new_window_req_handler(move |new_url, _| {
-                                    if new_url.starts_with("chrome-extension://") {
-                                        return NewWindowResponse::Allow;
-                                    }
-                                    if parse_http_url_authority(&new_url).is_ok() {
-                                        let _ = newwin_proxy.send_event(WinEvent::OpenNewTab {
-                                            url: new_url,
-                                            title: None,
-                                            background: false,
-                                        });
-                                    }
-                                    NewWindowResponse::Deny
-                                })
-                                .with_url(&popup_url);
-                                if let Some(ref env) = shared_content_env {
-                                    popup_builder = popup_builder.with_environment(Clone::clone(env));
-                                }
-                                let build_popup_wv = popup_builder.build_as_child(&popup_win);
-
-                                if let Ok(popup_wv) = build_popup_wv {
-                                    if shared_content_env.is_none() {
-                                        shared_content_env = Some(popup_wv.environment());
-                                    }
-                                    let _ = popup_wv.set_theme(Theme::Dark);
-                                    let _ = popup_wv.focus();
+                                let pop_proxy = proxy.clone();
+                                let pop_sink: CefEventSink = Arc::new(move |evt| {
+                                    let _ = pop_proxy.send_event(WinEvent::CefCallback(wid, evt));
+                                });
+                                if let Ok(popup_b) = cef_runtime::spawn_cef_child_browser(
+                                    popup_win.hwnd(),
+                                    0,
+                                    0,
+                                    pphys.width.max(1),
+                                    pphys.height.max(1),
+                                    &popup_url,
+                                    false,
+                                    true,
+                                    0,
+                                    bind_port,
+                                    Some(EXT_POPUP_INIT_SCRIPT),
+                                    None,
+                                    None,
+                                    pop_sink,
+                                    Arc::clone(&shared_shell),
+                                    Arc::clone(&download_resolver),
+                                ) {
+                                    popup_b.focus();
                                     let pid = popup_win.id();
-                                    ext_popup =
-                                        Some((ext_id, pid, !open_options, popup_win, popup_wv));
+                                    st.ext_popup =
+                                        Some((ext_id, pid, !open_options, popup_win, popup_b));
                                 } else {
                                     drop(popup_win);
                                     emit_ui_sync(
-                                        &ui_webview,
+                                        &st.ui_browser,
                                         &serde_json::json!({ "ext_popup_fallback": ext_id }),
                                     );
                                 }
@@ -3896,254 +3747,181 @@ fn run_windows_frameless_browser(
                                 if !extensions::is_valid_extension_dir_id(&ext_id) {
                                     return;
                                 }
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
                                 let is_fr = lang.as_deref().map(|l| l == "fr").unwrap_or_else(|| {
                                     shared_shell
                                         .lock()
                                         .map(|s| s.roaming.profile.language == "fr")
                                         .unwrap_or(false)
                                 });
-                                let hwnd = window.hwnd() as *mut core::ffi::c_void;
-                                if let Some(action) = show_native_extension_context_menu(
-                                    hwnd,
-                                    has_popup,
-                                    has_options,
-                                    is_fr,
-                                ) {
-                                    if action == "manage_ext" {
-                                        let _ = ui_webview.focus();
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    let hwnd = st.window.hwnd() as *mut core::ffi::c_void;
+                                    if let Some(action) = show_native_extension_context_menu(
+                                        hwnd,
+                                        has_popup,
+                                        has_options,
+                                        is_fr,
+                                    ) {
+                                        if action == "manage_ext" {
+                                            st.ui_browser.focus();
+                                        }
+                                        emit_ui_sync(
+                                            &st.ui_browser,
+                                            &serde_json::json!({
+                                                "ext_ctx_action": action,
+                                                "ext_ctx_id": ext_id
+                                            }),
+                                        );
                                     }
-                                    emit_ui_sync(
-                                        &ui_webview,
-                                        &serde_json::json!({
-                                            "ext_ctx_action": action,
-                                            "ext_ctx_id": ext_id
-                                        }),
-                                    );
                                 }
                             }
                             UiIpcCmd::SetViewMode {
                                 web_visible: wv_vis,
                                 overlay_open: ov,
                             } => {
-                                web_visible = wv_vis;
-                                overlay_open = ov;
-                                if (!web_visible || overlay_open) && html_fullscreen {
-                                    let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                    html_fullscreen = false;
-                                    let next_fs = user_f11_fullscreen;
-                                    if prev_fs && !next_fs {
-                                        window.set_fullscreen(None);
-                                        if was_maximized_before_fs {
-                                            window.set_maximized(true);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.web_visible = wv_vis;
+                                    st.overlay_open = ov;
+                                    if (!st.web_visible || st.overlay_open) && st.html_fullscreen {
+                                        st.html_fullscreen = false;
+                                        if !st.user_f11_fullscreen {
+                                            st.apply_fullscreen(true, false);
                                         }
-                                        emit_ui_sync(&ui_webview, &serde_json::json!({ "fullscreen": false }));
                                     }
-                                }
-                                // Do NOT destroy active tab WebView when switching to a New Tab or opening Settings!
-                                sync_webview_bounds(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    html_fullscreen || user_f11_fullscreen,
-                                );
-                                if web_visible && !overlay_open {
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.focus();
+                                    st.sync_layout();
+                                    if st.web_visible && !st.overlay_open {
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.focus();
+                                        }
                                     }
                                 }
                             }
                             UiIpcCmd::SetOverlay { open } => {
-                                overlay_open = open;
-                                if overlay_open {
-                                    close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                }
-                                if overlay_open && html_fullscreen {
-                                    let prev_fs = html_fullscreen || user_f11_fullscreen;
-                                    html_fullscreen = false;
-                                    let next_fs = user_f11_fullscreen;
-                                    if prev_fs && !next_fs {
-                                        window.set_fullscreen(None);
-                                        if was_maximized_before_fs {
-                                            window.set_maximized(true);
-                                        }
-                                        emit_ui_sync(&ui_webview, &serde_json::json!({ "fullscreen": false }));
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.overlay_open = open;
+                                    if st.overlay_open {
+                                        st.close_ext_popup();
                                     }
-                                }
-                                sync_webview_bounds(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    html_fullscreen || user_f11_fullscreen,
-                                );
-                                if web_visible && !overlay_open {
-                                    if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                        let _ = wv.focus();
+                                    if st.overlay_open && st.html_fullscreen {
+                                        st.html_fullscreen = false;
+                                        if !st.user_f11_fullscreen {
+                                            st.apply_fullscreen(true, false);
+                                        }
+                                    }
+                                    st.sync_layout();
+                                    if st.web_visible && !st.overlay_open {
+                                        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                            b.focus();
+                                        }
                                     }
                                 }
                             }
                             UiIpcCmd::SetPrivateMode { enabled } => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                // Use native WebView2 InPrivate isolation (`with_incognito`) instead of
-                                // EVER wiping the normal persistent profile's cookies & tokens!
                                 if enabled {
-                                    if let Some(any_wv) = tab_webviews.values().next() {
-                                        let _ = snapshot_and_encrypt_auth_cookies(
-                                            any_wv,
-                                            &shared_shell,
-                                        );
-                                    }
+                                    cef_runtime::run_cookie_hygiene_cef(
+                                        &shared_shell,
+                                        false,
+                                        true,
+                                        None,
+                                    );
                                 }
                                 {
                                     let mut shell =
                                         shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                                     shell.private_browsing_active = enabled;
                                 }
-                                // Drop open tab WebViews from the previous mode so subsequent tabs
-                                // spawn cleanly in InPrivate (or back in normal persistent profile)
-                                // without touching a single cookie or token on disk.
-                                let active_url = tab_last_urls.get(&active_tab_id).cloned();
-                                let active_sec = tab_media_times.get(&active_tab_id).copied();
-                                let active_sy = tab_scroll_ys.get(&active_tab_id).copied();
-                                tab_webviews.clear();
-                                invalidate_tab_layout_cache(None);
-                                if web_visible {
-                                    if let Some(u) = active_url.filter(|u| parse_http_url_authority(u).is_ok()) {
-                                        if let Ok(new_wv) = spawn_tab_webview_with_env(
-                                            active_tab_id,
-                                            &u,
-                                            bind_port,
-                                            &window,
-                                            &mut content_web_context,
-                                            &extensions_dir,
-                                            extensions_need_load,
-                                            enabled,
-                                            active_sec,
-                                            active_sy,
-                                            false,
-                                            &proxy,
-                                            &shared_shell,
-                                            &mut cookies_hydrated,
-                                            |mut b| {
-                                                if let Some(ref env) = shared_content_env {
-                                                    b = b.with_environment(Clone::clone(env));
-                                                }
-                                                b
-                                            },
-                                        ) {
-                                            if shared_content_env.is_none() {
-                                                shared_content_env = Some(new_wv.environment());
-                                            }
-                                            extensions_need_load = false;
-                                            tab_webviews.insert(active_tab_id, new_wv);
+                                if !enabled {
+                                    incognito_ctx = None;
+                                }
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    let active_url = st.tab_last_urls.get(&st.active_tab_id).cloned();
+                                    let active_sec = st.tab_media_times.get(&st.active_tab_id).copied();
+                                    let active_sy = st.tab_scroll_ys.get(&st.active_tab_id).copied();
+                                    let active_tid = st.active_tab_id;
+                                    st.tab_browsers.clear();
+                                    st.layout_cache.invalidate_tab(None);
+                                    if st.web_visible {
+                                        if let Some(u) = active_url
+                                            .filter(|u| parse_http_url_authority(u).is_ok())
+                                        {
+                                            spawn_content_tab_cef(
+                                                wid,
+                                                st,
+                                                active_tid,
+                                                &u,
+                                                bind_port,
+                                                enabled,
+                                                &mut incognito_ctx,
+                                                active_sec,
+                                                active_sy,
+                                                false,
+                                                &proxy,
+                                                &shared_shell,
+                                                &download_resolver,
+                                            );
                                         }
                                     }
+                                    st.sync_layout();
                                 }
-                                sync_webview_bounds(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    html_fullscreen || user_f11_fullscreen,
-                                );
                             }
                             UiIpcCmd::WebBack => {
-                                if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                    let _ = wv.evaluate_script("history.back();");
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.go_back();
+                                    }
                                 }
                             }
                             UiIpcCmd::WebForward => {
-                                if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                    let _ = wv.evaluate_script("history.forward();");
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.go_forward();
+                                    }
                                 }
                             }
                             UiIpcCmd::WebReload => {
-                                if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                    let _ = wv.reload();
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.reload();
+                                    }
                                 }
                             }
                             UiIpcCmd::SyncTokens => {
-                                let updated = tab_webviews
-                                    .values()
-                                    .next()
-                                    .map(|wv| snapshot_and_encrypt_auth_cookies(wv, &shared_shell))
-                                    .unwrap_or(0);
-                                bump_state_revision();
-                                emit_ui_sync(
-                                    &ui_webview,
-                                    &serde_json::json!({ "tokens_synced": updated }),
+                                let done_proxy = proxy.clone();
+                                cef_runtime::run_cookie_hygiene_cef(
+                                    &shared_shell,
+                                    false,
+                                    true,
+                                    Some(Arc::new(move |tr, ad, mal, synced| {
+                                        let _ = done_proxy.send_event(WinEvent::CookieHygieneDone {
+                                            win_id: wid,
+                                            mode: "sync_tokens",
+                                            trackers: tr,
+                                            ads: ad,
+                                            malicious: mal,
+                                            synced,
+                                        });
+                                    })),
                                 );
                             }
                             UiIpcCmd::PurgeProviderTokens { target } => {
-                                if let Some(any_wv) = tab_webviews.values().next() {
-                                    if let Ok(all_cookies) = any_wv.cookies() {
-                                        for c in all_cookies {
-                                            let dom = c.domain().unwrap_or("");
-                                            if let Some(prov) = classify_auth_cookie(dom, c.name()) {
-                                                let cid =
-                                                    format!("{}::{}::{}", prov, dom, c.name());
-                                                if target.eq_ignore_ascii_case("ALL")
-                                                    || prov.eq_ignore_ascii_case(&target)
-                                                    || cid == target
-                                                {
-                                                    let _ = any_wv.delete_cookie(&c);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                cef_runtime::purge_provider_cookies_cef(&target);
                                 {
                                     let mut shell =
                                         shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                                     let _ = shell.roaming.remove_tokens_by_provider_or_id(&target);
                                 }
                                 bump_state_revision();
-                                emit_ui_sync(
-                                    &ui_webview,
-                                    &serde_json::json!({ "tokens_purged": true }),
-                                );
+                                if let Some(st) = windows.get(&wid) {
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({ "tokens_purged": true }),
+                                    );
+                                }
                             }
                             UiIpcCmd::ClearBrowsingData { clear_tokens } => {
                                 if clear_tokens {
-                                    // Explicit full logout / reset requested by user.
-                                    if let Some(any_wv) = tab_webviews.values().next() {
-                                        let _ = any_wv.clear_all_browsing_data();
-                                    } else if let Ok(helper_wv) = spawn_tab_webview_with_env(
-                                        0,
-                                        "about:blank",
-                                        bind_port,
-                                        &window,
-                                        &mut content_web_context,
-                                        &extensions_dir,
-                                        false,
-                                        false,
-                                        None,
-                                        None,
-                                        false,
-                                        &proxy,
-                                        &shared_shell,
-                                        &mut cookies_hydrated,
-                                        |mut b| {
-                                            if let Some(ref env) = shared_content_env {
-                                                b = b.with_environment(Clone::clone(env));
-                                            }
-                                            b
-                                        },
-                                    ) {
-                                        if shared_content_env.is_none() {
-                                            shared_content_env = Some(helper_wv.environment());
-                                        }
-                                        let _ = helper_wv.clear_all_browsing_data();
-                                        drop(helper_wv);
-                                    }
+                                    cef_runtime::clear_all_cookies_cef();
                                     {
                                         let mut shell =
                                             shared_shell.lock().unwrap_or_else(|e| e.into_inner());
@@ -4154,64 +3932,33 @@ fn run_windows_frameless_browser(
                                     history_dirty = false;
                                     last_history_disk_flush = std::time::Instant::now();
                                     bump_state_revision();
-                                    emit_ui_sync(
-                                        &ui_webview,
-                                        &serde_json::json!({
-                                            "browsing_cleared": true,
-                                            "mode": "full_reset"
-                                        }),
-                                    );
-                                } else {
-                                    // Surgical tracker, ad & malicious cookie cleaner:
-                                    // NEVER calls `clear_all_browsing_data()`; preserves 100% of
-                                    // user tokens, login sessions, consent & functional cookies!
-                                    let (tr, ad, mal) = if let Some(any_wv) =
-                                        tab_webviews.values().next()
-                                    {
-                                        purge_tracker_and_malicious_cookies(any_wv, &shared_shell)
-                                    } else if let Ok(helper_wv) = spawn_tab_webview_with_env(
-                                        0,
-                                        "about:blank",
-                                        bind_port,
-                                        &window,
-                                        &mut content_web_context,
-                                        &extensions_dir,
-                                        false,
-                                        false,
-                                        None,
-                                        None,
-                                        false,
-                                        &proxy,
-                                        &shared_shell,
-                                        &mut cookies_hydrated,
-                                        |mut b| {
-                                            if let Some(ref env) = shared_content_env {
-                                                b = b.with_environment(Clone::clone(env));
-                                            }
-                                            b
-                                        },
-                                    ) {
-                                        if shared_content_env.is_none() {
-                                            shared_content_env = Some(helper_wv.environment());
-                                        }
-                                        let res = purge_tracker_and_malicious_cookies(
-                                            &helper_wv,
-                                            &shared_shell,
+                                    if let Some(st) = windows.get(&wid) {
+                                        emit_ui_sync(
+                                            &st.ui_browser,
+                                            &serde_json::json!({
+                                                "browsing_cleared": true,
+                                                "mode": "full_reset"
+                                            }),
                                         );
-                                        drop(helper_wv);
-                                        res
-                                    } else {
-                                        (0, 0, 0)
-                                    };
-                                    emit_ui_sync(
-                                        &ui_webview,
-                                        &serde_json::json!({
-                                            "browsing_cleared": true,
-                                            "mode": "trackers_only",
-                                            "trackers_removed": tr,
-                                            "ads_removed": ad,
-                                            "malicious_removed": mal
-                                        }),
+                                    }
+                                } else {
+                                    let done_proxy = proxy.clone();
+                                    cef_runtime::run_cookie_hygiene_cef(
+                                        &shared_shell,
+                                        true,
+                                        false,
+                                        Some(Arc::new(move |tr, ad, mal, synced| {
+                                            let _ = done_proxy.send_event(
+                                                WinEvent::CookieHygieneDone {
+                                                    win_id: wid,
+                                                    mode: "trackers_only",
+                                                    trackers: tr,
+                                                    ads: ad,
+                                                    malicious: mal,
+                                                    synced,
+                                                },
+                                            );
+                                        })),
                                     );
                                 }
                             }
@@ -4219,7 +3966,25 @@ fn run_windows_frameless_browser(
                                 reveal_download_in_explorer(&path);
                             }
                             UiIpcCmd::OpenNewWindow => {
-                                let _ = spawn_detached_singularity_window(None);
+                                let sid = crate::roaming_store::RoamingSingularityStore::new_window_session_id();
+                                let sess = WindowTabSession {
+                                    is_secondary_live_window: true,
+                                    ..Default::default()
+                                };
+                                if let Ok((nwid, nst)) = create_browser_window(
+                                    elwt,
+                                    bind_port,
+                                    &cfg_clone,
+                                    &shared_shell,
+                                    &proxy,
+                                    &download_resolver,
+                                    sid,
+                                    sess,
+                                    None,
+                                ) {
+                                    bring_win32_window_to_front(nst.window.hwnd());
+                                    windows.insert(nwid, nst);
+                                }
                             }
                             UiIpcCmd::DetachTab {
                                 tab_id,
@@ -4232,133 +3997,191 @@ fn run_windows_frameless_browser(
                                 target_window_id,
                                 is_only_tab,
                             } => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                // Prefer live exact SPA URL & video timestamp from WebView2 when loaded
-                                let live_url = tab_webviews
-                                    .get(&tab_id)
-                                    .and_then(read_live_http_url)
-                                    .or_else(|| {
-                                        let trimmed = url.trim();
-                                        let is_settings = trimmed == "singularity://settings"
-                                            || (trimmed.starts_with("singularity://settings/")
-                                                && trimmed.len() <= 64
-                                                && trimmed["singularity://settings/".len()..]
-                                                    .bytes()
-                                                    .all(|b| {
-                                                        b.is_ascii_alphanumeric()
-                                                            || b == b'-'
-                                                            || b == b'_'
-                                                    }));
-                                        if parse_http_url_authority(trimmed).is_ok() || is_settings
-                                        {
-                                            Some(trimmed.to_string())
-                                        } else {
-                                            None
-                                        }
+                                let Some((live_url, live_sec, live_sy, clean_favicon, win_outer)) =
+                                    windows.get_mut(&wid).map(|st| {
+                                        st.close_ext_popup();
+                                        let lu = st
+                                            .tab_browsers
+                                            .get(&tab_id)
+                                            .and_then(read_live_http_url)
+                                            .or_else(|| {
+                                                let trimmed = url.trim();
+                                                let is_settings = trimmed
+                                                    == "singularity://settings"
+                                                    || (trimmed
+                                                        .starts_with("singularity://settings/")
+                                                        && trimmed.len() <= 64
+                                                        && trimmed["singularity://settings/".len()..]
+                                                            .bytes()
+                                                            .all(|b| {
+                                                                b.is_ascii_alphanumeric()
+                                                                    || b == b'-'
+                                                                    || b == b'_'
+                                                            }));
+                                                if parse_http_url_authority(trimmed).is_ok()
+                                                    || is_settings
+                                                {
+                                                    Some(trimmed.to_string())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or_default();
+                                        let ls = st
+                                            .tab_media_times
+                                            .get(&tab_id)
+                                            .copied()
+                                            .or(media_time_sec)
+                                            .filter(|&s| s >= 2);
+                                        let lsy = st
+                                            .tab_scroll_ys
+                                            .get(&tab_id)
+                                            .copied()
+                                            .or(scroll_y)
+                                            .filter(|&y| y > 0);
+                                        let cf = favicon_url.and_then(|u| {
+                                            let t = u.trim();
+                                            if t.len() <= 512 && parse_http_url_authority(t).is_ok()
+                                            {
+                                                Some(t.to_string())
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        let outer = st.window.outer_position().ok();
+                                        (lu, ls, lsy, cf, outer)
                                     })
-                                    .unwrap_or_default();
-                                let live_sec = tab_media_times
-                                    .get(&tab_id)
-                                    .copied()
-                                    .or(media_time_sec)
-                                    .filter(|&s| s >= 2);
-                                let live_sy = tab_scroll_ys
-                                    .get(&tab_id)
-                                    .copied()
-                                    .or(scroll_y)
-                                    .filter(|&y| y > 0);
-                                let clean_favicon = favicon_url.and_then(|u| {
-                                    let t = u.trim();
-                                    if t.len() <= 512 && parse_http_url_authority(t).is_ok() {
-                                        Some(t.to_string())
-                                    } else {
-                                        None
-                                    }
-                                });
-
-                                let (cur_x, cur_y) = get_win32_cursor_pos();
-                                let peers = {
-                                    let shell =
-                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                    shell.roaming.list_other_live_windows()
+                                else {
+                                    return;
                                 };
 
-                                // 1. Check if explicitly moving to a chosen peer window or dropped on one!
-                                let target_peer = if let Some(ref wanted_id) = target_window_id {
-                                    peers.iter().find(|p| &p.window_id == wanted_id).cloned()
+                                let (cur_x, cur_y) = get_win32_cursor_pos();
+                                let target_wid = if let Some(ref wanted_sid) = target_window_id {
+                                    windows
+                                        .iter()
+                                        .find(|(&id, s)| id != wid && &s.session_id == wanted_sid)
+                                        .map(|(&id, _)| id)
                                 } else if !force_new_window {
-                                    find_peer_window_at_point(&peers, cur_x, cur_y)
+                                    find_peer_in_process_window(&windows, wid, cur_x, cur_y)
                                 } else {
                                     None
                                 };
 
-                                let payload = TabHandoffPayload {
-                                    url: live_url,
-                                    title: title.chars().take(180).collect(),
-                                    favicon_url: clean_favicon,
-                                    media_time_sec: live_sec,
-                                    scroll_y: live_sy,
-                                    pos_x: if force_new_window {
-                                        window.outer_position().ok().map(|p| p.x + 36)
-                                    } else {
-                                        Some(cur_x.saturating_sub(180))
-                                    },
-                                    pos_y: if force_new_window {
-                                        window.outer_position().ok().map(|p| p.y + 36)
-                                    } else {
-                                        Some(cur_y.saturating_sub(24).max(0))
-                                    },
-                                };
-
-                                let transferred = if let Some(peer) = target_peer {
-                                    send_adopt_tab_to_peer(&peer, &payload)
+                                let mut transferred = false;
+                                if let Some(twid) = target_wid {
+                                    if let Some(target_st) = windows.get(&twid) {
+                                        bring_win32_window_to_front(target_st.window.hwnd());
+                                        emit_ui_sync(
+                                            &target_st.ui_browser,
+                                            &serde_json::json!({
+                                                "adopt_external_tab": {
+                                                    "url": live_url,
+                                                    "title": title.chars().take(180).collect::<String>(),
+                                                    "favicon_url": clean_favicon,
+                                                    "media_time_sec": live_sec,
+                                                    "scroll_y": live_sy
+                                                }
+                                            }),
+                                        );
+                                        transferred = true;
+                                    }
                                 } else if is_only_tab && !force_new_window {
-                                    // Dragging the only tab onto desktop smoothly repositions this window!
-                                    if window.is_maximized() {
-                                        window.set_maximized(false);
+                                    if let Some(st) = windows.get(&wid) {
+                                        if st.window.is_maximized() {
+                                            st.window.set_maximized(false);
+                                        }
+                                        st.window.set_outer_position(TaoPhysicalPosition::new(
+                                            cur_x.saturating_sub(180),
+                                            cur_y.saturating_sub(24).max(0),
+                                        ));
                                     }
-                                    window.set_outer_position(TaoPhysicalPosition::new(
-                                        cur_x.saturating_sub(180),
-                                        cur_y.saturating_sub(24).max(0),
-                                    ));
-                                    false
                                 } else {
-                                    let handoff_res = {
-                                        let shell =
-                                            shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                        shell.roaming.write_detach_handoff(&payload)
+                                    // Instant in-process torn-off window (zero new OS process!)
+                                    let drop_pos = if force_new_window {
+                                        win_outer.map(|p| (p.x + 36, p.y + 36))
+                                    } else {
+                                        Some((
+                                            cur_x.saturating_sub(180),
+                                            cur_y.saturating_sub(24).max(0),
+                                        ))
                                     };
-                                    match handoff_res {
-                                        Ok(hid) => spawn_detached_singularity_window(Some(&hid)),
-                                        Err(_) => false,
+                                    let mut detached_tabs = Vec::new();
+                                    if !live_url.is_empty() {
+                                        detached_tabs.push(SavedTabEntry {
+                                            title: if title.trim().is_empty() {
+                                                live_url.clone()
+                                            } else {
+                                                title.trim().chars().take(180).collect()
+                                            },
+                                            url: live_url,
+                                            media_time_sec: live_sec,
+                                            scroll_y: live_sy,
+                                            group_id: None,
+                                            favicon_url: clean_favicon,
+                                        });
                                     }
-                                };
+                                    let new_sid = crate::roaming_store::RoamingSingularityStore::new_window_session_id();
+                                    let new_sess = WindowTabSession {
+                                        saved_tabs: detached_tabs,
+                                        saved_tab_groups: Vec::new(),
+                                        active_tab_index: 0,
+                                        geometry: WindowGeometry::default(),
+                                        is_detached_handoff: true,
+                                        is_secondary_live_window: true,
+                                        restored_windows_count: 0,
+                                    };
+                                    if let Ok((nwid, nst)) = create_browser_window(
+                                        elwt,
+                                        bind_port,
+                                        &cfg_clone,
+                                        &shared_shell,
+                                        &proxy,
+                                        &download_resolver,
+                                        new_sid,
+                                        new_sess,
+                                        drop_pos,
+                                    ) {
+                                        bring_win32_window_to_front(nst.window.hwnd());
+                                        windows.insert(nwid, nst);
+                                        transferred = true;
+                                    }
+                                }
 
                                 if transferred {
-                                    if let Some(wv) = tab_webviews.remove(&tab_id) {
-                                        let _ = snapshot_and_encrypt_auth_cookies(&wv, &shared_shell);
-                                        drop(wv);
-                                    }
-                                    invalidate_tab_layout_cache(Some(tab_id));
-                                    tab_last_urls.remove(&tab_id);
-                                    tab_media_times.remove(&tab_id);
-                                    tab_scroll_ys.remove(&tab_id);
-                                    last_favicon_at.remove(&tab_id);
                                     if is_only_tab {
-                                        let mut shell =
-                                            shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                        // Drain pending background writes BEFORE deleting this window's session!
-                                        shell.roaming.flush_async_persistence();
-                                        shell.roaming.delete_window_session();
-                                        shell.roaming.unregister_live_window();
-                                        shell.roaming.release_ui_webview_slot();
-                                        *control_flow = ControlFlow::Exit;
-                                    } else {
+                                        if let Some(st) = windows.remove(&wid) {
+                                            if let Ok(mut map) = cfg_clone.window_sessions.lock() {
+                                                map.remove(&st.session_id);
+                                            }
+                                            {
+                                                let shell = shared_shell
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                shell.roaming.flush_async_persistence();
+                                                shell
+                                                    .roaming
+                                                    .delete_window_session_for(&st.session_id);
+                                            }
+                                            drop(st);
+                                        }
+                                        if windows.is_empty() {
+                                            drop(incognito_ctx.take());
+                                            drop(cef_guard.take());
+                                            *control_flow = ControlFlow::Exit;
+                                        }
+                                    } else if let Some(st) = windows.get_mut(&wid) {
+                                        st.tab_browsers.remove(&tab_id);
+                                        st.layout_cache.invalidate_tab(Some(tab_id));
+                                        st.tab_last_urls.remove(&tab_id);
+                                        st.tab_media_times.remove(&tab_id);
+                                        st.tab_scroll_ys.remove(&tab_id);
+                                        st.tab_bg_intents.remove(&tab_id);
+                                        st.last_favicon_at.remove(&tab_id);
                                         emit_ui_sync(
-                                            &ui_webview,
+                                            &st.ui_browser,
                                             &serde_json::json!({
                                                 "tab_detached": tab_id,
-                                                "ram_active_count": tab_webviews.len()
+                                                "ram_active_count": st.tab_browsers.len()
                                             }),
                                         );
                                     }
@@ -4375,448 +4198,70 @@ fn run_windows_frameless_browser(
                                 groups,
                                 lang,
                             } => {
-                                close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                                let (is_fr, other_windows) = {
-                                    let shell =
-                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                    let fr = lang
-                                        .as_deref()
-                                        .map(|l| l == "fr")
-                                        .unwrap_or_else(|| shell.roaming.profile.language == "fr");
-                                    let peers = if kind == "tab" {
-                                        shell.roaming.list_other_live_windows()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    (fr, peers)
+                                let is_fr = lang.as_deref().map(|l| l == "fr").unwrap_or_else(|| {
+                                    shared_shell
+                                        .lock()
+                                        .map(|s| s.roaming.profile.language == "fr")
+                                        .unwrap_or(false)
+                                });
+                                let other_window_ids: Vec<String> = if kind == "tab" {
+                                    windows
+                                        .iter()
+                                        .filter(|(&id, _)| id != wid)
+                                        .map(|(_, s)| s.session_id.clone())
+                                        .collect()
+                                } else {
+                                    Vec::new()
                                 };
-                                let hwnd = window.hwnd() as *mut core::ffi::c_void;
-                                if let Some((action, target_id)) = show_native_tab_context_menu(
-                                    hwnd,
-                                    &kind,
-                                    tab_in_group,
-                                    can_reopen,
-                                    is_unloaded,
-                                    group_collapsed,
-                                    &groups,
-                                    &other_windows,
-                                    is_fr,
-                                ) {
+                                let menu_result = windows.get_mut(&wid).and_then(|st| {
+                                    st.close_ext_popup();
+                                    let hwnd = st.window.hwnd() as *mut core::ffi::c_void;
+                                    show_native_tab_context_menu(
+                                        hwnd,
+                                        &kind,
+                                        tab_in_group,
+                                        can_reopen,
+                                        is_unloaded,
+                                        group_collapsed,
+                                        &groups,
+                                        &other_window_ids,
+                                        is_fr,
+                                    )
+                                });
+                                if let Some((action, target_id)) = menu_result {
                                     if action == "new_window" {
-                                        let _ = spawn_detached_singularity_window(None);
+                                        let _ = proxy.send_event(WinEvent::OpenNewWindowInProcess);
                                         return;
                                     }
-                                    if matches!(
-                                        action,
-                                        "edit_group"
-                                            | "add_to_new_group"
-                                            | "new_group_empty"
-                                            | "new_tab"
-                                            | "new_tab_right"
-                                            | "new_tab_in_group"
-                                            | "open_settings"
-                                    ) {
-                                        let _ = ui_webview.focus();
+                                    if let Some(st) = windows.get(&wid) {
+                                        if matches!(
+                                            action,
+                                            "edit_group"
+                                                | "add_to_new_group"
+                                                | "new_group_empty"
+                                                | "new_tab"
+                                                | "new_tab_right"
+                                                | "new_tab_in_group"
+                                                | "open_settings"
+                                        ) {
+                                            st.ui_browser.focus();
+                                        }
+                                        emit_ui_sync(
+                                            &st.ui_browser,
+                                            &serde_json::json!({
+                                                "ctx_action": action,
+                                                "ctx_tab_id": tab_id,
+                                                "ctx_group_id": group_id,
+                                                "ctx_target_group_id": if action == "add_to_group" { target_id.as_deref() } else { None },
+                                                "ctx_target_window_id": if action == "move_tab_to_window" { target_id.as_deref() } else { None }
+                                            }),
+                                        );
                                     }
-                                    emit_ui_sync(
-                                        &ui_webview,
-                                        &serde_json::json!({
-                                            "ctx_action": action,
-                                            "ctx_tab_id": tab_id,
-                                            "ctx_group_id": group_id,
-                                            "ctx_target_group_id": if action == "add_to_group" { target_id.as_deref() } else { None },
-                                            "ctx_target_window_id": if action == "move_tab_to_window" { target_id.as_deref() } else { None }
-                                        }),
-                                    );
                                 }
                             }
                         }
                     }
-                }
-                WinEvent::CloseExtensionPopup => {
-                    close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                }
-                WinEvent::WebFullscreen { tab_id, enabled } => {
-                    if enabled && (tab_id != active_tab_id || !web_visible || overlay_open) {
-                        return;
-                    }
-                    if enabled {
-                        close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                    }
-                    let prev_fs = html_fullscreen || user_f11_fullscreen;
-                    html_fullscreen = enabled;
-                    let next_fs = html_fullscreen || user_f11_fullscreen;
-                    apply_fullscreen_state(
-                        &window,
-                        &ui_webview,
-                        &tab_webviews,
-                        active_tab_id,
-                        web_visible,
-                        overlay_open,
-                        prev_fs,
-                        next_fs,
-                        &mut was_maximized_before_fs,
-                        &mut last_maximized,
-                    );
-                }
-                WinEvent::WebPageStarted(tab_id, url) => {
-                    if tab_id == 0 {
-                        return;
-                    }
-                    if tab_last_urls
-                        .get(&tab_id)
-                        .map(|prev| {
-                            normalize_url_without_media_time(prev)
-                                != normalize_url_without_media_time(&url)
-                        })
-                        .unwrap_or(false)
-                    {
-                        tab_media_times.remove(&tab_id);
-                        tab_scroll_ys.remove(&tab_id);
-                    }
-                    tab_last_urls.insert(tab_id, url.clone());
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({ "tab_id": tab_id, "url": url }),
-                    );
-                }
-                WinEvent::WebPageFinished(tab_id, url) => {
-                    if tab_id == 0 {
-                        return;
-                    }
-                    let final_url = tab_webviews
-                        .get(&tab_id)
-                        .and_then(read_live_http_url)
-                        .unwrap_or(url);
-                    tab_last_urls.insert(tab_id, final_url.clone());
-                    let is_private = shared_shell
-                        .lock()
-                        .map(|s| s.private_browsing_active)
-                        .unwrap_or(false);
-                    let cookie_hygiene_due = last_cookie_hygiene_at
-                        .map(|t| t.elapsed() >= std::time::Duration::from_secs(90))
-                        .unwrap_or(true);
-                    let synced = if cookie_hygiene_due {
-                        if let Some(wv) = tab_webviews.get(&tab_id) {
-                            last_cookie_hygiene_at = Some(std::time::Instant::now());
-                            run_combined_cookie_hygiene_and_snapshot(wv, &shared_shell, !is_private)
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    if synced > 0 {
-                        bump_state_revision();
-                    }
-                    if !is_private {
-                        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                        shell.roaming.record_history_in_memory("", &final_url);
-                        history_dirty = true;
-                        if last_history_disk_flush.elapsed() >= std::time::Duration::from_secs(10) {
-                            shell.roaming.schedule_save_profile();
-                            history_dirty = false;
-                            last_history_disk_flush = std::time::Instant::now();
-                        }
-                    }
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "tab_id": tab_id,
-                            "url": final_url,
-                            "tokens_synced": synced
-                        }),
-                    );
-                }
-                WinEvent::WebTitleChanged(tab_id, title) => {
-                    if tab_id == 0 {
-                        return;
-                    }
-                    // Crucial for SPAs (YouTube, Twitch, GitHub, Discord): read the EXACT live URL
-                    // from WebView2 right when document.title changes!
-                    let live_url = tab_webviews
-                        .get(&tab_id)
-                        .and_then(read_live_http_url)
-                        .or_else(|| tab_last_urls.get(&tab_id).cloned());
-                    if let Some(ref u) = live_url {
-                        if tab_last_urls
-                            .get(&tab_id)
-                            .map(|prev| {
-                                normalize_url_without_media_time(prev)
-                                    != normalize_url_without_media_time(u)
-                            })
-                            .unwrap_or(false)
-                        {
-                            tab_media_times.remove(&tab_id);
-                            tab_scroll_ys.remove(&tab_id);
-                        }
-                        tab_last_urls.insert(tab_id, u.clone());
-                        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                        if !shell.private_browsing_active {
-                            shell.roaming.record_history_in_memory(&title, u);
-                            history_dirty = true;
-                            if last_history_disk_flush.elapsed()
-                                >= std::time::Duration::from_secs(10)
-                            {
-                                shell.roaming.schedule_save_profile();
-                                history_dirty = false;
-                                last_history_disk_flush = std::time::Instant::now();
-                            }
-                        }
-                    }
-                    let mut payload = serde_json::json!({
-                        "tab_id": tab_id,
-                        "title": title
-                    });
-                    if let Some(u) = live_url {
-                        payload["url"] = serde_json::Value::String(u);
-                    }
-                    emit_ui_sync(&ui_webview, &payload);
-                }
-                WinEvent::WebFavicon {
-                    tab_id,
-                    favicon_url,
-                } => {
-                    if tab_id == 0 {
-                        return;
-                    }
-                    // Rate-limit per-tab favicon IPC updates to prevent hostile page flooding
-                    let now = std::time::Instant::now();
-                    if let Some(prev) = last_favicon_at.get(&tab_id) {
-                        if now.duration_since(*prev) < std::time::Duration::from_millis(1000) {
-                            return;
-                        }
-                    }
-                    last_favicon_at.insert(tab_id, now);
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "tab_id": tab_id,
-                            "favicon_url": favicon_url
-                        }),
-                    );
-                }
-                WinEvent::WebShortcut {
-                    tab_id,
-                    action,
-                    index,
-                } => {
-                    // Only honor shortcuts originating from the active visible tab + 80ms flood guard
-                    if tab_id != active_tab_id || !web_visible || overlay_open {
-                        return;
-                    }
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_shortcut_at) < std::time::Duration::from_millis(80) {
-                        return;
-                    }
-                    last_shortcut_at = now;
-
-                    match action.as_str() {
-                        "new_window" => {
-                            let _ = spawn_detached_singularity_window(None);
-                            return;
-                        }
-                        "toggle_fullscreen" => {
-                            close_ext_popup(&mut ext_popup, &mut last_ext_popup_closed);
-                            let prev_fs = html_fullscreen || user_f11_fullscreen;
-                            if prev_fs {
-                                html_fullscreen = false;
-                                user_f11_fullscreen = false;
-                                if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                    let _ = wv.evaluate_script(
-                                        "document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});",
-                                    );
-                                }
-                            } else {
-                                user_f11_fullscreen = true;
-                            }
-                            let next_fs = html_fullscreen || user_f11_fullscreen;
-                            apply_fullscreen_state(
-                                &window,
-                                &ui_webview,
-                                &tab_webviews,
-                                active_tab_id,
-                                web_visible,
-                                overlay_open,
-                                prev_fs,
-                                next_fs,
-                                &mut was_maximized_before_fs,
-                                &mut last_maximized,
-                            );
-                            return;
-                        }
-                        "web_back" => {
-                            if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                let _ = wv.evaluate_script("history.back();");
-                            }
-                            return;
-                        }
-                        "web_forward" => {
-                            if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                let _ = wv.evaluate_script("history.forward();");
-                            }
-                            return;
-                        }
-                        "reload_tab" => {
-                            if let Some(wv) = tab_webviews.get(&active_tab_id) {
-                                let _ = wv.reload();
-                                return;
-                            }
-                        }
-                        "focus_omnibar" | "new_tab" | "open_settings" | "open_history" => {
-                            if html_fullscreen || user_f11_fullscreen {
-                                let prev_fs = true;
-                                html_fullscreen = false;
-                                user_f11_fullscreen = false;
-                                apply_fullscreen_state(
-                                    &window,
-                                    &ui_webview,
-                                    &tab_webviews,
-                                    active_tab_id,
-                                    web_visible,
-                                    overlay_open,
-                                    prev_fs,
-                                    false,
-                                    &mut was_maximized_before_fs,
-                                    &mut last_maximized,
-                                );
-                            }
-                            let _ = ui_webview.focus();
-                        }
-                        _ => {}
-                    }
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "shortcut": action,
-                            "shortcut_index": index
-                        }),
-                    );
-                }
-                WinEvent::WebMediaProgress {
-                    tab_id,
-                    time_sec,
-                    scroll_y,
-                } => {
-                    if tab_id == 0 {
-                        return;
-                    }
-                    // SECURITY: Always derive the URL from WebView2's own trusted navigation state,
-                    // NEVER from untrusted webpage IPC payloads (blocks omnibar spoofing).
-                    let Some(trusted_url) = tab_webviews
-                        .get(&tab_id)
-                        .and_then(read_live_http_url)
-                        .or_else(|| tab_last_urls.get(&tab_id).cloned())
-                    else {
-                        return;
-                    };
-                    if time_sec >= 2 {
-                        tab_media_times.insert(tab_id, time_sec);
-                    }
-                    if scroll_y > 0 {
-                        tab_scroll_ys.insert(tab_id, scroll_y);
-                    }
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "tab_id": tab_id,
-                            "media_time_sec": time_sec,
-                            "scroll_y": scroll_y
-                        }),
-                    );
-                    // Zero-stall background persistence every >= 6s so abrupt power-off never loses
-                    // video playback timestamps without ever stalling the UI thread!
-                    if last_media_disk_flush.elapsed() >= std::time::Duration::from_secs(6) {
-                        let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                        if !shell.private_browsing_active
-                            && shell.roaming.profile.restore_session
-                            && shell.roaming.update_saved_tab_media_progress(
-                                &trusted_url,
-                                time_sec,
-                                scroll_y,
-                            )
-                        {
-                            shell.roaming.schedule_save_profile();
-                            history_dirty = false;
-                            last_history_disk_flush = std::time::Instant::now();
-                            last_media_disk_flush = std::time::Instant::now();
-                        }
-                    }
-                }
-                WinEvent::OpenNewTab {
-                    url,
-                    title,
-                    background,
-                } => {
-                    let mut payload = serde_json::json!({
-                        "new_tab_url": url,
-                        "new_tab_background": background
-                    });
-                    if let Some(t) = title {
-                        payload["new_tab_title"] = serde_json::Value::String(t);
-                    }
-                    emit_ui_sync(&ui_webview, &payload);
-                }
-                WinEvent::AdoptExternalTab(handoff) => {
-                    bring_win32_window_to_front(window.hwnd());
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "adopt_external_tab": {
-                                "url": handoff.url,
-                                "title": handoff.title,
-                                "favicon_url": handoff.favicon_url,
-                                "media_time_sec": handoff.media_time_sec,
-                                "scroll_y": handoff.scroll_y
-                            }
-                        }),
-                    );
-                }
-                WinEvent::DownloadStarted { filename, path } => {
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "download_started": {
-                                "filename": filename,
-                                "path": path
-                            }
-                        }),
-                    );
-                }
-                WinEvent::DownloadCompleted {
-                    filename,
-                    path,
-                    success,
-                } => {
-                    emit_ui_sync(
-                        &ui_webview,
-                        &serde_json::json!({
-                            "download_completed": {
-                                "filename": filename,
-                                "path": path,
-                                "success": success
-                            }
-                        }),
-                    );
-                }
-                WinEvent::UiStartupWatchdog => {
-                    if !ui_ready_received {
-                        let fresh_nonce = watchdog_cfg.mint_recovery_bootstrap_nonce();
-                        let fresh_url = format!("http://127.0.0.1:{}/?boot={}", bind_port, fresh_nonce);
-                        let _ = ui_webview.load_url(&fresh_url);
-                        invalidate_ui_layout_cache();
-                        sync_webview_bounds(
-                            &window,
-                            &ui_webview,
-                            &tab_webviews,
-                            active_tab_id,
-                            web_visible,
-                            overlay_open,
-                            html_fullscreen || user_f11_fullscreen,
-                        );
-                        let _ = ui_webview.focus();
-                    }
-                }
+                },
             },
             _ => {}
         }
@@ -4833,7 +4278,7 @@ pub fn is_safe_launch_url(url: &str) -> bool {
         .any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'|' | b'^' | b'`'))
 }
 
-/// Fallback browser launcher when native WebView2 runtime is unavailable or on non-Windows OSes.
+/// Fallback browser launcher when native CEF runtime is unavailable or on non-Windows OSes.
 pub fn launch_native_chromium_window(app_url: &str) {
     if !is_safe_launch_url(app_url) {
         return;
@@ -4877,9 +4322,8 @@ pub fn launch_native_chromium_window(app_url: &str) {
     #[cfg(target_os = "windows")]
     {
         let win_candidates = [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
         ];
         for exe in win_candidates {
@@ -5317,6 +4761,43 @@ fn dispatch_http_request(
                 shell.roaming.root_dir(),
                 &shell.roaming.profile.pinned_extensions,
             );
+            let win_sess = req
+                .headers
+                .get("x-singularity-window")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(|wid| {
+                    cfg.window_sessions
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(wid).cloned())
+                });
+            let (
+                saved_tabs,
+                saved_tab_groups,
+                active_tab_index,
+                restored_windows_count,
+                is_secondary_live_window,
+                is_detached_handoff,
+            ) = if let Some(sess) = win_sess {
+                (
+                    sess.saved_tabs,
+                    sess.saved_tab_groups,
+                    sess.active_tab_index,
+                    sess.restored_windows_count,
+                    sess.is_secondary_live_window,
+                    sess.is_detached_handoff,
+                )
+            } else {
+                (
+                    shell.roaming.profile.saved_tabs.clone(),
+                    shell.roaming.profile.saved_tab_groups.clone(),
+                    shell.roaming.profile.active_tab_index,
+                    shell.roaming.restored_windows_count,
+                    shell.roaming.is_secondary_live_window,
+                    shell.roaming.startup_handoff.is_some(),
+                )
+            };
 
             let dto = serde_json::json!({
                 "rev": cur_rev,
@@ -5332,13 +4813,13 @@ fn dispatch_http_request(
                 "tab_unload_custom_minutes": shell.roaming.profile.tab_unload_custom_minutes,
                 "tab_unload_effective_seconds": shell.roaming.effective_tab_unload_seconds(),
                 "extensions": installed_exts,
-                "saved_tabs": shell.roaming.profile.saved_tabs,
-                "saved_tab_groups": shell.roaming.profile.saved_tab_groups,
+                "saved_tabs": saved_tabs,
+                "saved_tab_groups": saved_tab_groups,
                 "merged_windows_count": shell.roaming.merged_windows_count,
-                "restored_windows_count": shell.roaming.restored_windows_count,
-                "is_secondary_live_window": shell.roaming.is_secondary_live_window,
-                "is_detached_handoff": shell.roaming.startup_handoff.is_some(),
-                "active_tab_index": shell.roaming.profile.active_tab_index,
+                "restored_windows_count": restored_windows_count,
+                "is_secondary_live_window": is_secondary_live_window,
+                "is_detached_handoff": is_detached_handoff,
+                "active_tab_index": active_tab_index,
                 "private_browsing": shell.private_browsing_active,
                 "bookmarks": shell.roaming.profile.bookmarks,
                 "mullvad_authenticated": shell.core.mullvad_vpn.is_authenticated(),
@@ -5806,10 +5287,44 @@ fn dispatch_http_request(
                         .map(|i| i as usize)
                         .unwrap_or(0)
                         .min(clean_tabs.len().saturating_sub(1));
-                    shell.roaming.profile.saved_tabs = clean_tabs;
-                    shell.roaming.profile.saved_tab_groups = clean_groups;
-                    shell.roaming.profile.active_tab_index = active_idx;
-                    shell.roaming.schedule_save_profile();
+                    let req_win_id = req
+                        .headers
+                        .get("x-singularity-window")
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    if let Some(wid) = req_win_id {
+                        let geom = if let Ok(mut map) = cfg.window_sessions.lock() {
+                            let entry = map.entry(wid.clone()).or_default();
+                            entry.saved_tabs = clean_tabs.clone();
+                            entry.saved_tab_groups = clean_groups.clone();
+                            entry.active_tab_index = active_idx;
+                            entry.geometry
+                        } else {
+                            WindowGeometry::default()
+                        };
+                        if !shell.private_browsing_active && shell.roaming.profile.restore_session {
+                            let _ = shell.roaming.save_window_session_for(
+                                &wid,
+                                &clean_tabs,
+                                &clean_groups,
+                                active_idx,
+                                geom,
+                                true,
+                                false,
+                            );
+                        }
+                        if shell.roaming.window_id() == wid {
+                            shell.roaming.profile.saved_tabs = clean_tabs;
+                            shell.roaming.profile.saved_tab_groups = clean_groups;
+                            shell.roaming.profile.active_tab_index = active_idx;
+                            shell.roaming.schedule_save_profile();
+                        }
+                    } else {
+                        shell.roaming.profile.saved_tabs = clean_tabs;
+                        shell.roaming.profile.saved_tab_groups = clean_groups;
+                        shell.roaming.profile.active_tab_index = active_idx;
+                        shell.roaming.schedule_save_profile();
+                    }
                 }
             }
             HttpResponse::json_bytes("200 OK", b"{\"ok\":true}")

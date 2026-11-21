@@ -135,24 +135,45 @@ fn main() {
     if args.iter().any(|a| a == "--verify-only") {
         assert!(
             EMBEDDED_SINGULARITY_EXE.len() > 512 * 1024,
-            "Embedded singularity.exe payload looks truncated"
+            "Embedded singularity payload looks truncated"
         );
         assert!(
             EMBEDDED_SINGULARITY_ICO.len() > 4096,
             "Embedded singularity.ico looks truncated"
         );
-        println!(
-            "[OK] Singularity-Setup v{} (Pure Native Win32) verified — singularity.exe = {:.2} MB, icon = {} KB",
-            APP_VERSION,
-            EMBEDDED_SINGULARITY_EXE.len() as f64 / (1024.0 * 1024.0),
-            EMBEDDED_SINGULARITY_ICO.len() / 1024
-        );
+        if EMBEDDED_SINGULARITY_EXE.starts_with(b"PK\x03\x04") {
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(EMBEDDED_SINGULARITY_EXE))
+                .expect("Embedded ZIP bundle is corrupted");
+            assert!(
+                archive.by_name("singularity.exe").is_ok(),
+                "Embedded ZIP bundle missing singularity.exe"
+            );
+            assert!(
+                archive.by_name("libcef.dll").is_ok(),
+                "Embedded ZIP bundle missing libcef.dll"
+            );
+            println!(
+                "[OK] Singularity-Setup v{} (Pure Native Win32 + Pure Chromium CEF) verified — bundle = {:.2} MB ({} files), icon = {} KB",
+                APP_VERSION,
+                EMBEDDED_SINGULARITY_EXE.len() as f64 / (1024.0 * 1024.0),
+                archive.len(),
+                EMBEDDED_SINGULARITY_ICO.len() / 1024
+            );
+        } else {
+            println!(
+                "[OK] Singularity-Setup v{} (Pure Native Win32) verified — payload = {:.2} MB, icon = {} KB",
+                APP_VERSION,
+                EMBEDDED_SINGULARITY_EXE.len() as f64 / (1024.0 * 1024.0),
+                EMBEDDED_SINGULARITY_ICO.len() / 1024
+            );
+        }
         return;
     }
 
     let silent = args
         .iter()
         .any(|a| a == "--silent" || a.eq_ignore_ascii_case("/s") || a == "--quiet");
+    let launch_flag = args.iter().any(|a| a == "--launch");
 
     let mut custom_dir: Option<String> = None;
     for i in 1..args.len() {
@@ -168,7 +189,7 @@ fn main() {
             desktop_shortcut: true,
             start_menu_shortcut: true,
             init_roaming_vault: true,
-            launch_after_install: false,
+            launch_after_install: launch_flag,
         };
         let progress = Arc::new(Mutex::new(SharedProgress {
             phase: InstallPhase::Idle,
@@ -242,7 +263,11 @@ fn perform_installation<F: Fn()>(
     );
 
     #[cfg(target_os = "windows")]
-    win32_ops::terminate_running_singularity(&exe_path);
+    {
+        win32_ops::terminate_running_singularity(&exe_path);
+        // Allow Windows to release DLL/EXE file locks after subprocess teardown
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 
     std::fs::create_dir_all(&target_dir).map_err(|e| {
         format!(
@@ -251,27 +276,96 @@ fn perform_installation<F: Fn()>(
         )
     })?;
 
-    // Chunked write so UI progress updates smoothly in real time without ever stalling
-    let extract_label = format!("Extracting native browser {}...", exe_name);
-    set_step(progress, 24.0, &extract_label, &notify);
-    {
-        let mut file = std::fs::File::create(&exe_path).map_err(|e| {
-            format!(
-                "Failed to write '{}' (close Singularity if it is open): {e}",
-                exe_path.display()
-            )
-        })?;
-        let total = EMBEDDED_SINGULARITY_EXE.len().max(1);
-        let chunk_size = 131_072; // 128 KB
-        let mut written = 0usize;
-        for chunk in EMBEDDED_SINGULARITY_EXE.chunks(chunk_size) {
-            file.write_all(chunk)
-                .map_err(|e| format!("Disk write error: {e}"))?;
-            written += chunk.len();
-            let pct = 24.0 + (written as f32 / total as f32) * 44.0;
-            set_step(progress, pct, &extract_label, &notify);
+    // Remove legacy v1.0.x WebView2Loader.dll if upgrading in-place
+    let _ = std::fs::remove_file(target_dir.join("WebView2Loader.dll"));
+
+    // Extract Pure Chromium CEF ZIP bundle or fallback single binary with real-time progress
+    if EMBEDDED_SINGULARITY_EXE.starts_with(b"PK\x03\x04") {
+        set_step(
+            progress,
+            24.0,
+            "Extracting Singularity + Pure Chromium runtime...",
+            &notify,
+        );
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(EMBEDDED_SINGULARITY_EXE))
+            .map_err(|e| format!("Corrupted embedded Chromium bundle: {e}"))?;
+        let mut total_uncompressed: u64 = 0;
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index(i) {
+                total_uncompressed = total_uncompressed.saturating_add(entry.size());
+            }
         }
-        let _ = file.flush();
+        let total_uncompressed = total_uncompressed.max(1);
+        let mut written_total: u64 = 0;
+        let mut buf = vec![0u8; 131_072];
+
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("Failed reading bundle entry #{i}: {e}"))?;
+            let Some(rel_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let out_path = target_dir.join(&rel_path);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path).map_err(|e| {
+                    format!("Failed to create directory '{}': {e}", out_path.display())
+                })?;
+                continue;
+            }
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create directory '{}': {e}", parent.display())
+                })?;
+            }
+            let display_name = rel_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("runtime");
+            let step_lbl = format!("Extracting Pure Chromium ({display_name})...");
+            let mut out_file = std::fs::File::create(&out_path).map_err(|e| {
+                format!(
+                    "Failed to write '{}' (close Singularity if it is open): {e}",
+                    out_path.display()
+                )
+            })?;
+            loop {
+                let n = std::io::Read::read(&mut entry, &mut buf)
+                    .map_err(|e| format!("Decompression error on '{display_name}': {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                out_file
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("Disk write error on '{display_name}': {e}"))?;
+                written_total = written_total.saturating_add(n as u64);
+                let pct = 24.0 + (written_total as f32 / total_uncompressed as f32).min(1.0) * 48.0;
+                set_step(progress, pct, &step_lbl, &notify);
+            }
+            let _ = out_file.flush();
+        }
+    } else {
+        let extract_label = format!("Extracting native browser {}...", exe_name);
+        set_step(progress, 24.0, &extract_label, &notify);
+        {
+            let mut file = std::fs::File::create(&exe_path).map_err(|e| {
+                format!(
+                    "Failed to write '{}' (close Singularity if it is open): {e}",
+                    exe_path.display()
+                )
+            })?;
+            let total = EMBEDDED_SINGULARITY_EXE.len().max(1);
+            let chunk_size = 131_072; // 128 KB
+            let mut written = 0usize;
+            for chunk in EMBEDDED_SINGULARITY_EXE.chunks(chunk_size) {
+                file.write_all(chunk)
+                    .map_err(|e| format!("Disk write error: {e}"))?;
+                written += chunk.len();
+                let pct = 24.0 + (written as f32 / total as f32) * 48.0;
+                set_step(progress, pct, &extract_label, &notify);
+            }
+            let _ = file.flush();
+        }
     }
 
     let _ = std::fs::write(&ico_path, EMBEDDED_SINGULARITY_ICO);
@@ -294,14 +388,14 @@ fn perform_installation<F: Fn()>(
             &notify,
         );
         let roaming = roaming_singularity_dir();
-        let engine_dir = roaming.join("browser-engine");
+        let cef_dir = roaming.join("cef-profile");
         let _ = std::fs::create_dir_all(&roaming);
-        let _ = std::fs::create_dir_all(&engine_dir);
+        let _ = std::fs::create_dir_all(&cef_dir);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&roaming, std::fs::Permissions::from_mode(0o700));
-            let _ = std::fs::set_permissions(&engine_dir, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&cef_dir, std::fs::Permissions::from_mode(0o700));
         }
         let readme_sec = roaming.join("SECURITY-README.txt");
         if !readme_sec.exists() {
@@ -2210,7 +2304,7 @@ mod win32_gui {
             mem_dc,
             f_sub,
             c_muted,
-            "Native Rust desktop browser with WebView2 rendering, built-in ad & tracker shield, Argon2id vault, and DPAPI-encrypted sessions.",
+            "Native Rust desktop browser with Pure Chromium (CEF), built-in ad & tracker shield, Argon2id vault, and DPAPI-encrypted sessions.",
             RectF {
                 x0: hx0,
                 y0: lay.logo_rect.y0 + 30.0 * s,

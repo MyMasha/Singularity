@@ -7,6 +7,14 @@ use singularity_ui::{
 };
 
 fn main() {
+    // 0. Pure Chromium (CEF) multi-process entry point: renderer, GPU, network, and utility
+    //    subprocesses re-execute `singularity.exe --type=...` and MUST return immediately here
+    //    before any CLI handling, roaming store access, or window creation.
+    #[cfg(target_os = "windows")]
+    if let Some(exit_code) = singularity_ui::cef_runtime::maybe_run_cef_subprocess() {
+        std::process::exit(exit_code);
+    }
+
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("Singularity Browser v{}", env!("CARGO_PKG_VERSION"));
         return;

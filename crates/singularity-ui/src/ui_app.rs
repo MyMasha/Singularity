@@ -1996,15 +1996,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <div class="ram-mode-grid" id="tuto-ram-grid">
           <button type="button" class="ram-mode-btn" data-ram-mode="low" onclick="selectRamMode('low')">
             <span class="ram-mode-title">Low</span>
-            <span class="ram-mode-desc" data-i18n="ram_low_short">Keep nearly all (7d)</span>
+            <span class="ram-mode-desc" data-i18n="ram_low_short">Unload after 2h</span>
           </button>
           <button type="button" class="ram-mode-btn selected" data-ram-mode="medium" onclick="selectRamMode('medium')">
             <span class="ram-mode-title">Medium</span>
-            <span class="ram-mode-desc" data-i18n="ram_med_short">Unload after 24h</span>
+            <span class="ram-mode-desc" data-i18n="ram_med_short">Unload after 15 min</span>
           </button>
           <button type="button" class="ram-mode-btn" data-ram-mode="hard" onclick="selectRamMode('hard')">
             <span class="ram-mode-title">Hard</span>
-            <span class="ram-mode-desc" data-i18n="ram_hard_short">Unload after 1h30</span>
+            <span class="ram-mode-desc" data-i18n="ram_hard_short">Unload after 3 min</span>
           </button>
           <button type="button" class="ram-mode-btn" data-ram-mode="custom" onclick="selectRamMode('custom')">
             <span class="ram-mode-title" data-i18n="ram_custom_title">Custom</span>
@@ -2081,7 +2081,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v1.0.5</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.0</div>
         </div>
       </aside>
 
@@ -2153,16 +2153,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div class="ram-mode-grid" id="ram-mode-grid">
             <button type="button" class="ram-mode-btn" data-ram-mode="low" onclick="selectRamMode('low')">
-              <span class="ram-mode-title" data-i18n="ram_low_title">Low</span>
-              <span class="ram-mode-desc" data-i18n="ram_low_desc">Keep nearly everything in RAM (unload after 7 days).</span>
+              <span class="ram-mode-title" data-i18n="ram_low_title">Low (2h)</span>
+              <span class="ram-mode-desc" data-i18n="ram_low_desc">Keep more tabs in RAM (unload after 2h).</span>
             </button>
             <button type="button" class="ram-mode-btn selected" data-ram-mode="medium" onclick="selectRamMode('medium')">
-              <span class="ram-mode-title" data-i18n="ram_med_title">Medium (24h)</span>
-              <span class="ram-mode-desc" data-i18n="ram_med_desc">Balanced: keep tabs live in memory for 24h.</span>
+              <span class="ram-mode-title" data-i18n="ram_med_title">Medium (15 min)</span>
+              <span class="ram-mode-desc" data-i18n="ram_med_desc">Balanced: unload idle tabs after 15 min (max 6 background).</span>
             </button>
             <button type="button" class="ram-mode-btn" data-ram-mode="hard" onclick="selectRamMode('hard')">
-              <span class="ram-mode-title" data-i18n="ram_hard_title">Hard (1h30)</span>
-              <span class="ram-mode-desc" data-i18n="ram_hard_desc">Aggressive: unload inactive sites after 1h30.</span>
+              <span class="ram-mode-title" data-i18n="ram_hard_title">Hard (3 min)</span>
+              <span class="ram-mode-desc" data-i18n="ram_hard_desc">Ultra-low RAM: unload idle tabs after 3 min (max 3 background).</span>
             </button>
             <button type="button" class="ram-mode-btn" data-ram-mode="custom" onclick="selectRamMode('custom')">
               <span class="ram-mode-title" data-i18n="ram_custom_title">Custom</span>
@@ -2171,20 +2171,20 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div id="ram-custom-row" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
             <span style="font-size:12px;color:var(--text-secondary);" data-i18n="ram_unload_after">Unload after:</span>
-            <input id="ram-custom-val" class="text-field" style="width:90px;text-align:right;font-family:var(--font-mono);" type="number" min="1" max="43200" value="2" />
+            <input id="ram-custom-val" class="text-field" style="width:90px;text-align:right;font-family:var(--font-mono);" type="number" min="1" max="43200" value="15" />
             <select id="ram-custom-unit" class="engine-pill-select" style="height:32px;">
-              <option value="minutes" data-i18n="unit_minutes">minutes</option>
-              <option value="hours" selected data-i18n="unit_hours">hours</option>
+              <option value="minutes" selected data-i18n="unit_minutes">minutes</option>
+              <option value="hours" data-i18n="unit_hours">hours</option>
             </select>
             <button type="button" class="btn-gold" style="height:30px;padding:0 12px;" data-i18n="btn_apply" onclick="saveCustomRamDelay()">Apply</button>
             <span style="font-size:11px;color:var(--text-muted);" data-i18n="ram_presets">Presets:</span>
+            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(3)">3 min</button>
             <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(15)">15 min</button>
             <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(60)">1 h</button>
             <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(120)">2 h</button>
-            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(360)">6 h</button>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;">
-            <span style="font-size:11.5px;color:var(--text-muted);" id="ram-effective-label">Active mode: Medium (24h)</span>
+            <span style="font-size:11.5px;color:var(--text-muted);" id="ram-effective-label">Active mode: Medium (15 min)</span>
             <button type="button" class="btn-subtle" data-i18n="btn_unload_now" onclick="unloadInactiveTabsNow()">Unload inactive tabs now</button>
           </div>
         </div>
@@ -2232,7 +2232,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <div class="info-card">
           <div class="card-label" data-i18n="ext_install_title">Install a Chrome Extension (Chrome Web Store)</div>
           <div style="font-size:12px;color:var(--text-secondary);">
-            <span data-i18n="ext_install_desc">Paste a Chrome Web Store URL or 32-letter extension ID: Singularity downloads the official .crx package, verifies it, and loads it natively in WebView2</span> (<span class="mono-val" id="ext-dir-path">—</span>).
+            <span data-i18n="ext_install_desc">Paste a Chrome Web Store URL or 32-letter extension ID: Singularity downloads the official .crx package, verifies it, and loads it natively in Pure Chromium</span> (<span class="mono-val" id="ext-dir-path">—</span>).
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px;">
             <input id="ext-store-input" class="text-field" style="flex:1;min-width:260px;" type="text"
@@ -2436,8 +2436,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
    * AUTHENTICATED LOOPBACK IPC CLIENT (PER-SESSION 256-BIT TOKEN + POST JSON)
    * ============================================================================ */
   const SINGULARITY_IPC_TOKEN = "__SINGULARITY_IPC_TOKEN__";
+  const WINDOW_SESSION_ID = (() => {
+    try {
+      return new URLSearchParams(window.location.search || "").get("win") || "";
+    } catch (_) {
+      return "";
+    }
+  })();
   try {
-    if (window.location && String(window.location.search || "").includes("boot=")) {
+    const qs = String((window.location && window.location.search) || "");
+    if (qs.includes("boot=") || qs.includes("win=")) {
       window.history.replaceState(null, "", "/");
     }
   } catch (_) {}
@@ -2447,6 +2455,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const headers = Object.assign({}, o.headers || {}, {
       "X-Singularity-Token": SINGULARITY_IPC_TOKEN
     });
+    if (WINDOW_SESSION_ID) {
+      headers["X-Singularity-Window"] = WINDOW_SESSION_ID;
+    }
     o.headers = headers;
     return fetch(url, o);
   }
@@ -2460,7 +2471,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   /* ============================================================================
-   * NATIVE IPC BRIDGE (TAO + WRY FRAMELESS WINDOW & DUAL-WEBVIEW ENGINE)
+   * NATIVE IPC BRIDGE (TAO + PURE CHROMIUM CEF SINGLE-PROCESS SHELL)
    * ============================================================================ */
   function hasNativeIpc() {
     return !!(window.ipc && typeof window.ipc.postMessage === "function");
@@ -2544,9 +2555,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tuto2_sub: "Personnalisez votre moteur par défaut et la mise en veille automatique des onglets inactifs.",
     tuto2_engine_label: "Moteur de recherche par défaut",
     tuto2_ram_label: "Déchargement RAM des onglets inactifs",
-    ram_low_short: "Garde presque tout (7j)",
-    ram_med_short: "Décharge après 24h",
-    ram_hard_short: "Décharge après 1h30",
+    ram_low_short: "Décharge après 2h",
+    ram_med_short: "Décharge après 15 min",
+    ram_hard_short: "Décharge après 3 min",
     ram_custom_title: "Personnalisé",
     ram_custom_short: "Configurable dans Paramètres",
     tuto_f1_title: "Restauration anti-coupure",
@@ -2580,12 +2591,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     btn_reopen_wizard: "Relancer l'assistant",
     ram_card_title: "Gestionnaire de RAM & Déchargement automatique des onglets",
     ram_card_desc: "Chaque onglet conserve son URL exacte, le moment de la vidéo et sa session. Les onglets inactifs sont libérés de la RAM après le délai choisi et reprennent exactement où vous étiez.",
-    ram_low_title: "Low (Faible)",
-    ram_low_desc: "Garde presque tout en RAM (décharge après 7 jours).",
-    ram_med_title: "Medium (24h)",
-    ram_med_desc: "Équilibré : garde les onglets actifs pendant 24h.",
-    ram_hard_title: "Hard (1h30)",
-    ram_hard_desc: "Agressif : décharge les sites inactifs après 1h30.",
+    ram_low_title: "Low (2h)",
+    ram_low_desc: "Garde plus d'onglets en RAM (décharge après 2h).",
+    ram_med_title: "Medium (15 min)",
+    ram_med_desc: "Équilibré : décharge après 15 min (max 6 onglets en arrière-plan).",
+    ram_hard_title: "Hard (3 min)",
+    ram_hard_desc: "Ultra-basse RAM : décharge après 3 min (max 3 onglets en arrière-plan).",
     ram_custom_desc: "Choisissez exactement le délai d'inactivité avant déchargement.",
     ram_unload_after: "Décharger après :",
     unit_minutes: "minutes",
@@ -2604,7 +2615,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     app_bar_title: "Barre d'adresse adaptative & Onglets",
     app_bar_desc: "Avec peu d'onglets, la barre d'URL reste centrée. Dès 4 onglets ouverts, elle glisse avec une animation fluide vers la droite pour afficher un maximum d'onglets.",
     ext_install_title: "Installer une Extension Chrome (Chrome Web Store)",
-    ext_install_desc: "Collez une URL du Chrome Web Store ou un ID à 32 lettres : Singularity télécharge le paquet .crx officiel, le vérifie et le charge nativement dans WebView2",
+    ext_install_desc: "Collez une URL du Chrome Web Store ou un ID à 32 lettres : Singularity télécharge le paquet .crx officiel, le vérifie et le charge nativement dans Chromium pur",
     ext_store_ph: "URL Chrome Web Store ou ID à 32 lettres (ex: ddkjiahejlhfcafbddmgiahcphecmpfh)",
     btn_install: "Installer",
     ext_local_ph: "Ou chemin local d'un dossier décompressé (manifest.json) / .crx / .zip",
@@ -2867,8 +2878,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   let privateMode = false;
   let restoreSessionEnabled = true;
   let tabUnloadMode = "medium";
-  let tabUnloadCustomMinutes = 120;
-  let tabUnloadEffectiveSeconds = 86400;
+  let tabUnloadCustomMinutes = 15;
+  let tabUnloadEffectiveSeconds = 900;
   let nativeRamActiveCount = 0;
   let onboardEngine = "ddg";
   let vaultTotpTimer = null;
@@ -4250,9 +4261,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const c = document.getElementById("singularity-canvas");
     const v = document.getElementById("cinema-vignette");
     if (susp) {
-      // Never set display:none on the WebGL2 canvas — destroying and recreating its D3D11
-      // compositor surface causes a bright white flash when opening New Tabs on Windows.
-      if (c) { c.style.opacity = "0"; c.style.visibility = "hidden"; }
+      // Keep the WebGL2 context alive (no display:none flash) while shrinking the backing
+      // framebuffer to 1x1 so Chromium releases ~15-30 MB of GPU VRAM/RAM on normal web tabs.
+      if (c) {
+        c.style.opacity = "0";
+        c.style.visibility = "hidden";
+        c.width = 1;
+        c.height = 1;
+      }
       if (v) { v.style.opacity = "0"; v.style.visibility = "hidden"; }
     } else {
       if (v) { v.style.visibility = "visible"; v.style.opacity = "1"; }
@@ -4345,6 +4361,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             start_paused: shouldStartPaused
           });
         }
+        sweepInactiveTabsForRam();
       } else {
         document.body.classList.remove("bar-only");
         setBlackHoleSuspended(true);
@@ -4882,15 +4899,36 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     await applyRamPresetMinutes(mins);
   }
 
+  function maxActiveBackgroundTabsForMode() {
+    if (tabUnloadMode === "hard") return 3;
+    if (tabUnloadMode === "medium") return 6;
+    return 12;
+  }
+
   function sweepInactiveTabsForRam() {
     const thresholdMs = Math.max(60, tabUnloadEffectiveSeconds) * 1000;
     const now = Date.now();
     let unloadedNow = 0;
+    const liveBackground = [];
     for (const t of tabs) {
       if (t.id === activeTabId || !t.url || isInternalSettingsUrl(t.url) || t.unloaded) continue;
       if (now - (t.lastActiveAt || now) >= thresholdMs) {
         t.unloaded = true;
         sendNativeIpc({ cmd: "unload_tab", tab_id: t.id });
+        unloadedNow++;
+      } else {
+        liveBackground.push(t);
+      }
+    }
+    // Hard cap on concurrent background Chromium renderers so RAM never balloons with 15+ tabs
+    const maxBg = maxActiveBackgroundTabsForMode();
+    if (liveBackground.length > maxBg) {
+      liveBackground.sort((a, b) => (a.lastActiveAt || 0) - (b.lastActiveAt || 0));
+      const excess = liveBackground.length - maxBg;
+      for (let i = 0; i < excess; i++) {
+        const victim = liveBackground[i];
+        victim.unloaded = true;
+        sendNativeIpc({ cmd: "unload_tab", tab_id: victim.id });
         unloadedNow++;
       }
     }

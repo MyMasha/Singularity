@@ -4,11 +4,13 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let rel_bundle = "../../dist/singularity-bundle.zip";
     let rel_payload = if target_is_windows {
         "../../dist/singularity.exe"
     } else {
         "../../dist/singularity-linux-x86_64"
     };
+    println!("cargo:rerun-if-changed={rel_bundle}");
     println!("cargo:rerun-if-changed={rel_payload}");
     println!("cargo:rerun-if-changed=../singularity-ui/assets/singularity.ico");
     println!("cargo:rerun-if-changed=../singularity-ui/assets/logo_128.rgba");
@@ -17,15 +19,18 @@ fn main() {
         std::env::var("CARGO_MANIFEST_DIR"),
         std::env::var("OUT_DIR"),
     ) {
-        let src = Path::new(&manifest_dir).join(rel_payload);
+        let bundle_src = Path::new(&manifest_dir).join(rel_bundle);
+        let raw_src = Path::new(&manifest_dir).join(rel_payload);
         let dst = Path::new(&out_dir).join("embedded_singularity.bin");
-        if src.is_file() {
-            let _ = std::fs::copy(&src, &dst);
+        if target_is_windows && bundle_src.is_file() {
+            let _ = std::fs::copy(&bundle_src, &dst);
+        } else if raw_src.is_file() {
+            let _ = std::fs::copy(&raw_src, &dst);
         } else {
             let _ = std::fs::write(&dst, b"");
             if std::env::var("PROFILE").as_deref() == Ok("release") {
                 println!(
-                    "cargo:warning=Singularity payload ({rel_payload}) not found; build `singularity` first and stage it to `dist/` before packaging Singularity-Setup."
+                    "cargo:warning=Singularity payload ({rel_bundle} or {rel_payload}) not found; stage it to `dist/` before packaging Singularity-Setup."
                 );
             }
         }
@@ -92,8 +97,8 @@ fn embed_windows_exe_resources() {
          {icon_line}\
          1 24 \"{manifest_escaped}\"\r\n\
          1 VERSIONINFO\r\n\
-         FILEVERSION 1,0,5,0\r\n\
-         PRODUCTVERSION 1,0,5,0\r\n\
+         FILEVERSION 2,0,0,0\r\n\
+         PRODUCTVERSION 2,0,0,0\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -106,11 +111,11 @@ fn embed_windows_exe_resources() {
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Singularity\\0\"\r\n\
                VALUE \"FileDescription\", \"Singularity Setup\\0\"\r\n\
-               VALUE \"FileVersion\", \"1.0.5.0\\0\"\r\n\
+               VALUE \"FileVersion\", \"2.0.0.0\\0\"\r\n\
                VALUE \"InternalName\", \"Singularity-Setup\\0\"\r\n\
                VALUE \"OriginalFilename\", \"Singularity-Setup.exe\\0\"\r\n\
                VALUE \"ProductName\", \"Singularity\\0\"\r\n\
-               VALUE \"ProductVersion\", \"1.0.5.0\\0\"\r\n\
+               VALUE \"ProductVersion\", \"2.0.0.0\\0\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\

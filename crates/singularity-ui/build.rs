@@ -9,9 +9,6 @@ fn main() {
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_exe_resources();
-        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
-            stage_webview2_loader_dll_for_gnu();
-        }
     }
 }
 
@@ -64,8 +61,8 @@ fn embed_windows_exe_resources() {
          {icon_line}\
          1 24 \"{manifest_escaped}\"\r\n\
          1 VERSIONINFO\r\n\
-         FILEVERSION 1,0,5,0\r\n\
-         PRODUCTVERSION 1,0,5,0\r\n\
+         FILEVERSION 2,0,0,0\r\n\
+         PRODUCTVERSION 2,0,0,0\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -77,12 +74,12 @@ fn embed_windows_exe_resources() {
              BLOCK \"040904b0\"\r\n\
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Singularity\\0\"\r\n\
-               VALUE \"FileDescription\", \"Singularity Browser\\0\"\r\n\
-               VALUE \"FileVersion\", \"1.0.5.0\\0\"\r\n\
+               VALUE \"FileDescription\", \"Singularity Browser (Pure Chromium CEF)\\0\"\r\n\
+               VALUE \"FileVersion\", \"2.0.0.0\\0\"\r\n\
                VALUE \"InternalName\", \"singularity\\0\"\r\n\
                VALUE \"OriginalFilename\", \"singularity.exe\\0\"\r\n\
                VALUE \"ProductName\", \"Singularity\\0\"\r\n\
-               VALUE \"ProductVersion\", \"1.0.5.0\\0\"\r\n\
+               VALUE \"ProductVersion\", \"2.0.0.0\\0\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\
@@ -208,59 +205,3 @@ fn find_windres_exe() -> Option<PathBuf> {
     None
 }
 
-fn stage_webview2_loader_dll_for_gnu() {
-    let Ok(out_dir) = std::env::var("OUT_DIR") else {
-        return;
-    };
-    let dest = Path::new(&out_dir).join("WebView2Loader.dll");
-    if dest.is_file() {
-        return;
-    }
-
-    let mut cargo_roots = Vec::new();
-    if let Ok(ch) = std::env::var("CARGO_HOME") {
-        cargo_roots.push(PathBuf::from(ch));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        cargo_roots.push(Path::new(&home).join(".cargo"));
-    }
-    if let Ok(up) = std::env::var("USERPROFILE") {
-        cargo_roots.push(PathBuf::from(up).join(".cargo"));
-    }
-
-    let arch_dir = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
-        Ok("aarch64") => "arm64",
-        Ok("x86") => "x86",
-        _ => "x64",
-    };
-
-    for root in cargo_roots {
-        let reg_src = root.join("registry").join("src");
-        let Ok(indices) = std::fs::read_dir(&reg_src) else {
-            continue;
-        };
-        for idx in indices.flatten() {
-            let Ok(crates) = std::fs::read_dir(idx.path()) else {
-                continue;
-            };
-            let mut matches: Vec<PathBuf> = crates
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|s| s.starts_with("webview2-com-sys-"))
-                })
-                .collect();
-            matches.sort();
-            matches.reverse();
-            for crate_dir in matches {
-                let dll = crate_dir.join(arch_dir).join("WebView2Loader.dll");
-                if dll.is_file() && std::fs::copy(&dll, &dest).is_ok() {
-                    return;
-                }
-            }
-        }
-    }
-    panic!("WebView2Loader.dll ({arch_dir}) not found in Cargo registry cache for webview2-com-sys");
-}

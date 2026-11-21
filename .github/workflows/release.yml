@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v1.0.5)"
+        description: "Release tag to build and publish assets for (e.g. v2.0.0)"
         required: false
-        default: "v1.0.5"
+        default: "v2.0.0"
 
 permissions:
   contents: read
@@ -53,6 +53,8 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    env:
+      CEF_PATH: ${{ env.USERPROFILE }}\.local\share\cef
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -60,20 +62,86 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
+      - name: Cache Pure Chromium (CEF) SDK
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.USERPROFILE }}\.local\share\cef
+          key: cef-win64-156.7.0+156.0.31
+
+      - name: Ensure Ninja build tool is available for CEF C++ wrapper
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            $vsNinja = Get-ChildItem -Path "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "ninja.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vsNinja) {
+              $vsNinja.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "Added Visual Studio Ninja to PATH: $($vsNinja.DirectoryName)"
+            } else {
+              choco install ninja --no-progress -y
+            }
+          }
+          cmake --version
+
       - name: Run workspace tests on Windows
         run: cargo test --workspace --locked
 
-      - name: Build Windows browser and installer
+      - name: Build Pure Chromium (CEF) Windows browser and self-contained installer
+        shell: pwsh
         env:
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/src"
         run: |
           cargo build --release --locked --bin singularity
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/singularity.exe dist/singularity.exe -Force
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Stage Pure Chromium CEF runtime + singularity.exe (EN/FR locales only for lean installer size)
+          Remove-Item -Recurse -Force dist\stage -ErrorAction SilentlyContinue
+          Remove-Item -Force dist\singularity-bundle.zip -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path dist\stage\locales | Out-Null
+          Copy-Item target\release\singularity.exe dist\stage\singularity.exe -Force
+          foreach ($pat in @("*.dll", "*.dat", "*.bin", "*.pak", "vk_swiftshader_icd.json")) {
+            Get-ChildItem -Path target\release -Filter $pat -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName (Join-Path "dist\stage" $_.Name) -Force
+            }
+          }
+          foreach ($loc in @("en-US.pak", "fr.pak")) {
+            $srcLoc = Join-Path "target\release\locales" $loc
+            if (Test-Path $srcLoc) {
+              Copy-Item $srcLoc (Join-Path "dist\stage\locales" $loc) -Force
+            }
+          }
+          foreach ($reqFile in @("dist\stage\singularity.exe", "dist\stage\libcef.dll", "dist\stage\icudtl.dat", "dist\stage\resources.pak")) {
+            if (-not (Test-Path $reqFile)) {
+              Write-Error "Missing required Pure Chromium runtime file: $reqFile"
+              exit 1
+            }
+          }
+
+          # Compress staged bundle with maximum DEFLATE compression
+          @'
+import os, zipfile
+root = "dist/stage"
+out = "dist/singularity-bundle.zip"
+with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    for dp, _, fns in os.walk(root):
+        for fn in sorted(fns):
+            full = os.path.join(dp, fn)
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            zf.write(full, rel)
+print(f"Created {out}: {os.path.getsize(out) / 1048576:.2f} MB")
+'@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target\release\singularity.exe dist\singularity.exe -Force
+
           cargo build --release --locked --bin Singularity-Setup
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & target\release\Singularity-Setup.exe --verify-only
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           New-Item -ItemType Directory -Force -Path release-artifacts | Out-Null
-          Copy-Item target/release/Singularity-Setup.exe release-artifacts/Singularity-setup.exe
-          Copy-Item target/release/singularity.exe release-artifacts/singularity.exe
+          Copy-Item target\release\Singularity-Setup.exe release-artifacts\Singularity-setup.exe -Force
+          Copy-Item target\release\singularity.exe release-artifacts\singularity.exe -Force
+          Get-ChildItem release-artifacts | Format-Table Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -127,7 +195,7 @@ jobs:
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v1.0.5"
+            TARGET_TAG="v2.0.0"
           fi
           if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes

@@ -9,6 +9,9 @@ description = "Pure Native Win32 GUI Setup Wizard for Singularity Browser (Singu
 name = "Singularity-Setup"
 path = "src/main.rs"
 
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",

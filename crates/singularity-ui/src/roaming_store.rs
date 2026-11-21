@@ -367,17 +367,17 @@ pub fn apply_media_timestamp_to_url(url: &str, time_sec: u64) -> String {
 }
 
 /// Computes the tab RAM unload timeout in seconds for the 4 supported memory-saver modes:
-/// - `"low"`    : keeps almost everything (7 days / 168h)
-/// - `"medium"` : unloads inactive background tabs after 24h (default)
-/// - `"hard"`   : unloads inactive background tabs after 1h30 (90 min)
+/// - `"low"`    : relaxed memory saving (2 hours / 120 min)
+/// - `"medium"` : balanced memory saving — unloads silent background tabs after 15 min (default)
+/// - `"hard"`   : ultra-low RAM — unloads silent background tabs after 3 min
 /// - `"custom"` : user-selected delay (`custom_minutes`, clamped 1 min..=30 days)
 pub fn tab_unload_timeout_seconds(mode: &str, custom_minutes: u64) -> u64 {
     match mode {
-        "low" => 7 * 24 * 3600,
-        "medium" => 24 * 3600,
-        "hard" => 90 * 60,
+        "low" => 2 * 3600,
+        "medium" => 15 * 60,
+        "hard" => 3 * 60,
         "custom" => custom_minutes.clamp(1, 43_200) * 60,
-        _ => 24 * 3600,
+        _ => 15 * 60,
     }
 }
 
@@ -1002,12 +1002,76 @@ impl RoamingSingularityStore {
         serde_json::from_str::<WindowRestorePayload>(&raw).ok()
     }
 
+    /// Pure Chromium (CEF) persistent profile & cache directory (`%APPDATA%\.singularity\cef-profile`).
+    /// Shared across ALL windows & tabs inside Singularity's single Chromium browser process (0% Edge!).
+    pub fn chromium_profile_dir(&self) -> PathBuf {
+        self.root_dir.join("cef-profile")
+    }
+
     pub fn webview_engine_dir(&self) -> PathBuf {
         self.root_dir.join("browser-engine")
     }
 
     pub fn ui_webview_dir(&self) -> PathBuf {
         self.root_dir.join("browser-ui")
+    }
+
+    /// Generates a unique collision-free window session identifier for a new in-process CEF window.
+    pub fn new_window_session_id() -> String {
+        let mut rnd = [0u8; 6];
+        OsRng.fill_bytes(&mut rnd);
+        format!("win-{}-{}", std::process::id(), hex::encode(rnd))
+    }
+
+    /// Persists a specific in-process window's tabs, groups, active tab, and geometry to
+    /// `sessions/<window_id>.json` (+ `.bak`), enabling clean multi-window restart inside a single
+    /// low-RAM Chromium process.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_window_session_for(
+        &self,
+        window_id: &str,
+        tabs: &[SavedTabEntry],
+        tab_groups: &[SavedTabGroup],
+        active_tab_index: usize,
+        geometry: WindowGeometry,
+        closed_while_other_live: bool,
+        write_backup: bool,
+    ) -> Result<(), String> {
+        let sessions_dir = self.sessions_dir();
+        let _ = std::fs::create_dir_all(&sessions_dir);
+        let sess = WindowSessionFile {
+            window_id: window_id.to_string(),
+            pid: std::process::id(),
+            updated_unix: unix_now(),
+            active_tab_index: active_tab_index.min(tabs.len().saturating_sub(1)),
+            tabs: tabs.to_vec(),
+            tab_groups: tab_groups.to_vec(),
+            geometry,
+            closed_while_other_live,
+        };
+        let bytes = serde_json::to_vec(&sess)
+            .map_err(|e| format!("Window session serialization error: {}", e))?;
+        let path = sessions_dir.join(format!("{}.json", window_id));
+        atomic_write(&path, &bytes)?;
+        if write_backup && !sess.tabs.is_empty() {
+            let _ = atomic_write(&path.with_extension("json.bak"), &bytes);
+        }
+        Ok(())
+    }
+
+    /// Deletes a specific in-process window's persisted session files when closed empty or
+    /// after its only tab was transferred to another window.
+    pub fn delete_window_session_for(&self, window_id: &str) {
+        if window_id.is_empty()
+            || !window_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return;
+        }
+        let p = self.sessions_dir().join(format!("{}.json", window_id));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("json.bak"));
     }
 
     /// Allocates an isolated, reusable per-live-window WebView2 user-data directory

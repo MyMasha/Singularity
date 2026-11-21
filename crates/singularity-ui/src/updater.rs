@@ -24,7 +24,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO_URL: &str = "https://github.com/MyMasha/Singularity";
 pub const RELEASES_API_URL: &str = "https://api.github.com/repos/MyMasha/Singularity/releases/latest";
 pub const PUBLIC_ASSET_URL_WINDOWS: &str =
-    "https://github.com/MyMasha/Singularity/releases/latest/download/singularity.exe";
+    "https://github.com/MyMasha/Singularity/releases/latest/download/Singularity-setup.exe";
 pub const PUBLIC_ASSET_URL_LINUX: &str =
     "https://github.com/MyMasha/Singularity/releases/latest/download/singularity-linux-x86_64";
 pub const PUBLIC_SHA256SUMS_URL: &str =
@@ -52,7 +52,7 @@ pub struct UpdateCheckInfo {
     pub release_url: String,
 }
 
-/// Cleans up leftover `.old` executable backups from previous updates and ensures
+/// Cleans up leftover `.old` executable backups and temporary installer updates, and ensures
 /// `%APPDATA%\.singularity` exists without stripping Windows SmartScreen protections.
 pub fn perform_startup_maintenance() {
     let _ = crate::roaming_store::ensure_roaming_dir_initialized();
@@ -67,6 +67,13 @@ pub fn perform_startup_maintenance() {
         };
         if old_exe.exists() {
             let _ = std::fs::remove_file(old_exe);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let tmp_setup = std::env::temp_dir().join("Singularity-setup-update.exe");
+        if tmp_setup.exists() {
+            let _ = std::fs::remove_file(tmp_setup);
         }
     }
 }
@@ -296,7 +303,7 @@ pub fn verify_downloaded_binary_sha256(
 }
 
 /// Downloads, verifies SHA-256 integrity (and Ed25519 signature when configured), and atomically
-/// replaces the running executable directly from public GitHub Release Assets at
+/// updates the installation directly from public GitHub Release Assets at
 /// `https://github.com/MyMasha/Singularity`.
 pub fn execute_self_update() -> Result<String, String> {
     let force = std::env::var("SINGULARITY_FORCE_UPDATE").as_deref() == Ok("1");
@@ -314,18 +321,18 @@ pub fn execute_self_update() -> Result<String, String> {
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("Unable to locate current executable: {}", e))?;
     let target_dir = current_exe.parent().unwrap_or(Path::new("."));
-    let new_exe = if cfg!(target_os = "windows") {
-        target_dir.join("singularity.new.exe")
-    } else {
-        target_dir.join("singularity.new")
-    };
+    #[cfg(not(target_os = "windows"))]
+    let new_exe = target_dir.join("singularity.new");
     let sums_file = target_dir.join("SHA256SUMS.new.txt");
     let sig_file = target_dir.join("SHA256SUMS.new.txt.sig");
     let require_ed25519 = !RELEASE_SIGNING_PUBKEY_HEX.trim().is_empty();
 
     #[cfg(target_os = "windows")]
     {
-        let old_exe = target_dir.join("singularity.exe.old");
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let setup_tmp = std::env::temp_dir().join("Singularity-setup-update.exe");
         let opt_token = resolve_github_token();
         let ua = format!("Singularity-Updater/{}", CURRENT_VERSION);
 
@@ -371,24 +378,24 @@ pub fn execute_self_update() -> Result<String, String> {
             })
         };
 
-        let Some(bin_url) = find_asset_url("singularity.exe") else {
-            return Err("Release asset 'singularity.exe' is unavailable for the latest release.".into());
+        let Some(setup_url) = find_asset_url("Singularity-setup.exe") else {
+            return Err("Release asset 'Singularity-setup.exe' is unavailable for the latest release.".into());
         };
         let Some(sums_url) = find_asset_url("SHA256SUMS.txt") else {
             return Err("Release asset 'SHA256SUMS.txt' is unavailable for the latest release.".into());
         };
         let sig_url = find_asset_url("SHA256SUMS.txt.sig");
 
-        let dl_bin = crate::winhttp_client::winhttp_download_https_to_file(
-            &bin_url,
-            &new_exe,
+        let dl_setup = crate::winhttp_client::winhttp_download_https_to_file(
+            &setup_url,
+            &setup_tmp,
             &ua,
             &[],
             10_000,
-            60_000,
-            128 * 1024 * 1024,
+            180_000,
+            300 * 1024 * 1024,
         );
-        let dl_sums = if dl_bin.is_ok() {
+        let dl_sums = if dl_setup.is_ok() {
             crate::winhttp_client::winhttp_download_https_to_file(
                 &sums_url,
                 &sums_file,
@@ -401,11 +408,11 @@ pub fn execute_self_update() -> Result<String, String> {
         } else {
             Err("Skipped sums".into())
         };
-        if dl_bin.is_err() || dl_sums.is_err() || !new_exe.exists() || !sums_file.exists() {
-            let _ = std::fs::remove_file(&new_exe);
+        if dl_setup.is_err() || dl_sums.is_err() || !setup_tmp.exists() || !sums_file.exists() {
+            let _ = std::fs::remove_file(&setup_tmp);
             let _ = std::fs::remove_file(&sums_file);
             let _ = std::fs::remove_file(&sig_file);
-            return Err("Failed downloading update binary or SHA256SUMS.txt from GitHub Releases.".into());
+            return Err("Failed downloading Singularity-setup.exe or SHA256SUMS.txt from GitHub Releases.".into());
         }
         if let Some(s_url) = sig_url {
             let _ = crate::winhttp_client::winhttp_download_https_to_file(
@@ -426,42 +433,40 @@ pub fn execute_self_update() -> Result<String, String> {
 
         if require_ed25519 {
             let sig_str = std::fs::read_to_string(&sig_file).map_err(|_| {
-                let _ = std::fs::remove_file(&new_exe);
+                let _ = std::fs::remove_file(&setup_tmp);
                 "Missing SHA256SUMS.txt.sig Ed25519 signature. Update aborted.".to_string()
             })?;
             let _ = std::fs::remove_file(&sig_file);
             if let Err(err) =
                 verify_sha256sums_ed25519(&sums_bytes, &sig_str, RELEASE_SIGNING_PUBKEY_HEX)
             {
-                let _ = std::fs::remove_file(&new_exe);
+                let _ = std::fs::remove_file(&setup_tmp);
                 return Err(err);
             }
         } else {
             let _ = std::fs::remove_file(&sig_file);
         }
 
-        if let Err(err) = verify_downloaded_binary_sha256(&new_exe, &sums_content, "singularity.exe")
+        if let Err(err) =
+            verify_downloaded_binary_sha256(&setup_tmp, &sums_content, "Singularity-setup.exe")
         {
-            let _ = std::fs::remove_file(&new_exe);
+            let _ = std::fs::remove_file(&setup_tmp);
             return Err(err);
         }
 
-        if old_exe.exists() {
-            let _ = std::fs::remove_file(&old_exe);
-        }
-        std::fs::rename(&current_exe, &old_exe)
-            .map_err(|e| format!("Failed backing up current executable: {}", e))?;
-        if let Err(e) = std::fs::rename(&new_exe, &current_exe) {
-            let _ = std::fs::rename(&old_exe, &current_exe);
-            let _ = std::fs::remove_file(&new_exe);
-            return Err(format!("Failed replacing executable: {}", e));
-        }
-
-        let _ = Command::new(&current_exe)
+        // Launch the verified native Win32 installer silently so it atomically updates
+        // `singularity.exe`, `libcef.dll`, and all Pure Chromium CEF runtime files, then relaunches.
+        Command::new(&setup_tmp)
+            .arg("--silent")
+            .arg("--dir")
+            .arg(target_dir)
+            .arg("--launch")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("Failed launching verified updater: {}", e))?;
         std::process::exit(0);
     }
 
@@ -750,6 +755,13 @@ if ($env:SINGULARITY_DEL_EXE -and (Test-Path -LiteralPath $env:SINGULARITY_DEL_E
     Remove-Item -LiteralPath $env:SINGULARITY_DEL_EXE -Force -ErrorAction SilentlyContinue
 }
 if ($env:SINGULARITY_DEL_DIR -and (Test-Path -LiteralPath $env:SINGULARITY_DEL_DIR)) {
+    foreach ($pat in @('*.dll','*.pak','*.dat','*.bin','vk_swiftshader_icd.json','singularity.ico')) {
+        Get-ChildItem -LiteralPath $env:SINGULARITY_DEL_DIR -Filter $pat -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    $locDir = Join-Path $env:SINGULARITY_DEL_DIR 'locales'
+    if (Test-Path -LiteralPath $locDir) {
+        Remove-Item -LiteralPath $locDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ((Get-ChildItem -LiteralPath $env:SINGULARITY_DEL_DIR -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
         Remove-Item -LiteralPath $env:SINGULARITY_DEL_DIR -Force -ErrorAction SilentlyContinue
     }

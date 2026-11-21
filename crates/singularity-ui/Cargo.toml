@@ -30,7 +30,11 @@ subtle.workspace = true
 zeroize.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[features]
+default = []
+# Compile-only feature for Linux->Windows `cargo check` without running CEF CMake build scripts
+cef-dox = ["cef/dox"]
+
 [target.'cfg(windows)'.dependencies]
 tao = "0.37"
-wry = "0.57"
-
+cef = { version = "156.7.0", default-features = false }
