@@ -106,11 +106,11 @@ fn embed_windows_exe_resources() {
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Singularity\\0\"\r\n\
                VALUE \"FileDescription\", \"Singularity Setup\\0\"\r\n\
-               VALUE \"FileVersion\", \"2.0.5.0\\0\"\r\n\
+               VALUE \"FileVersion\", \"2.0.6.0\\0\"\r\n\
                VALUE \"InternalName\", \"Singularity-Setup\\0\"\r\n\
                VALUE \"OriginalFilename\", \"Singularity-Setup.exe\\0\"\r\n\
                VALUE \"ProductName\", \"Singularity\\0\"\r\n\
-               VALUE \"ProductVersion\", \"2.0.5.0\\0\"\r\n\
+               VALUE \"ProductVersion\", \"2.0.6.0\\0\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\

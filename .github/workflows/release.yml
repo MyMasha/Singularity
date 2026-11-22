@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v2.0.5)"
+        description: "Release tag to build and publish assets for (e.g. v2.0.6)"
         required: false
-        default: "v2.0.5"
+        default: "v2.0.6"
       publish:
         description: "Whether to publish assets to GitHub Releases (set false for CI verification dry-runs)"
         type: boolean
@@ -240,7 +240,7 @@ jobs:
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v2.0.5"
+            TARGET_TAG="v2.0.6"
           fi
           if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes

@@ -149,6 +149,15 @@ pub enum CefCallbackEvent {
         path: String,
         success: bool,
     },
+    NavigationStateChanged {
+        tab_id: u64,
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
+    NativeShortcut {
+        tab_id: u64,
+        action: &'static str,
+    },
     CloseExtensionPopup,
 }
 
@@ -452,7 +461,6 @@ wrap_app! {
             // - Caps disk cache (64 MiB) & media cache (32 MiB)
             let switches = [
                 "process-per-site",
-                "disable-background-networking",
                 "disable-component-update",
                 "disable-sync",
                 "disable-domain-reliability",
@@ -583,6 +591,8 @@ impl CefRuntimeGuard {
             root_cache_path: CefString::from(profile_str.as_str()),
             cache_path: CefString::from(profile_str.as_str()),
             persist_session_cookies: 1,
+            cookieable_schemes_list: CefString::from("chrome-extension"),
+            cookieable_schemes_exclude_defaults: 0,
             background_color: 0xFF00_0000, // OLED Pure Black (#000000) — zero white flash
             log_file: CefString::from(resolved_log.to_string_lossy().as_ref()),
             log_severity: if verbose_logging {
@@ -746,6 +756,9 @@ pub fn open_cef_browser_count() -> usize {
 /// Pumps CEF's external message loop until all closing child browsers complete `on_before_close`
 /// (up to `timeout`) so `cef::shutdown()` never hits Chromium's open-browser teardown assertion.
 pub fn drain_browsers_before_shutdown(timeout: std::time::Duration) -> usize {
+    if let Some(mgr) = cookie_manager_get_global_manager(None) {
+        let _ = mgr.flush_store(None);
+    }
     let start = std::time::Instant::now();
     while open_cef_browser_count() > 0 && start.elapsed() < timeout {
         pump_cef_message_loop();
@@ -809,15 +822,25 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             let url = target_url.map(CefString::to_string).unwrap_or_default();
-            if self.cfg.is_ext_popup && url.starts_with("chrome-extension://") {
-                return 0;
+            let is_explicit_popup = popup_features
+                .map(|f| f.is_popup != 0 || f.width_set != 0 || f.height_set != 0)
+                .unwrap_or(false);
+            if self.cfg.is_ext_popup {
+                if url.starts_with("chrome-extension://") {
+                    return 0;
+                }
+                if is_explicit_popup
+                    && parse_http_host_port(&url).is_some()
+                    && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
+                {
+                    // Allow OAuth/SSO popup dialogs opened from Chrome extension popups so
+                    // `window.opener` handoffs complete cleanly without logging extensions out.
+                    return 0;
+                }
             }
             if !self.cfg.is_ui && parse_http_host_port(&url).is_some()
                 && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
             {
-                let is_explicit_popup = popup_features
-                    .map(|f| f.is_popup != 0 || f.width_set != 0 || f.height_set != 0)
-                    .unwrap_or(false);
                 let background = !is_explicit_popup
                     && (target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB
                         || is_ctrl_or_mbutton_down_cef());
@@ -940,6 +963,23 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
+        fn on_loading_state_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _is_loading: ::std::os::raw::c_int,
+            can_go_back: ::std::os::raw::c_int,
+            can_go_forward: ::std::os::raw::c_int,
+        ) {
+            if self.cfg.is_ui || self.cfg.is_ext_popup || self.cfg.tab_id == 0 {
+                return;
+            }
+            (self.cfg.sink)(CefCallbackEvent::NavigationStateChanged {
+                tab_id: self.cfg.tab_id,
+                can_go_back: can_go_back != 0,
+                can_go_forward: can_go_forward != 0,
+            });
+        }
+
         fn on_load_start(
             &self,
             _browser: Option<&mut Browser>,
@@ -1141,6 +1181,9 @@ wrap_resource_request_handler! {
                 return ReturnValue::CONTINUE;
             };
             let url = cef_str_userfree(req.url());
+            if url.starts_with("chrome-extension://") {
+                return ReturnValue::CONTINUE;
+            }
             if is_blocked_local_ipc_url(&url, self.cfg.bind_port) {
                 return ReturnValue::CANCEL;
             }
@@ -1152,6 +1195,9 @@ wrap_resource_request_handler! {
                 return ReturnValue::CONTINUE;
             };
             let first_party_url = cef_str_userfree(req.first_party_for_cookies());
+            if first_party_url.starts_with("chrome-extension://") {
+                return ReturnValue::CONTINUE;
+            }
             let mut doc_host = parse_http_host_port(&first_party_url)
                 .map(|(h, _)| h)
                 .unwrap_or_default();
@@ -1160,6 +1206,9 @@ wrap_resource_request_handler! {
                     .and_then(|b| b.main_frame())
                     .map(|f| cef_str_userfree(f.url()))
                 {
+                    if main_url.starts_with("chrome-extension://") {
+                        return ReturnValue::CONTINUE;
+                    }
                     if let Some((mh, _)) = parse_http_host_port(&main_url) {
                         doc_host = mh;
                     }
@@ -1172,6 +1221,11 @@ wrap_resource_request_handler! {
             }
             let res_type = map_cef_resource_type(rtype);
             if let Ok(shell) = self.cfg.shared_shell.lock() {
+                let ext_domains =
+                    crate::extensions::collect_installed_extension_host_domains(shell.roaming.root_dir());
+                if crate::extensions::host_matches_extension_domains(&req_host, &ext_domains) {
+                    return ReturnValue::CONTINUE;
+                }
                 if !matches!(
                     shell.core.adblocker.evaluate_request(&url, &req_host, &doc_host, res_type),
                     FilterDecision::Allow | FilterDecision::AllowByExceptionRule(_)
@@ -1218,7 +1272,7 @@ wrap_request_handler! {
             target_disposition: WindowOpenDisposition,
             _user_gesture: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
-            if self.cfg.is_ui {
+            if self.cfg.is_ui || target_disposition == WindowOpenDisposition::CURRENT_TAB {
                 return 0;
             }
             let url = target_url.map(CefString::to_string).unwrap_or_default();
@@ -1354,6 +1408,73 @@ wrap_download_handler! {
     }
 }
 
+wrap_keyboard_handler! {
+    struct SingularityKeyboardHandler {
+        cfg: ClientConfig,
+    }
+
+    impl KeyboardHandler {
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut sys::MSG>,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            if self.cfg.is_ext_popup {
+                return 0;
+            }
+            let Some(ev) = event else {
+                return 0;
+            };
+            if ev.type_ != KeyEventType::RAWKEYDOWN {
+                return 0;
+            }
+            const EVENTFLAG_CONTROL_DOWN: u32 = 1 << 2;
+            const EVENTFLAG_ALT_DOWN: u32 = 1 << 3;
+            const VK_BROWSER_BACK: i32 = 0xA6;
+            const VK_BROWSER_FORWARD: i32 = 0xA7;
+            const VK_LEFT: i32 = 0x25;
+            const VK_RIGHT: i32 = 0x27;
+            const VK_OEM_PLUS: i32 = 0xBB;
+            const VK_OEM_MINUS: i32 = 0xBD;
+            const VK_ADD: i32 = 0x6B;
+            const VK_SUBTRACT: i32 = 0x6D;
+            const VK_0: i32 = 0x30;
+            const VK_NUMPAD0: i32 = 0x60;
+
+            let ctrl = (ev.modifiers & EVENTFLAG_CONTROL_DOWN) != 0;
+            let alt = (ev.modifiers & EVENTFLAG_ALT_DOWN) != 0;
+            let vk = ev.windows_key_code;
+
+            let action: Option<&'static str> = if vk == VK_BROWSER_BACK
+                || (alt && !ctrl && vk == VK_LEFT)
+            {
+                Some("web_back")
+            } else if vk == VK_BROWSER_FORWARD || (alt && !ctrl && vk == VK_RIGHT) {
+                Some("web_forward")
+            } else if !self.cfg.is_ui && ctrl && !alt && (vk == VK_OEM_PLUS || vk == VK_ADD) {
+                Some("zoom_in")
+            } else if !self.cfg.is_ui && ctrl && !alt && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) {
+                Some("zoom_out")
+            } else if !self.cfg.is_ui && ctrl && !alt && (vk == VK_0 || vk == VK_NUMPAD0) {
+                Some("zoom_reset")
+            } else {
+                None
+            };
+
+            if let Some(act) = action {
+                (self.cfg.sink)(CefCallbackEvent::NativeShortcut {
+                    tab_id: self.cfg.tab_id,
+                    action: act,
+                });
+                return 1;
+            }
+            0
+        }
+    }
+}
+
 wrap_client! {
     struct SingularityCefClient {
         cfg: ClientConfig,
@@ -1374,6 +1495,10 @@ wrap_client! {
             } else {
                 Some(SingularityDownloadHandler::new(self.cfg.clone()))
             }
+        }
+
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            Some(SingularityKeyboardHandler::new(self.cfg.clone()))
         }
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
@@ -1532,16 +1657,50 @@ impl CefBrowserHandle {
         self.browser.reload();
     }
 
-    pub fn go_back(&self) {
+    pub fn can_go_back(&self) -> bool {
+        self.browser.can_go_back() != 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.browser.can_go_forward() != 0
+    }
+
+    pub fn go_back(&self) -> bool {
         if self.browser.can_go_back() != 0 {
             self.browser.go_back();
+            true
+        } else {
+            false
         }
     }
 
-    pub fn go_forward(&self) {
+    pub fn go_forward(&self) -> bool {
         if self.browser.can_go_forward() != 0 {
             self.browser.go_forward();
+            true
+        } else {
+            false
         }
+    }
+
+    pub fn zoom_step(&self, delta: f64) -> i32 {
+        if let Some(host) = self.browser.host() {
+            let cur = host.zoom_level();
+            let mut next = (cur + delta).clamp(-4.0, 5.0);
+            if next.abs() < 0.05 {
+                next = 0.0;
+            }
+            host.set_zoom_level(next);
+            return (1.2_f64.powf(next) * 100.0).round() as i32;
+        }
+        100
+    }
+
+    pub fn zoom_reset(&self) -> i32 {
+        if let Some(host) = self.browser.host() {
+            host.set_zoom_level(0.0);
+        }
+        100
     }
 
     pub fn request_context(&self) -> Option<RequestContext> {
@@ -1690,6 +1849,9 @@ impl Drop for CookieHygieneFinalize {
         } else {
             0
         };
+        if let Some(mgr) = cookie_manager_get_global_manager(None) {
+            let _ = mgr.flush_store(None);
+        }
         if let Some(ref cb) = self.on_done {
             let (tr, ad, mal) = self.stats.lock().map(|g| *g).unwrap_or((0, 0, 0));
             cb(tr, ad, mal, synced);
@@ -1718,9 +1880,34 @@ wrap_cookie_visitor! {
                 let path = c.path.to_string();
 
                 let mut deleted = false;
-                if self.purge_trackers {
+                let dom_lower = domain.trim().to_ascii_lowercase();
+                let is_ext_scheme = dom_lower.starts_with("chrome-extension");
+                if self.purge_trackers && !is_ext_scheme {
                     let mut threat = classify_tracker_or_malicious_cookie(&domain, &name, &value);
+                    let is_ext_host = if !domain.is_empty() {
+                        self.fin
+                            .shared_shell
+                            .lock()
+                            .ok()
+                            .map(|shell| {
+                                let ext_domains =
+                                    crate::extensions::collect_installed_extension_host_domains(
+                                        shell.roaming.root_dir(),
+                                    );
+                                crate::extensions::host_matches_extension_domains(
+                                    &domain,
+                                    &ext_domains,
+                                )
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if is_ext_host && threat != Some(CookieThreatKind::Malicious) {
+                        threat = None;
+                    }
                     if threat.is_none()
+                        && !is_ext_host
                         && !domain.is_empty()
                         && !is_protected_session_or_functional_cookie(&domain, &name)
                     {
@@ -1896,6 +2083,7 @@ impl Drop for HydrateFinalize {
                 self.pending_sets.fetch_sub(1, Ordering::AcqRel);
             }
         }
+        let _ = self.manager.flush_store(None);
         self.visit_done.store(true, Ordering::Release);
     }
 }

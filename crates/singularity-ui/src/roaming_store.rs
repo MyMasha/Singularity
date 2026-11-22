@@ -1833,7 +1833,43 @@ pub fn is_protected_session_or_functional_cookie(domain: &str, cookie_name: &str
     if ESSENTIAL_COOKIES.contains(&n.as_str()) {
         return true;
     }
-    n.contains("csrf") || n.contains("xsrf") || n.contains("session") || n.contains("auth")
+    // Never protect unambiguous ad/analytics cookie prefixes even if they contain words like "session".
+    if n.starts_with("_hj")
+        || n.starts_with("_ga")
+        || n.starts_with("_gid")
+        || n.starts_with("_gcl_")
+        || n.starts_with("_gac_")
+        || n.starts_with("_fb")
+        || n.starts_with("cto_")
+        || n.starts_with("pbjs_")
+        || n.starts_with("_pbjs_")
+        || n.starts_with("__utm")
+        || n.starts_with("_vwo_")
+        || n.starts_with("_vis_opt_")
+        || n.starts_with("ajs_")
+        || n.starts_with("amcv")
+    {
+        return false;
+    }
+    n.contains("csrf")
+        || n.contains("xsrf")
+        || n.contains("session")
+        || n.contains("sess")
+        || n.contains("auth")
+        || n.contains("token")
+        || n.contains("jwt")
+        || n.contains("login")
+        || n.contains("logged")
+        || n.contains("refresh")
+        || n.contains("remember")
+        || n.contains("identity")
+        || n.contains("oauth")
+        || n.contains("sso")
+        || n.contains("vault")
+        || n.contains("bearer")
+        || n.contains("account")
+        || n.contains("cred")
+        || n.contains("member")
 }
 
 /// Classifies whether a cookie is strictly a tracker, advertising cookie, or malicious cookie

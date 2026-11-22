@@ -53,6 +53,7 @@ const HTTP_WORKER_THREADS: usize = 32;
 const MAX_KEEPALIVE_REQUESTS_PER_CONN: usize = 64;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
+const MAX_BOOKMARK_IMPORT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROXY_REDIRECTS: usize = 5;
 const MAX_PROXY_BODY_BYTES: usize = 5 * 1024 * 1024;
 
@@ -416,7 +417,7 @@ fn run_windows_frameless_browser(
     use tao::dpi::{
         LogicalSize, PhysicalPosition as TaoPhysicalPosition, PhysicalSize as TaoPhysicalSize, Size,
     };
-    use tao::event::{Event, StartCause, WindowEvent};
+    use tao::event::{ElementState, Event, MouseButton, StartCause, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
     use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
     use tao::window::{Fullscreen, Icon, ResizeDirection, Window, WindowBuilder, WindowId};
@@ -555,6 +556,9 @@ fn run_windows_frameless_browser(
         },
         WebBack,
         WebForward,
+        WebZoom {
+            action: String,
+        },
         WebReload,
         SyncTokens,
         PurgeProviderTokens {
@@ -641,16 +645,105 @@ fn run_windows_frameless_browser(
         at: std::time::Instant,
     }
 
+    #[derive(Debug, Clone)]
+    struct TabNavHistory {
+        entries: Vec<String>,
+        index: usize,
+        cef_can_go_back: bool,
+        cef_can_go_forward: bool,
+        pending_traversal_at: Option<std::time::Instant>,
+    }
+
+    impl TabNavHistory {
+        fn new_with_home() -> Self {
+            Self {
+                entries: vec![String::new()],
+                index: 0,
+                cef_can_go_back: false,
+                cef_can_go_forward: false,
+                pending_traversal_at: None,
+            }
+        }
+
+        fn new_with_url(url: &str) -> Self {
+            Self {
+                entries: vec![url.to_string()],
+                index: 0,
+                cef_can_go_back: false,
+                cef_can_go_forward: false,
+                pending_traversal_at: None,
+            }
+        }
+
+        fn record_url(&mut self, url: &str) {
+            if url.is_empty() {
+                return;
+            }
+            if self.entries.is_empty() {
+                self.entries.push(url.to_string());
+                self.index = 0;
+                return;
+            }
+            if self.entries.get(self.index).map(String::as_str) == Some(url) {
+                return;
+            }
+            let in_traversal = self
+                .pending_traversal_at
+                .map(|t| t.elapsed() < Duration::from_millis(1600))
+                .unwrap_or(false);
+            if in_traversal {
+                if self.index > 0 && self.entries.get(self.index - 1).map(String::as_str) == Some(url)
+                {
+                    self.index -= 1;
+                    return;
+                }
+                if self.index + 1 < self.entries.len()
+                    && self.entries.get(self.index + 1).map(String::as_str) == Some(url)
+                {
+                    self.index += 1;
+                    return;
+                }
+            }
+            self.pending_traversal_at = None;
+            self.entries.truncate(self.index + 1);
+            self.entries.push(url.to_string());
+            if self.entries.len() > 50 {
+                let overflow = self.entries.len() - 50;
+                self.entries.drain(0..overflow);
+            }
+            self.index = self.entries.len().saturating_sub(1);
+        }
+
+        fn can_go_back(&self) -> bool {
+            self.cef_can_go_back || self.index > 0
+        }
+
+        fn can_go_forward(&self) -> bool {
+            self.cef_can_go_forward || self.index + 1 < self.entries.len()
+        }
+    }
+
+    struct ExtPopupState {
+        ext_id: String,
+        window_id: WindowId,
+        auto_dismiss: bool,
+        opened_at: std::time::Instant,
+        // Drop order: close & release child CEF browser BEFORE destroying parent popup Window!
+        browser: CefBrowserHandle,
+        window: Window,
+    }
+
     struct BrowserWindowState {
         session_id: String,
         // Drop order matters on Windows: child CEF browsers (`ui_browser`, `tab_browsers`,
         // `ext_popup`) MUST be closed and released BEFORE the parent `tao::Window` destroys
         // the top-level HWND, preventing use-after-destroy crashes inside Chromium teardown!
-        ext_popup: Option<(String, WindowId, bool, Window, CefBrowserHandle)>,
+        ext_popup: Option<ExtPopupState>,
         tab_browsers: HashMap<u64, CefBrowserHandle>,
         ui_browser: CefBrowserHandle,
         window: Window,
         tab_last_urls: HashMap<u64, String>,
+        tab_nav_history: HashMap<u64, TabNavHistory>,
         tab_media_times: HashMap<u64, u64>,
         tab_scroll_ys: HashMap<u64, u32>,
         tab_bg_intents: HashMap<u64, BgLinkIntent>,
@@ -667,14 +760,15 @@ fn run_windows_frameless_browser(
         ui_recovery_attempts: u8,
         was_minimized: bool,
         last_ext_popup_closed: Option<(String, std::time::Instant)>,
+        last_nav_at: Option<std::time::Instant>,
     }
 
     impl BrowserWindowState {
         fn close_ext_popup(&mut self) {
-            if let Some((eid, _, _, pwin, pb)) = self.ext_popup.take() {
-                self.last_ext_popup_closed = Some((eid, std::time::Instant::now()));
-                drop(pb);
-                drop(pwin);
+            if let Some(p) = self.ext_popup.take() {
+                self.last_ext_popup_closed = Some((p.ext_id, std::time::Instant::now()));
+                drop(p.browser);
+                drop(p.window);
             }
         }
 
@@ -1447,6 +1541,59 @@ fn run_windows_frameless_browser(
         }
     }
 
+    fn get_win32_foreground_hwnd() -> *mut core::ffi::c_void {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetForegroundWindow() -> *mut core::ffi::c_void;
+        }
+        unsafe { GetForegroundWindow() }
+    }
+
+    /// Returns `true` when Win32 foreground, active window, or keyboard focus belongs to
+    /// `popup_hwnd`, any of its embedded child CEF HWNDs (`Chrome_WidgetWin_0` /
+    /// `Chrome_RenderWidgetHostHWND`), or an owned dropdown/dialog window.
+    fn is_win32_focus_inside_popup(popup_hwnd: *mut core::ffi::c_void) -> bool {
+        if popup_hwnd.is_null() {
+            return false;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetForegroundWindow() -> *mut core::ffi::c_void;
+            fn GetFocus() -> *mut core::ffi::c_void;
+            fn GetActiveWindow() -> *mut core::ffi::c_void;
+            fn IsChild(
+                parent: *mut core::ffi::c_void,
+                child: *mut core::ffi::c_void,
+            ) -> i32;
+            fn GetAncestor(
+                hwnd: *mut core::ffi::c_void,
+                ga_flags: u32,
+            ) -> *mut core::ffi::c_void;
+            fn GetWindow(
+                hwnd: *mut core::ffi::c_void,
+                u_cmd: u32,
+            ) -> *mut core::ffi::c_void;
+        }
+        const GA_ROOT: u32 = 2;
+        const GA_ROOTOWNER: u32 = 3;
+        const GW_OWNER: u32 = 4;
+        unsafe {
+            let belongs = |h: *mut core::ffi::c_void| -> bool {
+                if h.is_null() {
+                    return false;
+                }
+                h == popup_hwnd
+                    || IsChild(popup_hwnd, h) != 0
+                    || GetAncestor(h, GA_ROOT) == popup_hwnd
+                    || GetAncestor(h, GA_ROOTOWNER) == popup_hwnd
+                    || GetWindow(h, GW_OWNER) == popup_hwnd
+            };
+            belongs(GetForegroundWindow())
+                || belongs(GetFocus())
+                || belongs(GetActiveWindow())
+        }
+    }
+
     fn is_cursor_clicking_top_bar(window: &Window) -> bool {
         const VK_LBUTTON: i32 = 0x01;
         let lbutton_down = unsafe { ((GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000) != 0 };
@@ -1876,11 +2023,36 @@ fn run_windows_frameless_browser(
     } catch (_) {}
   }
   document.addEventListener("mousedown", function(e) {
+    if (!e || e.isTrusted === false) return;
+    if (e.button === 3) {
+      sendShortcut("web_back", 0, e);
+      return;
+    }
+    if (e.button === 4) {
+      sendShortcut("web_forward", 0, e);
+      return;
+    }
     if (e.button === 1 || (e.button === 0 && (e.ctrlKey || e.metaKey))) report("bg_click", e);
   }, true);
+  document.addEventListener("mouseup", function(e) {
+    if (e && e.isTrusted !== false && (e.button === 3 || e.button === 4)) {
+      try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
+    }
+  }, true);
   document.addEventListener("auxclick", function(e) {
+    if (!e || e.isTrusted === false) return;
+    if (e.button === 3 || e.button === 4) {
+      try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
+      return;
+    }
     if (e.button === 1) report("bg_click", e);
   }, true);
+  document.addEventListener("wheel", function(e) {
+    if (!e || e.isTrusted === false) return;
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.deltaY !== 0) {
+      sendShortcut(e.deltaY < 0 ? "zoom_in" : "zoom_out", 0, e);
+    }
+  }, { capture: true, passive: false });
   document.addEventListener("contextmenu", function(e) {
     report("context_link", e);
   }, true);
@@ -1927,13 +2099,19 @@ fn run_windows_frameless_browser(
       sendShortcut("open_history", 0, e);
     } else if (ctrl && !e.shiftKey && (k === "," || code === "Comma")) {
       sendShortcut("open_settings", 0, e);
+    } else if (ctrl && !e.shiftKey && (k === "+" || k === "=" || code === "Equal" || code === "NumpadAdd")) {
+      sendShortcut("zoom_in", 0, e);
+    } else if (ctrl && !e.shiftKey && (k === "-" || code === "Minus" || code === "NumpadSubtract")) {
+      sendShortcut("zoom_out", 0, e);
+    } else if (ctrl && !e.shiftKey && (k === "0" || code === "Digit0" || code === "Numpad0")) {
+      sendShortcut("zoom_reset", 0, e);
     } else if (ctrl && !e.shiftKey && /^[1-9]$/.test(k)) {
       sendShortcut("jump_tab", parseInt(k, 10), e);
     } else if (ctrl && !e.shiftKey && /^Digit[1-9]$/.test(code)) {
       sendShortcut("jump_tab", parseInt(code.slice(5), 10), e);
-    } else if (alt && !e.shiftKey && e.key === "ArrowLeft") {
+    } else if ((alt && !e.shiftKey && e.key === "ArrowLeft") || e.key === "BrowserBack" || code === "BrowserBack") {
       sendShortcut("web_back", 0, e);
-    } else if (alt && !e.shiftKey && e.key === "ArrowRight") {
+    } else if ((alt && !e.shiftKey && e.key === "ArrowRight") || e.key === "BrowserForward" || code === "BrowserForward") {
       sendShortcut("web_forward", 0, e);
     } else if (
       !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !e.repeat
@@ -2626,6 +2804,7 @@ fn run_windows_frameless_browser(
             ui_browser,
             tab_browsers: HashMap::new(),
             tab_last_urls: HashMap::new(),
+            tab_nav_history: HashMap::new(),
             tab_media_times: HashMap::new(),
             tab_scroll_ys: HashMap::new(),
             tab_bg_intents: HashMap::new(),
@@ -2643,6 +2822,7 @@ fn run_windows_frameless_browser(
             was_minimized: false,
             ext_popup: None,
             last_ext_popup_closed: None,
+            last_nav_at: None,
         };
         st.capture_geometry(server_cfg, shared_shell);
         st.sync_layout();
@@ -2921,6 +3101,265 @@ fn run_windows_frameless_browser(
         }
     }
 
+    fn emit_tab_nav_state(st: &BrowserWindowState, tab_id: u64) {
+        let cef_back = st
+            .tab_browsers
+            .get(&tab_id)
+            .map(|b| st.web_visible && b.can_go_back())
+            .unwrap_or(false);
+        let cef_fwd = st
+            .tab_browsers
+            .get(&tab_id)
+            .map(|b| st.web_visible && b.can_go_forward())
+            .unwrap_or(false);
+        let (can_back, can_fwd) = st
+            .tab_nav_history
+            .get(&tab_id)
+            .map(|h| (h.can_go_back() || cef_back, h.can_go_forward() || cef_fwd))
+            .unwrap_or((cef_back, cef_fwd));
+        emit_ui_sync(
+            &st.ui_browser,
+            &serde_json::json!({
+                "tab_id": tab_id,
+                "can_go_back": can_back,
+                "can_go_forward": can_fwd
+            }),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn perform_tab_go_back(
+        win_id: WindowId,
+        st: &mut BrowserWindowState,
+        bind_port: u16,
+        is_private: bool,
+        incognito_ctx: &mut Option<cef::RequestContext>,
+        proxy: &EventLoopProxy<WinEvent>,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        download_resolver: &CefDownloadResolver,
+    ) {
+        let now = std::time::Instant::now();
+        if st
+            .last_nav_at
+            .map(|t| now.duration_since(t) < Duration::from_millis(120))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        st.last_nav_at = Some(now);
+        st.close_ext_popup();
+
+        let tid = st.active_tab_id;
+        if st.web_visible {
+            if let Some(b) = st.tab_browsers.get(&tid) {
+                if b.go_back() {
+                    if let Some(nav) = st.tab_nav_history.get_mut(&tid) {
+                        nav.pending_traversal_at = Some(now);
+                        if nav.index > 0 {
+                            nav.index -= 1;
+                        }
+                    }
+                    emit_tab_nav_state(st, tid);
+                    return;
+                }
+            }
+        }
+
+        // Fallback via per-tab URL history stack (handles returning to New Tab, RAM-unloaded
+        // tabs whose Chromium NavigationController reset, and restored sessions).
+        let target_opt = st.tab_nav_history.get_mut(&tid).and_then(|nav| {
+            if nav.index > 0 {
+                nav.index -= 1;
+                nav.pending_traversal_at = Some(now);
+                nav.entries.get(nav.index).cloned()
+            } else {
+                None
+            }
+        });
+
+        if let Some(target_url) = target_opt {
+            if target_url.is_empty() {
+                // Smoothly step back to the New Tab page while preserving forward history!
+                st.tab_browsers.remove(&tid);
+                st.layout_cache.invalidate_tab(Some(tid));
+                st.web_visible = false;
+                st.sync_layout();
+                let (can_back, can_fwd) = st
+                    .tab_nav_history
+                    .get(&tid)
+                    .map(|h| (h.can_go_back(), h.can_go_forward()))
+                    .unwrap_or((false, true));
+                emit_ui_sync(
+                    &st.ui_browser,
+                    &serde_json::json!({
+                        "tab_id": tid,
+                        "nav_to_home": true,
+                        "can_go_back": can_back,
+                        "can_go_forward": can_fwd,
+                        "ram_active_count": st.tab_browsers.len()
+                    }),
+                );
+            } else if parse_http_url_authority(&target_url).is_ok() {
+                st.web_visible = true;
+                st.tab_last_urls.insert(tid, target_url.clone());
+                if let Some(existing) = st.tab_browsers.get(&tid) {
+                    existing.load_url(&target_url);
+                } else {
+                    spawn_content_tab_cef(
+                        win_id,
+                        st,
+                        tid,
+                        &target_url,
+                        bind_port,
+                        is_private,
+                        incognito_ctx,
+                        None,
+                        None,
+                        false,
+                        proxy,
+                        shared_shell,
+                        download_resolver,
+                    );
+                }
+                st.sync_layout();
+                emit_ui_sync(
+                    &st.ui_browser,
+                    &serde_json::json!({
+                        "tab_id": tid,
+                        "url": target_url,
+                        "nav_restore_web": true,
+                        "ram_active_count": st.tab_browsers.len()
+                    }),
+                );
+                emit_tab_nav_state(st, tid);
+            }
+            return;
+        }
+
+        // Last-resort SPA safety net for client-side hash/pushState history
+        if st.web_visible {
+            if let Some(b) = st.tab_browsers.get(&tid) {
+                b.evaluate_script("if (window.history && window.history.length > 1) window.history.back();");
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn perform_tab_go_forward(
+        win_id: WindowId,
+        st: &mut BrowserWindowState,
+        bind_port: u16,
+        is_private: bool,
+        incognito_ctx: &mut Option<cef::RequestContext>,
+        proxy: &EventLoopProxy<WinEvent>,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        download_resolver: &CefDownloadResolver,
+    ) {
+        let now = std::time::Instant::now();
+        if st
+            .last_nav_at
+            .map(|t| now.duration_since(t) < Duration::from_millis(120))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        st.last_nav_at = Some(now);
+        st.close_ext_popup();
+
+        let tid = st.active_tab_id;
+        if st.web_visible {
+            if let Some(b) = st.tab_browsers.get(&tid) {
+                if b.go_forward() {
+                    if let Some(nav) = st.tab_nav_history.get_mut(&tid) {
+                        nav.pending_traversal_at = Some(now);
+                        if nav.index + 1 < nav.entries.len() {
+                            nav.index += 1;
+                        }
+                    }
+                    emit_tab_nav_state(st, tid);
+                    return;
+                }
+            }
+        }
+
+        let target_opt = st.tab_nav_history.get_mut(&tid).and_then(|nav| {
+            if nav.index + 1 < nav.entries.len() {
+                nav.index += 1;
+                nav.pending_traversal_at = Some(now);
+                nav.entries.get(nav.index).cloned()
+            } else {
+                None
+            }
+        });
+
+        if let Some(target_url) = target_opt {
+            if !target_url.is_empty() && parse_http_url_authority(&target_url).is_ok() {
+                st.web_visible = true;
+                st.tab_last_urls.insert(tid, target_url.clone());
+                if let Some(existing) = st.tab_browsers.get(&tid) {
+                    existing.load_url(&target_url);
+                } else {
+                    spawn_content_tab_cef(
+                        win_id,
+                        st,
+                        tid,
+                        &target_url,
+                        bind_port,
+                        is_private,
+                        incognito_ctx,
+                        None,
+                        None,
+                        false,
+                        proxy,
+                        shared_shell,
+                        download_resolver,
+                    );
+                }
+                st.sync_layout();
+                if !st.overlay_open {
+                    if let Some(b) = st.tab_browsers.get(&tid) {
+                        b.focus();
+                    }
+                }
+                emit_ui_sync(
+                    &st.ui_browser,
+                    &serde_json::json!({
+                        "tab_id": tid,
+                        "url": target_url,
+                        "nav_restore_web": true,
+                        "ram_active_count": st.tab_browsers.len()
+                    }),
+                );
+                emit_tab_nav_state(st, tid);
+            }
+            return;
+        }
+
+        if st.web_visible {
+            if let Some(b) = st.tab_browsers.get(&tid) {
+                b.evaluate_script("if (window.history && window.history.length > 1) window.history.forward();");
+            }
+        }
+    }
+
+    fn perform_tab_zoom(st: &BrowserWindowState, action: &str) {
+        if !st.web_visible || st.overlay_open {
+            return;
+        }
+        if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+            let pct = match action {
+                "zoom_in" => b.zoom_step(0.5),
+                "zoom_out" => b.zoom_step(-0.5),
+                "zoom_reset" => b.zoom_reset(),
+                _ => return,
+            };
+            emit_ui_sync(&st.ui_browser, &serde_json::json!({ "zoom_pct": pct }));
+        }
+    }
+
+    let mut prev_xbtn1_down = false;
+    let mut prev_xbtn2_down = false;
+
     event_loop.run(move |event, elwt, control_flow| {
         let fallback_pump_ms: u64 = if windows.values().all(|st| st.was_minimized) {
             100
@@ -2949,12 +3388,111 @@ fn run_windows_frameless_browser(
                     cef_runtime::pump_cef_message_loop();
                     next_cef_pump =
                         std::time::Instant::now() + Duration::from_millis(fallback_pump_ms);
+
+                    // Edge-triggered mouse side-button (XBUTTON1 = Back, XBUTTON2 = Forward)
+                    // fallback when Singularity is foreground so mouse shortcuts also work over
+                    // PDFs, loading pages, and sandboxed cross-origin iframes (debounced with DOM).
+                    const VK_XBUTTON1: i32 = 0x05;
+                    const VK_XBUTTON2: i32 = 0x06;
+                    let x1_down = unsafe { ((GetAsyncKeyState(VK_XBUTTON1) as u16) & 0x8000) != 0 };
+                    let x2_down = unsafe { ((GetAsyncKeyState(VK_XBUTTON2) as u16) & 0x8000) != 0 };
+                    let x1_edge = x1_down && !prev_xbtn1_down;
+                    let x2_edge = x2_down && !prev_xbtn2_down;
+                    prev_xbtn1_down = x1_down;
+                    prev_xbtn2_down = x2_down;
+                    if x1_edge || x2_edge {
+                        let fg = get_win32_foreground_hwnd();
+                        if !fg.is_null() {
+                            let fg_wid = windows
+                                .iter()
+                                .find(|(_, w)| {
+                                    let wh = w.window.hwnd() as *mut core::ffi::c_void;
+                                    wh == fg || is_win32_focus_inside_popup(wh)
+                                })
+                                .map(|(id, _)| *id);
+                            if let Some(target_wid) = fg_wid {
+                                if let Some(st) = windows.get_mut(&target_wid) {
+                                    if !st.overlay_open {
+                                        let is_private = shared_shell
+                                            .lock()
+                                            .map(|s| s.private_browsing_active)
+                                            .unwrap_or(false);
+                                        if x1_edge {
+                                            perform_tab_go_back(
+                                                target_wid,
+                                                st,
+                                                bind_port,
+                                                is_private,
+                                                &mut incognito_ctx,
+                                                &proxy,
+                                                &shared_shell,
+                                                &download_resolver,
+                                            );
+                                        } else if x2_edge {
+                                            perform_tab_go_forward(
+                                                target_wid,
+                                                st,
+                                                bind_port,
+                                                is_private,
+                                                &mut incognito_ctx,
+                                                &proxy,
+                                                &shared_shell,
+                                                &download_resolver,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 *control_flow = if cef_guard.is_some() {
                     ControlFlow::WaitUntil(next_cef_pump)
                 } else {
                     ControlFlow::Exit
                 };
+            }
+            Event::WindowEvent {
+                window_id,
+                event:
+                    WindowEvent::MouseInput {
+                        state: ElementState::Pressed,
+                        button: MouseButton::Other(xbtn),
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(st) = windows.get_mut(&window_id) {
+                    if !st.overlay_open && (xbtn == 1 || xbtn == 2) {
+                        let is_private = shared_shell
+                            .lock()
+                            .map(|s| s.private_browsing_active)
+                            .unwrap_or(false);
+                        if xbtn == 1 {
+                            perform_tab_go_back(
+                                window_id,
+                                st,
+                                bind_port,
+                                is_private,
+                                &mut incognito_ctx,
+                                &proxy,
+                                &shared_shell,
+                                &download_resolver,
+                            );
+                        } else {
+                            perform_tab_go_forward(
+                                window_id,
+                                st,
+                                bind_port,
+                                is_private,
+                                &mut incognito_ctx,
+                                &proxy,
+                                &shared_shell,
+                                &download_resolver,
+                            );
+                        }
+                    }
+                }
             }
             Event::WindowEvent {
                 window_id,
@@ -3004,7 +3542,12 @@ fn run_windows_frameless_browser(
                     }
                 } else {
                     for st in windows.values_mut() {
-                        if st.ext_popup.as_ref().map(|p| p.1 == window_id).unwrap_or(false) {
+                        if st
+                            .ext_popup
+                            .as_ref()
+                            .map(|p| p.window_id == window_id)
+                            .unwrap_or(false)
+                        {
                             st.close_ext_popup();
                             break;
                         }
@@ -3016,7 +3559,17 @@ fn run_windows_frameless_browser(
                 event: WindowEvent::Focused(true),
                 ..
             } => {
-                if let Some(st) = windows.get(&window_id) {
+                if let Some(st) = windows.get_mut(&window_id) {
+                    if let Some(ref p) = st.ext_popup {
+                        let inside_popup =
+                            is_win32_focus_inside_popup(p.window.hwnd() as *mut core::ffi::c_void);
+                        if p.opened_at.elapsed() < Duration::from_millis(500) || inside_popup {
+                            return;
+                        }
+                        if p.auto_dismiss {
+                            st.close_ext_popup();
+                        }
+                    }
                     if st.web_visible
                         && !st.overlay_open
                         && !is_cursor_clicking_top_bar(&st.window)
@@ -3037,7 +3590,14 @@ fn run_windows_frameless_browser(
                         let should_close = st
                             .ext_popup
                             .as_ref()
-                            .map(|p| p.1 == window_id && p.2)
+                            .map(|p| {
+                                p.window_id == window_id
+                                    && p.auto_dismiss
+                                    && p.opened_at.elapsed() >= Duration::from_millis(500)
+                                    && !is_win32_focus_inside_popup(
+                                        p.window.hwnd() as *mut core::ffi::c_void,
+                                    )
+                            })
                             .unwrap_or(false);
                         if should_close {
                             st.close_ext_popup();
@@ -3073,9 +3633,14 @@ fn run_windows_frameless_browser(
                     st.sync_maximized(false);
                 } else {
                     for st in windows.values() {
-                        if let Some((_, pid, _, _, pb)) = st.ext_popup.as_ref() {
-                            if *pid == window_id {
-                                let _ = pb.set_bounds(0, 0, new_size.width.max(1), new_size.height.max(1));
+                        if let Some(ref p) = st.ext_popup {
+                            if p.window_id == window_id {
+                                let _ = p.browser.set_bounds(
+                                    0,
+                                    0,
+                                    new_size.width.max(1),
+                                    new_size.height.max(1),
+                                );
                                 break;
                             }
                         }
@@ -3101,7 +3666,14 @@ fn run_windows_frameless_browser(
                 ..
             } => {
                 if let Some(st) = windows.get_mut(&window_id) {
-                    if st.ext_popup.as_ref().map(|p| p.2).unwrap_or(false) {
+                    let should_close = st
+                        .ext_popup
+                        .as_ref()
+                        .map(|p| {
+                            p.auto_dismiss && p.opened_at.elapsed() >= Duration::from_millis(500)
+                        })
+                        .unwrap_or(false);
+                    if should_close {
                         st.close_ext_popup();
                     }
                     st.capture_geometry(&cfg_clone, &shared_shell);
@@ -3114,6 +3686,44 @@ fn run_windows_frameless_browser(
                         cef_runtime::pump_cef_message_loop();
                         next_cef_pump =
                             std::time::Instant::now() + Duration::from_millis(fallback_pump_ms);
+                        // Auto-dismiss an open extension popup cleanly if the user clicked directly
+                        // back onto a main Singularity web tab (where child HWND activation may not
+                        // resend WM_SETFOCUS to the top-level parent window).
+                        let has_auto_popup = windows.values().any(|w| {
+                            w.ext_popup
+                                .as_ref()
+                                .map(|p| {
+                                    p.auto_dismiss
+                                        && p.opened_at.elapsed() >= Duration::from_millis(500)
+                                })
+                                .unwrap_or(false)
+                        });
+                        if has_auto_popup {
+                            let fg = get_win32_foreground_hwnd();
+                            let fg_is_main_win = !fg.is_null()
+                                && windows
+                                    .values()
+                                    .any(|w| (w.window.hwnd() as *mut core::ffi::c_void) == fg);
+                            if fg_is_main_win {
+                                for st in windows.values_mut() {
+                                    let should_close = st
+                                        .ext_popup
+                                        .as_ref()
+                                        .map(|p| {
+                                            p.auto_dismiss
+                                                && p.opened_at.elapsed()
+                                                    >= Duration::from_millis(500)
+                                                && !is_win32_focus_inside_popup(
+                                                    p.window.hwnd() as *mut core::ffi::c_void,
+                                                )
+                                        })
+                                        .unwrap_or(false);
+                                    if should_close {
+                                        st.close_ext_popup();
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         let target = std::time::Instant::now()
                             + Duration::from_millis((delay_ms as u64).min(fallback_pump_ms));
@@ -3440,6 +4050,22 @@ fn run_windows_frameless_browser(
                                     sm.browser_created = true;
                                     sm.log(&format!("BrowserCreated (ui_browser, hwnd=0x{:x})", hwnd as usize));
                                 }
+                            } else if tab_id == 0 {
+                                if let Some(ref popup) = st.ext_popup {
+                                    popup.browser.cache_hwnd(hwnd);
+                                    ensure_win32_clip_children(
+                                        popup.window.hwnd() as *mut core::ffi::c_void,
+                                    );
+                                    let psize = popup.window.inner_size();
+                                    let _ = popup.browser.set_bounds(
+                                        0,
+                                        0,
+                                        psize.width.max(1),
+                                        psize.height.max(1),
+                                    );
+                                    let _ = popup.browser.set_visible(true);
+                                }
+                                return;
                             } else if let Some(b) = st.tab_browsers.get(&tab_id) {
                                 b.cache_hwnd(hwnd);
                                 st.layout_cache.invalidate_tab(Some(tab_id));
@@ -3591,6 +4217,74 @@ fn run_windows_frameless_browser(
                             st.close_ext_popup();
                         }
                     }
+                    CefCallbackEvent::NavigationStateChanged {
+                        tab_id,
+                        can_go_back,
+                        can_go_forward,
+                    } => {
+                        if tab_id == 0 {
+                            return;
+                        }
+                        if let Some(st) = windows.get_mut(&wid) {
+                            let nav = st
+                                .tab_nav_history
+                                .entry(tab_id)
+                                .or_insert_with(TabNavHistory::new_with_home);
+                            nav.cef_can_go_back = can_go_back;
+                            nav.cef_can_go_forward = can_go_forward;
+                            if tab_id == st.active_tab_id {
+                                emit_tab_nav_state(st, tab_id);
+                            }
+                        }
+                    }
+                    CefCallbackEvent::NativeShortcut { tab_id, action } => {
+                        if let Some(st) = windows.get_mut(&wid) {
+                            if tab_id != 0 && tab_id != st.active_tab_id {
+                                return;
+                            }
+                            if st.overlay_open {
+                                return;
+                            }
+                            match action {
+                                "web_back" => {
+                                    let is_private = shared_shell
+                                        .lock()
+                                        .map(|s| s.private_browsing_active)
+                                        .unwrap_or(false);
+                                    perform_tab_go_back(
+                                        wid,
+                                        st,
+                                        bind_port,
+                                        is_private,
+                                        &mut incognito_ctx,
+                                        &proxy,
+                                        &shared_shell,
+                                        &download_resolver,
+                                    );
+                                }
+                                "web_forward" => {
+                                    let is_private = shared_shell
+                                        .lock()
+                                        .map(|s| s.private_browsing_active)
+                                        .unwrap_or(false);
+                                    perform_tab_go_forward(
+                                        wid,
+                                        st,
+                                        bind_port,
+                                        is_private,
+                                        &mut incognito_ctx,
+                                        &proxy,
+                                        &shared_shell,
+                                        &download_resolver,
+                                    );
+                                }
+                                "zoom_in" | "zoom_out" | "zoom_reset" => {
+                                    perform_tab_zoom(st, action);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     CefCallbackEvent::PageStarted { tab_id, url } => {
                         if tab_id == 0 {
                             if let Some(ref sm) = smoke_tracker {
@@ -3612,10 +4306,17 @@ fn run_windows_frameless_browser(
                                 st.tab_scroll_ys.remove(&tab_id);
                             }
                             st.tab_last_urls.insert(tab_id, url.clone());
+                            st.tab_nav_history
+                                .entry(tab_id)
+                                .or_insert_with(TabNavHistory::new_with_home)
+                                .record_url(&url);
                             emit_ui_sync(
                                 &st.ui_browser,
                                 &serde_json::json!({ "tab_id": tab_id, "url": url }),
                             );
+                            if tab_id == st.active_tab_id {
+                                emit_tab_nav_state(st, tab_id);
+                            }
                         }
                     }
                     CefCallbackEvent::AddressChanged { tab_id, url } => {
@@ -3642,10 +4343,17 @@ fn run_windows_frameless_browser(
                                     st.tab_scroll_ys.remove(&tab_id);
                                 }
                                 st.tab_last_urls.insert(tab_id, url.clone());
+                                st.tab_nav_history
+                                    .entry(tab_id)
+                                    .or_insert_with(TabNavHistory::new_with_home)
+                                    .record_url(&url);
                                 emit_ui_sync(
                                     &st.ui_browser,
                                     &serde_json::json!({ "tab_id": tab_id, "url": url }),
                                 );
+                                if tab_id == st.active_tab_id {
+                                    emit_tab_nav_state(st, tab_id);
+                                }
                             }
                         }
                     }
@@ -3907,12 +4615,15 @@ fn run_windows_frameless_browser(
                                         | "jump_tab"
                                         | "web_back"
                                         | "web_forward"
+                                        | "zoom_in"
+                                        | "zoom_out"
+                                        | "zoom_reset"
                                 );
                                 if !allowed {
                                     return;
                                 }
                                 let now = std::time::Instant::now();
-                                if now.duration_since(last_shortcut_at) < Duration::from_millis(80)
+                                if now.duration_since(last_shortcut_at) < Duration::from_millis(60)
                                 {
                                     return;
                                 }
@@ -3955,17 +4666,41 @@ fn run_windows_frameless_browser(
                                             return;
                                         }
                                         "web_back" => {
-                                            if let Some(b) = st.tab_browsers.get(&st.active_tab_id)
-                                            {
-                                                b.go_back();
-                                            }
+                                            let is_private = shared_shell
+                                                .lock()
+                                                .map(|s| s.private_browsing_active)
+                                                .unwrap_or(false);
+                                            perform_tab_go_back(
+                                                wid,
+                                                st,
+                                                bind_port,
+                                                is_private,
+                                                &mut incognito_ctx,
+                                                &proxy,
+                                                &shared_shell,
+                                                &download_resolver,
+                                            );
                                             return;
                                         }
                                         "web_forward" => {
-                                            if let Some(b) = st.tab_browsers.get(&st.active_tab_id)
-                                            {
-                                                b.go_forward();
-                                            }
+                                            let is_private = shared_shell
+                                                .lock()
+                                                .map(|s| s.private_browsing_active)
+                                                .unwrap_or(false);
+                                            perform_tab_go_forward(
+                                                wid,
+                                                st,
+                                                bind_port,
+                                                is_private,
+                                                &mut incognito_ctx,
+                                                &proxy,
+                                                &shared_shell,
+                                                &download_resolver,
+                                            );
+                                            return;
+                                        }
+                                        "zoom_in" | "zoom_out" | "zoom_reset" => {
+                                            perform_tab_zoom(st, action);
                                             return;
                                         }
                                         "reload_tab" => {
@@ -4433,6 +5168,10 @@ fn run_windows_frameless_browser(
                                     st.web_visible = true;
                                     st.overlay_open = ov;
                                     st.tab_last_urls.insert(tid, url.clone());
+                                    st.tab_nav_history
+                                        .entry(tid)
+                                        .or_insert_with(TabNavHistory::new_with_home)
+                                        .record_url(&url);
 
                                     if let Some(existing) = st.tab_browsers.get(&tid) {
                                         existing.load_url(&url);
@@ -4467,6 +5206,7 @@ fn run_windows_frameless_browser(
                                             "ram_active_count": st.tab_browsers.len()
                                         }),
                                     );
+                                    emit_tab_nav_state(st, tid);
                                 }
                             }
                             UiIpcCmd::ActivateTab {
@@ -4513,6 +5253,11 @@ fn run_windows_frameless_browser(
                                         if let Some(existing) = st.tab_browsers.get(&tab_id) {
                                             if let Some(live_url) = read_live_http_url(existing) {
                                                 st.tab_last_urls.insert(tab_id, live_url.clone());
+                                                st.tab_nav_history
+                                                    .entry(tab_id)
+                                                    .or_insert_with(|| {
+                                                        TabNavHistory::new_with_url(&live_url)
+                                                    });
                                                 emit_ui_sync(
                                                     &st.ui_browser,
                                                     &serde_json::json!({
@@ -4541,6 +5286,11 @@ fn run_windows_frameless_browser(
                                                         .filter(|&sy| sy >= 40)
                                                 });
                                             st.tab_last_urls.insert(tab_id, url.clone());
+                                            st.tab_nav_history
+                                                .entry(tab_id)
+                                                .or_insert_with(|| {
+                                                    TabNavHistory::new_with_url(&url)
+                                                });
                                             if let Some(t) = target_sec {
                                                 st.tab_media_times.insert(tab_id, t);
                                             }
@@ -4571,8 +5321,13 @@ fn run_windows_frameless_browser(
                                                 }),
                                             );
                                         }
+                                    } else {
+                                        st.tab_nav_history
+                                            .entry(tab_id)
+                                            .or_insert_with(TabNavHistory::new_with_home);
                                     }
                                     st.sync_layout();
+                                    emit_tab_nav_state(st, tab_id);
                                     if st.web_visible && !st.overlay_open {
                                         if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
                                             b.focus();
@@ -4603,6 +5358,7 @@ fn run_windows_frameless_browser(
                                     st.tab_browsers.remove(&tab_id);
                                     st.layout_cache.invalidate_tab(Some(tab_id));
                                     st.tab_last_urls.remove(&tab_id);
+                                    st.tab_nav_history.remove(&tab_id);
                                     st.tab_media_times.remove(&tab_id);
                                     st.tab_scroll_ys.remove(&tab_id);
                                     st.tab_bg_intents.remove(&tab_id);
@@ -4684,10 +5440,11 @@ fn run_windows_frameless_browser(
                                 let Some(st) = windows.get_mut(&wid) else {
                                     return;
                                 };
-                                if let Some((open_id, _, _, pwin, pb)) = st.ext_popup.take() {
-                                    drop(pb);
-                                    drop(pwin);
-                                    if open_id == ext_id && !open_options {
+                                if let Some(open_popup) = st.ext_popup.take() {
+                                    let was_same = open_popup.ext_id == ext_id;
+                                    drop(open_popup.browser);
+                                    drop(open_popup.window);
+                                    if was_same && !open_options {
                                         st.last_ext_popup_closed = None;
                                         return;
                                     }
@@ -4779,6 +5536,9 @@ fn run_windows_frameless_browser(
                                 enable_win32_immersive_dark_window(
                                     popup_win.hwnd() as *mut core::ffi::c_void,
                                 );
+                                ensure_win32_clip_children(
+                                    popup_win.hwnd() as *mut core::ffi::c_void,
+                                );
                                 let pphys = popup_win.inner_size();
                                 let pop_proxy = proxy.clone();
                                 let pop_sink: CefEventSink = Arc::new(move |evt| {
@@ -4802,10 +5562,17 @@ fn run_windows_frameless_browser(
                                     Arc::clone(&shared_shell),
                                     Arc::clone(&download_resolver),
                                 ) {
+                                    bring_win32_window_to_front(popup_win.hwnd());
                                     popup_b.focus();
                                     let pid = popup_win.id();
-                                    st.ext_popup =
-                                        Some((ext_id, pid, !open_options, popup_win, popup_b));
+                                    st.ext_popup = Some(ExtPopupState {
+                                        ext_id,
+                                        window_id: pid,
+                                        auto_dismiss: !open_options,
+                                        opened_at: std::time::Instant::now(),
+                                        browser: popup_b,
+                                        window: popup_win,
+                                    });
                                 } else {
                                     drop(popup_win);
                                     emit_ui_sync(
@@ -4942,17 +5709,44 @@ fn run_windows_frameless_browser(
                                 }
                             }
                             UiIpcCmd::WebBack => {
-                                if let Some(st) = windows.get(&wid) {
-                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
-                                        b.go_back();
-                                    }
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    let is_private = shared_shell
+                                        .lock()
+                                        .map(|s| s.private_browsing_active)
+                                        .unwrap_or(false);
+                                    perform_tab_go_back(
+                                        wid,
+                                        st,
+                                        bind_port,
+                                        is_private,
+                                        &mut incognito_ctx,
+                                        &proxy,
+                                        &shared_shell,
+                                        &download_resolver,
+                                    );
                                 }
                             }
                             UiIpcCmd::WebForward => {
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    let is_private = shared_shell
+                                        .lock()
+                                        .map(|s| s.private_browsing_active)
+                                        .unwrap_or(false);
+                                    perform_tab_go_forward(
+                                        wid,
+                                        st,
+                                        bind_port,
+                                        is_private,
+                                        &mut incognito_ctx,
+                                        &proxy,
+                                        &shared_shell,
+                                        &download_resolver,
+                                    );
+                                }
+                            }
+                            UiIpcCmd::WebZoom { action } => {
                                 if let Some(st) = windows.get(&wid) {
-                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
-                                        b.go_forward();
-                                    }
+                                    perform_tab_zoom(st, action.as_str());
                                 }
                             }
                             UiIpcCmd::WebReload => {
@@ -5570,13 +6364,20 @@ fn read_http_request(
         }
     }
 
+    let max_body_bytes = if full_target == "/api/bookmarks/import-file"
+        || full_target.starts_with("/api/bookmarks/import-file?")
+    {
+        MAX_BOOKMARK_IMPORT_BODY_BYTES
+    } else {
+        MAX_HTTP_BODY_BYTES
+    };
     let content_length: usize = match headers.get("content-length") {
         Some(v) => match v.parse::<usize>() {
-            Ok(len) if len <= MAX_HTTP_BODY_BYTES => len,
+            Ok(len) if len <= max_body_bytes => len,
             Ok(_) => {
                 return Err(HttpResponse::text(
                     "413 Payload Too Large",
-                    "Request body exceeds 512 KiB limit",
+                    "Request body exceeds maximum allowed size",
                 ));
             }
             Err(_) => {
@@ -6127,7 +6928,7 @@ fn dispatch_http_request(
                     .collect();
                 let ts = unix_now();
                 for (i, bm) in extracted.bookmarks.into_iter().enumerate() {
-                    if shell.roaming.profile.bookmarks.len() >= 500 {
+                    if shell.roaming.profile.bookmarks.len() >= 2000 {
                         break;
                     }
                     if parse_http_url_authority(&bm.url).is_err() {
@@ -6520,6 +7321,86 @@ fn dispatch_http_request(
             let _ = shell.roaming.save_profile();
             let out = serde_json::json!({ "bookmarks": shell.roaming.profile.bookmarks });
             HttpResponse::json("200 OK", &out)
+        }
+        "/api/bookmarks/import-file" => {
+            let body = match require_post() {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let filename = body
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("bookmarks.html");
+            let content = body
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if content.trim().is_empty() {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "error": "Bookmark file content is empty." }),
+                );
+            }
+            let parsed = browser_import::parse_exported_bookmarks_file(filename, content);
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let mut existing_bms: HashSet<String> = shell
+                .roaming
+                .profile
+                .bookmarks
+                .iter()
+                .map(|b| b.url.clone())
+                .collect();
+            let ts = unix_now();
+            let mut imported_count = 0usize;
+            let mut skipped_duplicates = 0usize;
+            for (i, bm) in parsed.into_iter().enumerate() {
+                if shell.roaming.profile.bookmarks.len() >= 2000 {
+                    break;
+                }
+                if parse_http_url_authority(&bm.url).is_err() {
+                    continue;
+                }
+                if existing_bms.insert(bm.url.clone()) {
+                    shell.roaming.profile.bookmarks.push(BookmarkEntry {
+                        id: format!("bm-file-{}-{}", ts, i),
+                        title: bm.title,
+                        url: bm.url,
+                    });
+                    imported_count += 1;
+                } else {
+                    skipped_duplicates += 1;
+                }
+            }
+            let _ = shell.roaming.save_profile();
+            let out = serde_json::json!({
+                "ok": true,
+                "imported_count": imported_count,
+                "skipped_duplicates": skipped_duplicates,
+                "total_count": shell.roaming.profile.bookmarks.len(),
+                "bookmarks": shell.roaming.profile.bookmarks
+            });
+            HttpResponse::json("200 OK", &out)
+        }
+        "/api/bookmarks/export-html" => {
+            if req.method != "GET" {
+                return HttpResponse::text("405 Method Not Allowed", "Method Not Allowed");
+            }
+            let pairs: Vec<(String, String)> = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell
+                    .roaming
+                    .profile
+                    .bookmarks
+                    .iter()
+                    .map(|b| (b.title.clone(), b.url.clone()))
+                    .collect()
+            };
+            let html = browser_import::format_netscape_bookmarks_html(&pairs);
+            HttpResponse::new("200 OK", "text/html; charset=utf-8", html.into_bytes())
+                .with_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"singularity-bookmarks.html\"",
+                )
         }
         "/api/history/list" => {
             let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());

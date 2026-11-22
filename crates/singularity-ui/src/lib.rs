@@ -788,11 +788,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.5");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.6");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.5"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.6"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.5"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.6"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1337,7 +1337,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.5"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.6"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1422,7 +1422,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.5"));
+        assert!(txt.contains("v2.0.6"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1456,7 +1456,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.5"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.6"));
     }
 
     #[test]
@@ -1531,7 +1531,7 @@ mod tests {
         // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.5"}"#,
+            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.6"}"#,
         )
         .expect("write running.lock");
         let sessions_dir = tmp_dir.join("sessions");
@@ -1597,7 +1597,7 @@ mod tests {
         // even after the new process truncates `cef.log`!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.5"}"#,
+            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.6"}"#,
         )
         .expect("write dead lock");
         std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
@@ -1631,5 +1631,147 @@ mod tests {
         let installer_src = include_str!("../../singularity-installer/src/main.rs");
         assert!(installer_src.contains("planned_restart.flag"));
         assert!(installer_src.contains("terminated_live"));
+    }
+
+    #[test]
+    fn test_v206_extension_popups_persistence_bookmarks_and_navigation() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity_v206_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 1. Extension runtime ID lookup resolves from CEF's `cef-profile/Default/Preferences`
+        let ext_dir = tmp_dir.join("extensions").join("my_cashback_ext");
+        let cef_def = tmp_dir.join("cef-profile").join("Default");
+        std::fs::create_dir_all(&ext_dir).expect("create ext dir");
+        std::fs::create_dir_all(&cef_def).expect("create cef profile dir");
+        std::fs::write(
+            ext_dir.join("manifest.json"),
+            r#"{
+                "manifest_version": 3,
+                "name": "Cashback Helper",
+                "version": "1.2.3",
+                "action": { "default_popup": "popup.html" },
+                "host_permissions": [
+                    "https://*.cashback-example.com/*",
+                    "<all_urls>",
+                    "*://*/*"
+                ],
+                "homepage_url": "https://portal.cashback-example.org/login"
+            }"#,
+        )
+        .expect("write manifest");
+        std::fs::write(ext_dir.join("popup.html"), "<html><body>Popup</body></html>")
+            .expect("write popup");
+        let rt_id = "abcdefghijklmnopabcdefghijklmnop";
+        std::fs::write(
+            cef_def.join("Preferences"),
+            serde_json::json!({
+                "extensions": {
+                    "settings": {
+                        rt_id: {
+                            "path": ext_dir.to_string_lossy().to_string(),
+                            "manifest": { "name": "Cashback Helper" }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write CEF Preferences");
+
+        let resolved =
+            extensions::find_runtime_extension_id(&tmp_dir, &ext_dir, "my_cashback_ext", "Cashback Helper");
+        assert_eq!(resolved.as_deref(), Some(rt_id));
+
+        // 2. Extension host domain extraction collects concrete domains & ignores wildcards
+        extensions::invalidate_extensions_cache();
+        let ext_domains = extensions::collect_installed_extension_host_domains(&tmp_dir);
+        assert!(ext_domains.contains(&"cashback-example.com".to_string()));
+        assert!(ext_domains.contains(&"portal.cashback-example.org".to_string()));
+        assert!(!ext_domains.iter().any(|d| d.contains('*') || d == "<all_urls>"));
+        assert!(extensions::host_matches_extension_domains(
+            "api.cashback-example.com",
+            &ext_domains
+        ));
+        assert!(!extensions::host_matches_extension_domains(
+            "doubleclick.net",
+            &ext_domains
+        ));
+
+        // 3. Expanded auth cookie protection protects extension/site login tokens while keeping trackers blocked
+        for (dom, name) in [
+            (".bitwarden.com", "bw_refresh_token"),
+            (".proton.me", "jwt_access"),
+            (".example.org", "remember_user_id"),
+            (".cashback-example.com", "logged_in_member"),
+            (".vault.example.com", "oauth_bearer"),
+        ] {
+            assert!(
+                is_protected_session_or_functional_cookie(dom, name),
+                "expected auth cookie {} on {} to be protected",
+                name,
+                dom
+            );
+            assert_eq!(
+                classify_tracker_or_malicious_cookie(dom, name, "valid_secret_value"),
+                None
+            );
+        }
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(".example.com", "_ga", "GA1.1.12345"),
+            Some(CookieThreatKind::Tracker)
+        );
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(".example.com", "_fbp", "fb.1.12345"),
+            Some(CookieThreatKind::Advertising)
+        );
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(".example.com", "_hjsession_123", "abc"),
+            Some(CookieThreatKind::Tracker)
+        );
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(".doubleclick.net", "IDE", "abc"),
+            Some(CookieThreatKind::Advertising)
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 4. Verify UI & runtime invariants for all 5 v2.0.6 fixes/features
+        assert!(SINGULARITY_UI_HTML.contains("id=\"ntp-bookmarks-bar\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"bm-file-input\""));
+        assert!(SINGULARITY_UI_HTML.contains("/api/bookmarks/import-file"));
+        assert!(SINGULARITY_UI_HTML.contains("/api/bookmarks/export-html"));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"btn-nav-back\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"btn-nav-fwd\""));
+        assert!(SINGULARITY_UI_HTML.contains("e.button === 3"));
+        assert!(SINGULARITY_UI_HTML.contains("e.button === 4"));
+        assert!(SINGULARITY_UI_HTML.contains("nav_to_home"));
+        assert!(SINGULARITY_UI_HTML.contains("nav_restore_web"));
+
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("struct ExtPopupState"));
+        assert!(server_src.contains("fn is_win32_focus_inside_popup"));
+        assert!(server_src.contains("struct TabNavHistory"));
+        assert!(server_src.contains("fn perform_tab_go_back"));
+        assert!(server_src.contains("fn perform_tab_go_forward"));
+        assert!(server_src.contains("fn perform_tab_zoom"));
+        assert!(server_src.contains("MouseButton::Other(xbtn)"));
+        assert!(server_src.contains("VK_XBUTTON1"));
+        assert!(server_src.contains("e.button === 3"));
+        assert!(server_src.contains("/api/bookmarks/import-file"));
+        assert!(server_src.contains("/api/bookmarks/export-html"));
+
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("cookieable_schemes_list"));
+        assert!(cef_src.contains("chrome-extension"));
+        assert!(!cef_src.contains("\"disable-background-networking\""));
+        assert!(cef_src.contains("collect_installed_extension_host_domains"));
+        assert!(cef_src.contains("flush_store"));
+        assert!(cef_src.contains("SingularityKeyboardHandler"));
+        assert!(cef_src.contains("on_loading_state_change"));
+        assert!(cef_src.contains("pub fn zoom_step"));
     }
 }

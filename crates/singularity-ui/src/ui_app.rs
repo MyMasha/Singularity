@@ -239,11 +239,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   .apple-bar button,
+  .apple-bar button *,
   .apple-bar input,
   .apple-bar select,
   .apple-bar a,
   .traffic-lights,
   .safari-nav-group,
+  .safari-nav-group *,
   .tabs-bar-wrap,
   .tabs-strip,
   .tab-pill,
@@ -339,10 +341,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     justify-content: center;
     cursor: pointer;
     position: relative;
-    transition: background 0.15s ease, color 0.15s ease;
+    transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
     flex-shrink: 0;
   }
+  .icon-btn svg { pointer-events: none; }
   .icon-btn:hover { background: var(--glass-hover); color: #ffffff; }
+  .icon-btn.nav-dim { opacity: 0.38; }
+  .icon-btn.nav-dim:hover { opacity: 0.72; }
   .icon-btn.active-gold { color: var(--gold-bright); background: rgba(240, 178, 84, 0.14); }
 
   .mini-badge {
@@ -881,6 +886,122 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   #ntp-view {
     width: 100%;
     height: 100%;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: stretch;
+    pointer-events: none;
+  }
+
+  /* Bookmarks Bar: shown EXCLUSIVELY on New Tab / Search pages directly underneath the open tabs bar */
+  #ntp-bookmarks-bar {
+    pointer-events: auto;
+    width: 100%;
+    height: 36px;
+    min-height: 36px;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(10, 12, 18, 0.78);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    flex-shrink: 0;
+    z-index: 4;
+  }
+
+  .ntp-bm-scroll {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .ntp-bm-scroll::-webkit-scrollbar { display: none; }
+
+  .ntp-bm-item {
+    height: 26px;
+    max-width: 176px;
+    padding: 0 9px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+  }
+  .ntp-bm-item:hover {
+    background: rgba(255, 255, 255, 0.09);
+    border-color: rgba(255, 255, 255, 0.10);
+    color: #ffffff;
+  }
+  .ntp-bm-item img, .ntp-bm-item svg {
+    width: 13px;
+    height: 13px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .ntp-bm-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ntp-bm-empty-hint {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    padding: 0 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ntp-bm-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+    padding-left: 8px;
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .ntp-bm-action-btn {
+    height: 24px;
+    padding: 0 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+  }
+  .ntp-bm-action-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: var(--border-warm);
+    color: #ffffff;
+  }
+
+  .ntp-stage-body {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
     padding: 28px 32px;
     display: flex;
     flex-direction: column;
@@ -953,40 +1074,6 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     outline: none; cursor: pointer;
   }
   .engine-pill-select option { background: #0d1017; color: var(--text-primary); }
-
-  /* Quick-Launch Bookmarks Strip */
-  .quick-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
-  .quick-strip {
-    display: inline-flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 2px;
-    padding: 3px;
-    border-radius: 9px;
-    background: rgba(10, 12, 18, 0.82);
-    border: 1px solid rgba(255, 255, 255, 0.085);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-  }
-
-  .quick-pill {
-    height: 28px;
-    padding: 0 10px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-secondary);
-    font-family: inherit;
-    font-size: 11.5px;
-    font-weight: 500;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    transition: background 0.14s ease, color 0.14s ease;
-  }
-  .quick-pill:hover { background: rgba(255, 255, 255, 0.08); color: #ffffff; }
-  .quick-pill svg { width: 13px; height: 13px; opacity: 0.85; flex-shrink: 0; }
 
   #web-view { display: none; width: 100%; height: 100%; background: #000000; }
   #web-frame { width: 100%; height: 100%; border: none; background: #0a0a0d; }
@@ -1837,12 +1924,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <button type="button" class="brand-home-btn" title="Singularity Home" data-i18n-title="nav_home" onclick="openHomeInActiveTab()">
             <img src="/api/logo.png" alt="Singularity" />
           </button>
-          <button type="button" class="icon-btn" title="Back" data-i18n-title="nav_back" onclick="historyBack()">
+          <button type="button" class="icon-btn" id="btn-nav-back" title="Back" data-i18n-title="nav_back" onclick="historyBack()">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="15 18 9 12 15 6"/>
             </svg>
           </button>
-          <button type="button" class="icon-btn" title="Forward" data-i18n-title="nav_forward" onclick="historyForward()">
+          <button type="button" class="icon-btn" id="btn-nav-fwd" title="Forward" data-i18n-title="nav_forward" onclick="historyForward()">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"/>
             </svg>
@@ -1959,34 +2046,40 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     <main id="stage-viewport">
       <!-- NEW TAB PAGE -->
       <section id="ntp-view">
-        <div class="ntp-cluster">
-          <div class="hero-kicker">
-            <span class="status-dot" id="ntp-kicker-dot"></span>
-            <span id="ntp-kicker-text">Singularity &middot; Encrypted .singularity Vault</span>
+        <!-- Bookmarks Bar: displayed ONLY on New Tab / Search pages, flush underneath the open tabs bar -->
+        <nav id="ntp-bookmarks-bar" aria-label="Bookmarks bar" data-i18n-aria="bm_bar_aria">
+          <div class="ntp-bm-scroll" id="ntp-bookmarks-strip"></div>
+          <div class="ntp-bm-actions">
+            <button type="button" class="ntp-bm-action-btn" id="btn-ntp-bm-import" onclick="openSheet('bookmarks')" data-i18n="bm_bar_import">Import</button>
+            <button type="button" class="ntp-bm-action-btn" id="btn-ntp-bm-add" onclick="openSheet('bookmarks')" title="Add or manage bookmarks" data-i18n-title="bm_bar_add_title">+</button>
           </div>
-          <h1 class="hero-title">SINGULARITY</h1>
+        </nav>
 
-          <div class="ntp-search-bar">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);flex-shrink:0;">
-              <circle cx="11" cy="11" r="7.5"/>
-              <line x1="20" y1="20" x2="16.35" y2="16.35"/>
-            </svg>
-            <input id="ntp-search-input" class="ntp-search-input" type="text" spellcheck="false"
-                   placeholder="Search the web or enter a URL..."
-                   data-i18n-placeholder="ntp_placeholder"
-                   onkeydown="if(event.key==='Enter') executeNtpSearch(this.value)" />
-            <select id="search-engine" class="engine-pill-select" aria-label="Search engine" data-i18n-aria="search_engine_aria" onchange="saveDefaultEngine(this.value)">
-              <option value="ddg">DuckDuckGo</option>
-              <option value="google">Google</option>
-              <option value="brave">Brave</option>
-              <option value="qwant">Qwant</option>
-              <option value="startpage">Startpage</option>
-            </select>
-          </div>
+        <div class="ntp-stage-body">
+          <div class="ntp-cluster">
+            <div class="hero-kicker">
+              <span class="status-dot" id="ntp-kicker-dot"></span>
+              <span id="ntp-kicker-text">Singularity &middot; Encrypted .singularity Vault</span>
+            </div>
+            <h1 class="hero-title">SINGULARITY</h1>
 
-          <!-- Dynamic User Bookmarks Strip -->
-          <div class="quick-row">
-            <div class="quick-strip" id="ntp-bookmarks-strip"></div>
+            <div class="ntp-search-bar">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted);flex-shrink:0;">
+                <circle cx="11" cy="11" r="7.5"/>
+                <line x1="20" y1="20" x2="16.35" y2="16.35"/>
+              </svg>
+              <input id="ntp-search-input" class="ntp-search-input" type="text" spellcheck="false"
+                     placeholder="Search the web or enter a URL..."
+                     data-i18n-placeholder="ntp_placeholder"
+                     onkeydown="if(event.key==='Enter') executeNtpSearch(this.value)" />
+              <select id="search-engine" class="engine-pill-select" aria-label="Search engine" data-i18n-aria="search_engine_aria" onchange="saveDefaultEngine(this.value)">
+                <option value="ddg">DuckDuckGo</option>
+                <option value="google">Google</option>
+                <option value="brave">Brave</option>
+                <option value="qwant">Qwant</option>
+                <option value="startpage">Startpage</option>
+              </select>
+            </div>
           </div>
         </div>
       </section>
@@ -2191,7 +2284,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.5</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.6</div>
         </div>
       </aside>
 
@@ -2420,13 +2513,31 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       <!-- TAB 5: BOOKMARKS & HISTORY -->
       <div class="panel-grid" id="pane-bookmarks">
         <div class="info-card">
-          <div class="card-label" data-i18n="bm_add_title">Add Quick Bookmark</div>
+          <div class="card-label" data-i18n="bm_import_card_title">Import &amp; Export Bookmarks (Browsers or File)</div>
+          <div style="font-size:12px;color:var(--text-secondary);line-height:1.45;" data-i18n="bm_import_card_desc">
+            Import bookmarks from another installed browser (Chrome, Edge, Brave, Opera, Firefox, Vivaldi, Arc...) or from an exported bookmarks file (.html / .json). Your bookmarks bar appears exclusively on New Tab pages directly underneath open tabs.
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <input id="bm-file-input" type="file" accept=".html,.htm,.json,text/html,application/json" style="display:none;" onchange="handleBookmarksFileSelected(this)" />
+            <button type="button" class="btn-gold" style="height:32px;" data-i18n="bm_btn_import_file" onclick="document.getElementById('bm-file-input').click()">Import file (.html / .json)</button>
+            <button type="button" class="btn-subtle" data-i18n="bm_btn_export_html" onclick="exportBookmarksToHtml()">Export (.html)</button>
+            <button type="button" class="btn-subtle" data-i18n="bm_btn_rescan_browsers" onclick="loadBookmarkImportBrowsers(true)">Scan browsers</button>
+          </div>
+          <div id="bm-import-browsers-list" style="display:flex;flex-direction:column;gap:6px;margin-top:4px;"></div>
+        </div>
+
+        <div class="info-card">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <span class="card-label" data-i18n="bm_add_title">Add Quick Bookmark</span>
+            <span id="bm-count-badge" class="mono-val" style="font-size:11px;"></span>
+          </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <input id="bm-new-title" class="text-field" style="width:190px;" type="text" placeholder="Title (e.g. ProtonMail)" data-i18n-placeholder="bm_title_ph" />
             <input id="bm-new-url" class="text-field" style="flex:1;min-width:220px;" type="text" placeholder="URL (e.g. https://mail.proton.me)" data-i18n-placeholder="bm_url_ph" />
             <button type="button" class="btn-subtle" data-i18n="btn_add" onclick="addBookmarkFromSheet()">Add</button>
           </div>
-          <div id="bm-sheet-list" style="display:flex;flex-direction:column;gap:6px;margin-top:6px;"></div>
+          <input id="bm-filter-input" class="text-field" type="text" placeholder="Filter your bookmarks..." data-i18n-placeholder="bm_filter_ph" oninput="renderBookmarksSheetList()" style="margin-top:4px;" />
+          <div id="bm-sheet-list" style="display:flex;flex-direction:column;gap:6px;margin-top:6px;max-height:260px;overflow-y:auto;"></div>
         </div>
 
         <div class="info-card">
@@ -2759,6 +2870,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tok_name_ph: "Nom (ex: oauth_token)",
     tok_sec_ph: "Valeur du token à chiffrer...",
     btn_encrypt_save: "Chiffrer & Sauvegarder",
+    bm_bar_aria: "Barre de favoris",
+    bm_bar_import: "Importer",
+    bm_bar_add_title: "Ajouter ou gérer les favoris",
+    bm_import_card_title: "Importer & Exporter des Favoris (Navigateurs ou Fichier)",
+    bm_import_card_desc: "Importez vos favoris depuis un autre navigateur installé (Chrome, Edge, Brave, Opera, Firefox, Vivaldi, Arc...) ou depuis un fichier exporté (.html / .json). La barre de favoris s'affiche uniquement dans les nouveaux onglets, juste en dessous des onglets ouverts.",
+    bm_btn_import_file: "Importer un fichier (.html / .json)",
+    bm_btn_export_html: "Exporter (.html)",
+    bm_btn_rescan_browsers: "Actualiser les navigateurs",
+    bm_filter_ph: "Filtrer vos favoris...",
     bm_add_title: "Ajouter un Favori Rapide",
     bm_title_ph: "Nom (ex: ProtonMail)",
     bm_url_ph: "URL (ex: https://mail.proton.me)",
@@ -3223,13 +3343,36 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   function renderBookmarksStrip() {
     const strip = document.getElementById("ntp-bookmarks-strip");
+    if (!strip) return;
+    if (!strip.dataset.wheelWired) {
+      strip.dataset.wheelWired = "1";
+      strip.addEventListener("wheel", (e) => {
+        if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+          e.preventDefault();
+          strip.scrollLeft += e.deltaY;
+        }
+      }, { passive: false });
+    }
     strip.replaceChildren();
+    if (!currentBookmarks || currentBookmarks.length === 0) {
+      const hint = document.createElement("span");
+      hint.className = "ntp-bm-empty-hint";
+      hint.textContent = L(
+        "No bookmarks yet — import from Chrome, Firefox, Edge or an exported .html file",
+        "Aucun favori — importez depuis Chrome, Firefox, Edge ou un fichier .html exporté"
+      );
+      strip.appendChild(hint);
+      updateBookmarkStarState();
+      return;
+    }
     for (const b of currentBookmarks) {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "quick-pill";
+      btn.className = "ntp-bm-item";
+      btn.title = b.title ? `${b.title}\n${b.url}` : b.url;
       btn.appendChild(createBookmarkIconNode(b.url));
       const sp = document.createElement("span");
+      sp.className = "ntp-bm-label";
       sp.textContent = b.title || b.url;
       btn.appendChild(sp);
       btn.addEventListener("click", (e) => {
@@ -3249,15 +3392,6 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       });
       strip.appendChild(btn);
     }
-    const addBtn = document.createElement("button");
-    addBtn.type = "button";
-    addBtn.className = "quick-pill";
-    addBtn.title = L("Manage bookmarks", "Gérer les favoris");
-    const plus = document.createElement("span");
-    plus.textContent = "+";
-    addBtn.appendChild(plus);
-    addBtn.addEventListener("click", () => openSheet("bookmarks"));
-    strip.appendChild(addBtn);
     updateBookmarkStarState();
   }
 
@@ -4424,6 +4558,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     omni.value = tab.url || "";
     renderTabs(true);
     updateBookmarkStarState();
+    updateNavArrowsState(tab.canGoBack, tab.canGoForward);
     persistOpenTabsIfEnabled(false);
 
     const tutorialOpen = anyModalOpen();
@@ -4845,17 +4980,28 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     openUrlInActiveTab(searchUrlForEngine(query, eng), query);
   }
 
+  function updateNavArrowsState(canBack, canFwd) {
+    const bBtn = document.getElementById("btn-nav-back");
+    const fBtn = document.getElementById("btn-nav-fwd");
+    if (bBtn) bBtn.classList.toggle("nav-dim", canBack === false);
+    if (fBtn) fBtn.classList.toggle("nav-dim", canFwd === false);
+  }
+
   function historyBack() {
     const tab = getActiveTab();
-    if (!tab.url) return;
+    if (!tab) return;
+    if (isInternalSettingsUrl(tab.url)) {
+      closeSheet();
+      return;
+    }
     if (!sendNativeIpc({ cmd: "web_back" })) {
-      openHomeInActiveTab();
+      if (tab.url) openHomeInActiveTab();
     }
   }
 
   function historyForward() {
     const tab = getActiveTab();
-    if (!tab.url) return;
+    if (!tab) return;
     sendNativeIpc({ cmd: "web_forward" });
   }
 
@@ -5844,10 +5990,73 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       return;
     }
 
+    if (typeof msg.zoom_pct === "number") {
+      showToast(L(`Zoom ${msg.zoom_pct}%`, `Zoom ${msg.zoom_pct} %`), null, 1100);
+      return;
+    }
+
     const targetTab = typeof msg.tab_id === "number"
       ? tabs.find(t => t.id === msg.tab_id)
       : getActiveTab();
     if (!targetTab) return;
+
+    if (typeof msg.can_go_back === "boolean") {
+      targetTab.canGoBack = msg.can_go_back;
+    }
+    if (typeof msg.can_go_forward === "boolean") {
+      targetTab.canGoForward = msg.can_go_forward;
+    }
+    if (targetTab.id === activeTabId && (typeof msg.can_go_back === "boolean" || typeof msg.can_go_forward === "boolean")) {
+      updateNavArrowsState(targetTab.canGoBack, targetTab.canGoForward);
+    }
+
+    if (msg.nav_to_home) {
+      targetTab.url = "";
+      targetTab.title = L("New Tab", "Nouvel onglet");
+      targetTab.mediaTimeSec = 0;
+      targetTab.scrollY = 0;
+      targetTab.faviconUrl = "";
+      targetTab.unloaded = false;
+      if (targetTab.id === activeTabId) {
+        document.getElementById("settings-modal").classList.remove("open");
+        stopVaultTotpTicker();
+        document.body.classList.remove("bar-only");
+        document.getElementById("ntp-view").style.display = "flex";
+        document.getElementById("web-view").style.display = "none";
+        document.getElementById("omnibar-input").value = "";
+        setBlackHoleSuspended(false);
+        renderTabs(true);
+        updateBookmarkStarState();
+        updateNavArrowsState(targetTab.canGoBack, targetTab.canGoForward);
+      } else {
+        updateSingleTabPill(targetTab);
+      }
+      persistOpenTabsIfEnabled(false);
+      return;
+    }
+
+    if (msg.nav_restore_web && msg.url && /^https?:\/\//i.test(msg.url)) {
+      targetTab.url = msg.url;
+      targetTab.title = deriveTitleFromUrl(msg.url);
+      targetTab.unloaded = false;
+      if (targetTab.id === activeTabId) {
+        const tutorialOpen = anyModalOpen();
+        document.getElementById("settings-modal").classList.remove("open");
+        stopVaultTotpTicker();
+        document.getElementById("ntp-view").style.display = "none";
+        document.body.classList.toggle("bar-only", !tutorialOpen);
+        setBlackHoleSuspended(!tutorialOpen);
+        const omni = document.getElementById("omnibar-input");
+        if (document.activeElement !== omni) omni.value = msg.url;
+        renderTabs(true);
+        updateBookmarkStarState();
+        updateNavArrowsState(targetTab.canGoBack, targetTab.canGoForward);
+      } else {
+        updateSingleTabPill(targetTab);
+      }
+      persistOpenTabsIfEnabled(false);
+      return;
+    }
 
     let pillDirty = false;
     if (typeof msg.unloaded === "boolean" && targetTab.unloaded !== msg.unloaded) {
@@ -5980,16 +6189,25 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     } else if (ctrl && e.shiftKey && (k === "n" || code === "KeyN")) {
       e.preventDefault();
       handleBrowserShortcut("toggle_private", 0);
+    } else if (ctrl && !e.shiftKey && (k === "+" || k === "=" || code === "Equal" || code === "NumpadAdd")) {
+      e.preventDefault();
+      sendNativeIpc({ cmd: "web_zoom", action: "zoom_in" });
+    } else if (ctrl && !e.shiftKey && (k === "-" || code === "Minus" || code === "NumpadSubtract")) {
+      e.preventDefault();
+      sendNativeIpc({ cmd: "web_zoom", action: "zoom_out" });
+    } else if (ctrl && !e.shiftKey && (k === "0" || code === "Digit0" || code === "Numpad0")) {
+      e.preventDefault();
+      sendNativeIpc({ cmd: "web_zoom", action: "zoom_reset" });
     } else if (ctrl && !e.shiftKey && /^[1-9]$/.test(k)) {
       e.preventDefault();
       handleBrowserShortcut("jump_tab", parseInt(k, 10));
     } else if (ctrl && !e.shiftKey && /^Digit[1-9]$/.test(code)) {
       e.preventDefault();
       handleBrowserShortcut("jump_tab", parseInt(code.slice(5), 10));
-    } else if (alt && !e.shiftKey && e.key === "ArrowLeft") {
+    } else if ((alt && !e.shiftKey && e.key === "ArrowLeft") || e.key === "BrowserBack" || code === "BrowserBack") {
       e.preventDefault();
       handleBrowserShortcut("web_back", 0);
-    } else if (alt && !e.shiftKey && e.key === "ArrowRight") {
+    } else if ((alt && !e.shiftKey && e.key === "ArrowRight") || e.key === "BrowserForward" || code === "BrowserForward") {
       e.preventDefault();
       handleBrowserShortcut("web_forward", 0);
     } else if (
@@ -6010,6 +6228,32 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       closeHtmlTabContextMenu();
       closeGroupEditor();
       closeSheet();
+    }
+  }, true);
+
+  // Mouse side buttons (XButton1 = Back / button 3, XButton2 = Forward / button 4) over top bar & New Tab
+  window.addEventListener("mousedown", (e) => {
+    if (!e || e.isTrusted === false) return;
+    if (e.button === 3) {
+      e.preventDefault();
+      e.stopPropagation();
+      historyBack();
+    } else if (e.button === 4) {
+      e.preventDefault();
+      e.stopPropagation();
+      historyForward();
+    }
+  }, true);
+  window.addEventListener("mouseup", (e) => {
+    if (e && e.isTrusted !== false && (e.button === 3 || e.button === 4)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+  window.addEventListener("auxclick", (e) => {
+    if (e && e.isTrusted !== false && (e.button === 3 || e.button === 4)) {
+      e.preventDefault();
+      e.stopPropagation();
     }
   }, true);
 
@@ -6693,34 +6937,61 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   /* --- TAB 3: BOOKMARKS & HISTORY --- */
-  async function loadBookmarksAndHistoryPanel() {
+  let cachedBookmarkBrowsers = null;
+
+  function renderBookmarksSheetList() {
     const bmBox = document.getElementById("bm-sheet-list");
+    if (!bmBox) return;
+    const filterEl = document.getElementById("bm-filter-input");
+    const q = (filterEl ? filterEl.value : "").trim().toLowerCase();
+    const badge = document.getElementById("bm-count-badge");
+    const filtered = q
+      ? currentBookmarks.filter((b) =>
+          (b.title || "").toLowerCase().includes(q) || (b.url || "").toLowerCase().includes(q)
+        )
+      : currentBookmarks;
+    if (badge) {
+      badge.textContent = L(
+        `${currentBookmarks.length} saved`,
+        `${currentBookmarks.length} favoris`
+      );
+    }
     bmBox.replaceChildren();
-    for (const b of currentBookmarks) {
+    if (filtered.length === 0) {
+      const empty = document.createElement("div");
+      empty.style.cssText = "font-size:12px;color:var(--text-muted);padding:6px 2px;";
+      empty.textContent = q
+        ? L("No bookmarks match this filter.", "Aucun favori ne correspond à ce filtre.")
+        : L("No bookmarks yet. Import from another browser or a .html / .json file above.", "Aucun favori pour l'instant. Importez depuis un navigateur ou un fichier .html / .json ci-dessus.");
+      bmBox.appendChild(empty);
+      return;
+    }
+    for (const b of filtered.slice(0, 300)) {
       const row = document.createElement("div");
       row.className = "token-row";
 
       const linkArea = document.createElement("div");
-      linkArea.style.cssText = "display:flex;align-items:center;gap:10px;cursor:pointer;";
+      linkArea.style.cssText = "display:flex;align-items:center;gap:8px;cursor:pointer;min-width:0;flex:1;overflow:hidden;";
       linkArea.addEventListener("click", () => {
         createNewTab(b.url, b.title);
       });
+      linkArea.appendChild(createBookmarkIconNode(b.url));
 
       const titleEl = document.createElement("span");
-      titleEl.style.fontWeight = "500";
+      titleEl.style.cssText = "font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;";
       titleEl.textContent = b.title || b.url;
       linkArea.appendChild(titleEl);
 
       const urlEl = document.createElement("span");
       urlEl.className = "mono-val";
-      urlEl.style.fontSize = "11px";
+      urlEl.style.cssText = "font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;";
       urlEl.textContent = b.url || "";
       linkArea.appendChild(urlEl);
 
       const rmBtn = document.createElement("button");
       rmBtn.type = "button";
       rmBtn.className = "btn-subtle btn-danger";
-      rmBtn.style.height = "26px";
+      rmBtn.style.cssText = "height:26px;flex-shrink:0;";
       rmBtn.textContent = L("Remove", "Retirer");
       rmBtn.addEventListener("click", () => deleteBookmarkById(b.id));
 
@@ -6728,6 +6999,175 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       row.appendChild(rmBtn);
       bmBox.appendChild(row);
     }
+  }
+
+  async function loadBookmarkImportBrowsers(forceRefresh) {
+    const box = document.getElementById("bm-import-browsers-list");
+    if (!box) return;
+    if (forceRefresh || !cachedBookmarkBrowsers) {
+      box.replaceChildren();
+      const loading = document.createElement("div");
+      loading.style.cssText = "font-size:12px;color:var(--text-muted);padding:4px 0;";
+      loading.textContent = L("Scanning installed browsers...", "Recherche des navigateurs installés...");
+      box.appendChild(loading);
+      try {
+        const res = await apiFetch("/api/import/browsers");
+        const data = await res.json();
+        cachedBookmarkBrowsers = Array.isArray(data.browsers) ? data.browsers : [];
+      } catch (_) {
+        cachedBookmarkBrowsers = [];
+      }
+    }
+    box.replaceChildren();
+    if (!cachedBookmarkBrowsers || cachedBookmarkBrowsers.length === 0) {
+      const empty = document.createElement("div");
+      empty.style.cssText = "font-size:12px;color:var(--text-muted);padding:4px 0;";
+      empty.textContent = L(
+        "No other installed browser profiles detected. Use 'Import file (.html / .json)' to import exported bookmarks.",
+        "Aucun autre navigateur installé détecté. Utilisez « Importer un fichier (.html / .json) » pour importer vos favoris exportés."
+      );
+      box.appendChild(empty);
+      return;
+    }
+    for (const b of cachedBookmarkBrowsers) {
+      const row = document.createElement("div");
+      row.className = "token-row";
+      row.style.cssText = "padding:7px 10px;";
+
+      const info = document.createElement("div");
+      info.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;";
+      const dot = document.createElement("span");
+      dot.style.cssText = `width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${b.accent || "#d4a853"};`;
+      const nameEl = document.createElement("span");
+      nameEl.style.fontWeight = "500";
+      nameEl.textContent = b.name;
+      const countEl = document.createElement("span");
+      countEl.className = "mono-val";
+      countEl.style.fontSize = "11px";
+      countEl.textContent = L(
+        `${b.bookmarks_count || 0} bookmarks`,
+        `${b.bookmarks_count || 0} favoris`
+      );
+      info.appendChild(dot);
+      info.appendChild(nameEl);
+      info.appendChild(countEl);
+
+      const impBtn = document.createElement("button");
+      impBtn.type = "button";
+      impBtn.className = "btn-subtle";
+      impBtn.style.height = "26px";
+      impBtn.disabled = !b.bookmarks_count;
+      impBtn.textContent = b.bookmarks_count
+        ? L("Import bookmarks", "Importer les favoris")
+        : L("None", "Aucun");
+      impBtn.addEventListener("click", () => importBookmarksFromBrowser(b.id, b.name, impBtn));
+
+      row.appendChild(info);
+      row.appendChild(impBtn);
+      box.appendChild(row);
+    }
+  }
+
+  async function importBookmarksFromBrowser(browserId, browserName, btnEl) {
+    if (btnEl) btnEl.disabled = true;
+    try {
+      const res = await apiPost("/api/import/execute", {
+        browser_ids: [browserId],
+        import_tabs: false,
+        import_bookmarks: true
+      });
+      const d = await res.json();
+      if (Array.isArray(d.bookmarks)) {
+        currentBookmarks = d.bookmarks;
+      }
+      renderBookmarksStrip();
+      renderBookmarksSheetList();
+      const added = Number(d.imported_bookmarks_count || 0);
+      showToast(
+        added > 0
+          ? L(`${added} bookmarks imported from ${browserName}`, `${added} favoris importés depuis ${browserName}`)
+          : L(`All bookmarks from ${browserName} are already imported`, `Tous les favoris de ${browserName} sont déjà importés`)
+      );
+    } catch (_) {
+      showToast(L("Bookmark import failed", "Échec de l'import des favoris"));
+    } finally {
+      if (btnEl) btnEl.disabled = false;
+    }
+  }
+
+  async function handleBookmarksFileSelected(inputEl) {
+    const file = inputEl && inputEl.files && inputEl.files[0];
+    if (!file) return;
+    try {
+      let text = await file.text();
+      // Strip embedded base64 favicon blobs from Chrome/Firefox HTML exports to keep upload instant
+      text = text.replace(/\s+ICON=(?:"data:[^"]*"|'data:[^']*')/gi, "");
+      if (text.length > 7_500_000) {
+        showToast(L("Bookmarks file is too large (max 7.5 MB)", "Fichier de favoris trop volumineux (max 7,5 Mo)"));
+        return;
+      }
+      const res = await apiPost("/api/bookmarks/import-file", {
+        filename: file.name || "bookmarks.html",
+        content: text
+      });
+      const d = await res.json();
+      if (!res.ok || d.error) {
+        showToast(d.error || L("Invalid bookmarks file", "Fichier de favoris invalide"));
+        return;
+      }
+      if (Array.isArray(d.bookmarks)) {
+        currentBookmarks = d.bookmarks;
+      }
+      renderBookmarksStrip();
+      renderBookmarksSheetList();
+      const added = Number(d.imported_count || 0);
+      const dupes = Number(d.skipped_duplicates || 0);
+      if (added > 0) {
+        showToast(L(
+          `${added} bookmarks imported from ${file.name}`,
+          `${added} favoris importés depuis ${file.name}`
+        ));
+      } else if (dupes > 0) {
+        showToast(L(
+          `All ${dupes} bookmarks from ${file.name} were already saved`,
+          `Les ${dupes} favoris de ${file.name} étaient déjà enregistrés`
+        ));
+      } else {
+        showToast(L(
+          "No valid HTTP/HTTPS bookmarks found in this file",
+          "Aucun favori HTTP/HTTPS valide trouvé dans ce fichier"
+        ));
+      }
+    } catch (_) {
+      showToast(L("Failed reading bookmarks file", "Impossible de lire le fichier de favoris"));
+    } finally {
+      if (inputEl) inputEl.value = "";
+    }
+  }
+
+  async function exportBookmarksToHtml() {
+    try {
+      const res = await apiFetch("/api/bookmarks/export-html");
+      if (!res.ok) throw new Error("export failed");
+      const html = await res.text();
+      const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "singularity-bookmarks.html";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(L("Exported singularity-bookmarks.html", "Favoris exportés dans singularity-bookmarks.html"));
+    } catch (_) {
+      showToast(L("Export failed", "Échec de l'exportation"));
+    }
+  }
+
+  async function loadBookmarksAndHistoryPanel() {
+    renderBookmarksSheetList();
+    loadBookmarkImportBrowsers(false);
 
     try {
       const hRes = await apiFetch("/api/history/list");
@@ -6774,7 +7214,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     document.getElementById("bm-new-title").value = "";
     document.getElementById("bm-new-url").value = "";
     renderBookmarksStrip();
-    loadBookmarksAndHistoryPanel();
+    renderBookmarksSheetList();
   }
 
   async function deleteBookmarkById(id) {
@@ -6782,7 +7222,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const d = await res.json();
     currentBookmarks = d.bookmarks || [];
     renderBookmarksStrip();
-    loadBookmarksAndHistoryPanel();
+    renderBookmarksSheetList();
   }
 
   async function clearHistoryOnly() {

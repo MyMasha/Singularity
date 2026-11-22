@@ -464,6 +464,10 @@ static EXTENSIONS_CACHE: std::sync::OnceLock<
     std::sync::Mutex<Option<(PathBuf, Vec<String>, Vec<ChromeExtensionInfo>)>>,
 > = std::sync::OnceLock::new();
 
+static EXTENSION_HOST_DOMAINS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, Vec<String>)>>,
+> = std::sync::OnceLock::new();
+
 /// Returns installed extensions from RAM when unchanged (zero directory scans on `/api/state`).
 pub fn list_extensions_cached(
     roaming_root: &Path,
@@ -484,9 +488,142 @@ pub fn list_extensions_cached(
     fresh
 }
 
+/// Extracts a concrete domain from a Chrome extension match pattern or URL
+/// (e.g. `https://*.bitwarden.com/*` -> `bitwarden.com`), ignoring broad wildcards
+/// like `<all_urls>` or `*://*/*` so the adblocker stays effective on normal sites.
+fn extract_concrete_host_from_pattern(raw: &str) -> Option<String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "<all_urls>" {
+        return None;
+    }
+    let after_scheme = if let Some((_, rest)) = s.split_once("://") {
+        rest
+    } else {
+        return None;
+    };
+    let host_port = after_scheme.split('/').next().unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("").trim();
+    let host = host.trim_start_matches("*.").trim_start_matches('.');
+    if host.is_empty()
+        || host.contains('*')
+        || !host.contains('.')
+        || host == "localhost"
+        || host == "127.0.0.1"
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// Collects concrete host domains declared in enabled Chrome extensions' `manifest.json`
+/// (`host_permissions`, `optional_host_permissions`, `permissions`, `content_scripts[].matches`,
+/// `externally_connectable.matches`, `homepage_url`) so Singularity preserves extension auth
+/// cookies and API token-refresh calls.
+pub fn collect_installed_extension_host_domains(roaming_root: &Path) -> Vec<String> {
+    let lock = EXTENSION_HOST_DOMAINS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = lock.lock() {
+        if let Some((ref cached_root, ref domains)) = *guard {
+            if cached_root == roaming_root {
+                return domains.clone();
+            }
+        }
+    }
+
+    let mut set = std::collections::BTreeSet::new();
+    let dir = enabled_extensions_dir(roaming_root);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(p.join("manifest.json")) else {
+                continue;
+            };
+            let Ok(manifest) =
+                serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+            else {
+                continue;
+            };
+
+            let mut patterns: Vec<&str> = Vec::new();
+            for key in ["host_permissions", "optional_host_permissions", "permissions"] {
+                if let Some(arr) = manifest.get(key).and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            if s.contains("://") {
+                                patterns.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(cs_arr) = manifest.get("content_scripts").and_then(|v| v.as_array()) {
+                for cs in cs_arr {
+                    if let Some(m_arr) = cs.get("matches").and_then(|v| v.as_array()) {
+                        for item in m_arr {
+                            if let Some(s) = item.as_str() {
+                                patterns.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ec_arr) = manifest
+                .get("externally_connectable")
+                .and_then(|e| e.get("matches"))
+                .and_then(|v| v.as_array())
+            {
+                for item in ec_arr {
+                    if let Some(s) = item.as_str() {
+                        patterns.push(s);
+                    }
+                }
+            }
+            if let Some(hp) = manifest.get("homepage_url").and_then(|v| v.as_str()) {
+                patterns.push(hp);
+            }
+
+            for pat in patterns {
+                if let Some(host) = extract_concrete_host_from_pattern(pat) {
+                    set.insert(host);
+                }
+            }
+        }
+    }
+
+    let domains: Vec<String> = set.into_iter().collect();
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some((roaming_root.to_path_buf(), domains.clone()));
+    }
+    domains
+}
+
+/// Returns `true` when `host` equals or is a subdomain of any domain in `ext_domains`.
+pub fn host_matches_extension_domains(host: &str, ext_domains: &[String]) -> bool {
+    let clean = host.trim().trim_start_matches('.').to_ascii_lowercase();
+    if clean.is_empty() {
+        return false;
+    }
+    ext_domains.iter().any(|d| {
+        clean == *d
+            || (clean.len() > d.len()
+                && clean.ends_with(d.as_str())
+                && clean.as_bytes()[clean.len() - d.len() - 1] == b'.')
+    })
+}
+
 /// Invalidates the cached extensions snapshot after any install, uninstall, toggle, or pin mutation.
 pub fn invalidate_extensions_cache() {
     if let Some(lock) = EXTENSIONS_CACHE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+    }
+    if let Some(lock) = EXTENSION_HOST_DOMAINS_CACHE.get() {
         if let Ok(mut guard) = lock.lock() {
             *guard = None;
         }
@@ -662,16 +799,20 @@ pub fn chromium_id_from_public_key_b64(key_b64: &str) -> Option<String> {
     Some(id)
 }
 
-fn find_webview2_runtime_extension_id(
+pub fn find_runtime_extension_id(
     roaming_root: &Path,
     ext_dir: &Path,
     dir_id: &str,
     ext_name: &str,
 ) -> Option<String> {
-    let profile_default = roaming_root
-        .join("browser-engine")
-        .join("EBWebView")
-        .join("Default");
+    let profile_dirs = [
+        roaming_root.join("cef-profile").join("Default"),
+        roaming_root.join("cef-profile"),
+        roaming_root
+            .join("browser-engine")
+            .join("EBWebView")
+            .join("Default"),
+    ];
     let norm_target = ext_dir
         .to_string_lossy()
         .replace('/', "\\")
@@ -680,42 +821,44 @@ fn find_webview2_runtime_extension_id(
     let suffix_match = format!("\\extensions\\{}", dir_id.to_ascii_lowercase());
     let mut name_fallback: Option<String> = None;
 
-    for fname in ["Preferences", "Secure Preferences"] {
-        let p = profile_default.join(fname);
-        let Ok(raw) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(settings) = val
-            .get("extensions")
-            .and_then(|e| e.get("settings"))
-            .and_then(|s| s.as_object())
-        else {
-            continue;
-        };
-        for (rt_id, entry) in settings {
-            if !is_chrome_store_id(rt_id) {
+    for profile_dir in &profile_dirs {
+        for fname in ["Preferences", "Secure Preferences"] {
+            let p = profile_dir.join(fname);
+            let Ok(raw) = std::fs::read_to_string(&p) else {
                 continue;
-            }
-            if let Some(epath) = entry.get("path").and_then(|v| v.as_str()) {
-                let norm = epath
-                    .replace('/', "\\")
-                    .trim_end_matches('\\')
-                    .to_ascii_lowercase();
-                if norm == norm_target || norm.ends_with(&suffix_match) {
-                    return Some(rt_id.to_ascii_lowercase());
+            };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(settings) = val
+                .get("extensions")
+                .and_then(|e| e.get("settings"))
+                .and_then(|s| s.as_object())
+            else {
+                continue;
+            };
+            for (rt_id, entry) in settings {
+                if !is_chrome_store_id(rt_id) {
+                    continue;
                 }
-            }
-            if name_fallback.is_none() && !ext_name.is_empty() {
-                if let Some(mname) = entry
-                    .get("manifest")
-                    .and_then(|m| m.get("name"))
-                    .and_then(|v| v.as_str())
-                {
-                    if mname.eq_ignore_ascii_case(ext_name) {
-                        name_fallback = Some(rt_id.to_ascii_lowercase());
+                if let Some(epath) = entry.get("path").and_then(|v| v.as_str()) {
+                    let norm = epath
+                        .replace('/', "\\")
+                        .trim_end_matches('\\')
+                        .to_ascii_lowercase();
+                    if norm == norm_target || norm.ends_with(&suffix_match) {
+                        return Some(rt_id.to_ascii_lowercase());
+                    }
+                }
+                if name_fallback.is_none() && !ext_name.is_empty() {
+                    if let Some(mname) = entry
+                        .get("manifest")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if mname.eq_ignore_ascii_case(ext_name) {
+                            name_fallback = Some(rt_id.to_ascii_lowercase());
+                        }
                     }
                 }
             }
@@ -763,7 +906,7 @@ pub fn resolve_extension_runtime_url(
         .unwrap_or(rel_clean);
     resolve_safe_child_path(&ext_dir, rel_file)?;
 
-    let runtime_id = find_webview2_runtime_extension_id(roaming_root, &ext_dir, dir_id, &info.name)
+    let runtime_id = find_runtime_extension_id(roaming_root, &ext_dir, dir_id, &info.name)
         .or_else(|| {
             manifest
                 .get("key")

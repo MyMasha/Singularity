@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LZ4_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TABS_PER_BROWSER: usize = 250;
-const MAX_BOOKMARKS_PER_BROWSER: usize = 500;
+const MAX_BOOKMARKS_PER_BROWSER: usize = 2000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportedTab {
@@ -1051,6 +1051,314 @@ pub fn extract_from_browser_ids(browser_ids: &[String]) -> ExtractedBrowserData 
     combined
 }
 
+fn decode_html_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if let Some(semi_rel) = input[i..].find(';') {
+                if semi_rel <= 12 {
+                    let ent = &input[i + 1..i + semi_rel];
+                    let decoded = match ent {
+                        "amp" => Some('&'),
+                        "lt" => Some('<'),
+                        "gt" => Some('>'),
+                        "quot" => Some('"'),
+                        "apos" => Some('\''),
+                        "nbsp" => Some(' '),
+                        _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                            u32::from_str_radix(&ent[2..], 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                        }
+                        _ if ent.starts_with('#') => {
+                            ent[1..].parse::<u32>().ok().and_then(char::from_u32)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ch) = decoded {
+                        out.push(ch);
+                        i += semi_rel + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn extract_href_from_anchor_attrs(attrs: &str) -> Option<String> {
+    let bytes = attrs.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        while i < len && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'>' {
+            i += 1;
+        }
+        let attr_name = &attrs[name_start..i];
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1; // skip '='
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        let (val_start, val_end, next_i) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            let vs = i + 1;
+            let mut j = vs;
+            while j < len && bytes[j] != quote {
+                j += 1;
+            }
+            (vs, j, (j + 1).min(len))
+        } else {
+            let vs = i;
+            let mut j = vs;
+            while j < len && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+                j += 1;
+            }
+            (vs, j, j)
+        };
+        if attr_name.eq_ignore_ascii_case("href") {
+            return Some(decode_html_entities(attrs[val_start..val_end].trim()));
+        }
+        i = next_i;
+    }
+    None
+}
+
+fn strip_html_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parses standard Netscape Bookmarks HTML files (`bookmarks.html`) exported by Chrome, Edge,
+/// Brave, Opera, Vivaldi, Firefox, Safari, Arc, etc., safely in pure Rust.
+pub fn parse_netscape_bookmarks_html(html: &str) -> Vec<ImportedBookmark> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i + 2 < len && out.len() < MAX_BOOKMARKS_PER_BROWSER {
+        if bytes[i] == b'<'
+            && (bytes[i + 1] == b'a' || bytes[i + 1] == b'A')
+            && (bytes[i + 2].is_ascii_whitespace() || bytes[i + 2] == b'>')
+        {
+            // Find matching '>' respecting quoted attributes (including large ICON="data:...")
+            let attrs_start = i + 2;
+            let mut j = attrs_start;
+            let mut quote: u8 = 0;
+            while j < len {
+                let b = bytes[j];
+                if quote != 0 {
+                    if b == quote {
+                        quote = 0;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = b;
+                } else if b == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= len {
+                break;
+            }
+            let attrs = &html[attrs_start..j];
+            let content_start = j + 1;
+
+            // Locate closing </a> (case-insensitive)
+            let mut k = content_start;
+            let mut close_pos = None;
+            while k + 3 < len {
+                if bytes[k] == b'<'
+                    && bytes[k + 1] == b'/'
+                    && (bytes[k + 2] == b'a' || bytes[k + 2] == b'A')
+                    && (bytes[k + 3] == b'>' || bytes[k + 3].is_ascii_whitespace())
+                {
+                    close_pos = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            let content_end = close_pos.unwrap_or(content_start);
+            if let Some(href) = extract_href_from_anchor_attrs(attrs) {
+                let url = href.trim().to_string();
+                if is_importable_http_url(&url) && seen.insert(url.clone()) {
+                    let raw_inner = &html[content_start..content_end];
+                    let stripped = strip_html_tags(raw_inner);
+                    let decoded_title = decode_html_entities(&stripped);
+                    let title = clean_title(&decoded_title, &url);
+                    out.push(ImportedBookmark { title, url });
+                }
+            }
+            i = close_pos.map(|p| p + 4).unwrap_or(content_start);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn collect_generic_json_bookmarks(
+    val: &serde_json::Value,
+    out: &mut Vec<ImportedBookmark>,
+    seen: &mut HashSet<String>,
+) {
+    if out.len() >= MAX_BOOKMARKS_PER_BROWSER {
+        return;
+    }
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_generic_json_bookmarks(item, out, seen);
+                if out.len() >= MAX_BOOKMARKS_PER_BROWSER {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let url_opt = map
+                .get("url")
+                .and_then(|v| v.as_str())
+                .or_else(|| map.get("uri").and_then(|v| v.as_str()))
+                .or_else(|| map.get("href").and_then(|v| v.as_str()));
+            if let Some(u) = url_opt {
+                let url = u.trim().to_string();
+                if is_importable_http_url(&url) && seen.insert(url.clone()) {
+                    let raw_title = map
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| map.get("name").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    out.push(ImportedBookmark {
+                        title: clean_title(raw_title, &url),
+                        url,
+                    });
+                }
+            }
+            for child_key in ["bookmarks", "children", "items", "roots"] {
+                if let Some(sub) = map.get(child_key) {
+                    collect_generic_json_bookmarks(sub, out, seen);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parses an exported bookmarks file in any common browser export format:
+/// - Standard Netscape Bookmarks HTML (`.html` / `.htm` from Chrome, Edge, Firefox, Brave, Opera, Safari)
+/// - Chromium `Bookmarks` JSON (`roots.bookmark_bar` / `roots.other` / `roots.synced`)
+/// - Firefox JSON backup (`children` + `uri` / `title`)
+/// - Singularity / generic JSON array or `{ "bookmarks": [...] }`
+pub fn parse_exported_bookmarks_file(filename: &str, content: &str) -> Vec<ImportedBookmark> {
+    let trimmed = content.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let lower_name = filename.to_ascii_lowercase();
+    let looks_json = trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || lower_name.ends_with(".json");
+
+    if looks_json {
+        // 1. Chromium native `Bookmarks` JSON structure first
+        let mut from_chromium = parse_chromium_bookmarks(trimmed.as_bytes());
+        if !from_chromium.is_empty() {
+            let mut seen = HashSet::new();
+            from_chromium.retain(|b| seen.insert(b.url.clone()));
+            from_chromium.truncate(MAX_BOOKMARKS_PER_BROWSER);
+            return from_chromium;
+        }
+        // 2. Firefox JSON backup / Singularity JSON / generic array
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            collect_generic_json_bookmarks(&val, &mut out, &mut seen);
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+
+    parse_netscape_bookmarks_html(trimmed)
+}
+
+fn escape_html_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Formats Singularity bookmarks as a standards-compliant Netscape Bookmarks HTML file
+/// directly importable by Chrome, Edge, Firefox, Brave, Opera, Safari, and Singularity.
+pub fn format_netscape_bookmarks_html(bookmarks: &[(String, String)]) -> String {
+    let mut out = String::from(
+        "<!DOCTYPE NETSCAPE-Bookmark-file-1>\n\
+         <!-- This is an automatically generated file exported by Singularity Browser. -->\n\
+         <META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n\
+         <TITLE>Singularity Bookmarks</TITLE>\n\
+         <H1>Singularity Bookmarks</H1>\n\
+         <DL><p>\n\
+         \x20\x20<DT><H3 PERSONAL_TOOLBAR_FOLDER=\"true\">Bookmarks Bar</H3>\n\
+         \x20\x20<DL><p>\n",
+    );
+    for (title, url) in bookmarks {
+        if !is_importable_http_url(url) {
+            continue;
+        }
+        out.push_str("    <DT><A HREF=\"");
+        out.push_str(&escape_html_text(url.trim()));
+        out.push_str("\">");
+        out.push_str(&escape_html_text(title.trim()));
+        out.push_str("</A>\n");
+    }
+    out.push_str("  </DL><p>\n</DL><p>\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,5 +1506,54 @@ mod tests {
         assert_eq!(bms.len(), 1);
         assert_eq!(bms[0].title, "Rust");
         assert_eq!(bms[0].url, "https://www.rust-lang.org/");
+    }
+
+    #[test]
+    fn test_netscape_html_and_json_bookmark_import_export_roundtrip() {
+        let chrome_html = r#"<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<TITLE>Bookmarks</TITLE>
+<DL><p>
+  <DT><H3 PERSONAL_TOOLBAR_FOLDER="true">Bookmarks bar</H3>
+  <DL><p>
+    <DT><A HREF="https://www.youtube.com/watch?v=abc&amp;t=42" ADD_DATE="1700000000" ICON="data:image/png;base64,AAAA">YouTube &amp; Chill</A>
+    <DT><A href='https://github.com/MyMasha/Singularity'>Singularity &lt;Browser&gt;</A>
+    <DT><A HREF="javascript:alert(1)">XSS Bookmark</A>
+    <DT><A HREF="chrome://extensions">Internal Chrome</A>
+    <DT><A HREF="https://www.youtube.com/watch?v=abc&amp;t=42">Duplicate Entry</A>
+  </DL><p>
+</DL><p>"#;
+
+        let parsed = parse_exported_bookmarks_file("bookmarks_2026.html", chrome_html);
+        assert_eq!(parsed.len(), 2, "must skip javascript:, chrome:, and duplicates");
+        assert_eq!(parsed[0].url, "https://www.youtube.com/watch?v=abc&t=42");
+        assert_eq!(parsed[0].title, "YouTube & Chill");
+        assert_eq!(parsed[1].url, "https://github.com/MyMasha/Singularity");
+        assert_eq!(parsed[1].title, "Singularity <Browser>");
+
+        // Export to Netscape HTML and roundtrip parse cleanly
+        let pairs: Vec<(String, String)> = parsed
+            .iter()
+            .map(|b| (b.title.clone(), b.url.clone()))
+            .collect();
+        let exported = format_netscape_bookmarks_html(&pairs);
+        assert!(exported.contains("<!DOCTYPE NETSCAPE-Bookmark-file-1>"));
+        assert!(exported.contains("YouTube &amp; Chill"));
+        assert!(exported.contains("Singularity &lt;Browser&gt;"));
+        let roundtrip = parse_netscape_bookmarks_html(&exported);
+        assert_eq!(roundtrip, parsed);
+
+        // Firefox JSON backup format (`uri` + `children`)
+        let ff_json = r#"{"type":"text/x-moz-place-container","children":[{"title":"Proton Mail","uri":"https://mail.proton.me/"},{"title":"Bad","uri":"place:sort=8"}]}"#;
+        let ff_bms = parse_exported_bookmarks_file("bookmarks-2026.json", ff_json);
+        assert_eq!(ff_bms.len(), 1);
+        assert_eq!(ff_bms[0].title, "Proton Mail");
+        assert_eq!(ff_bms[0].url, "https://mail.proton.me/");
+
+        // Simple JSON array export
+        let simple_json = r#"[{"title":"Docs","url":"https://docs.rs/"},{"title":"Loopback","url":"http://127.0.0.1:8080/"}]"#;
+        let simple_bms = parse_exported_bookmarks_file("my-bookmarks.json", simple_json);
+        assert_eq!(simple_bms.len(), 1);
+        assert_eq!(simple_bms[0].url, "https://docs.rs/");
     }
 }
