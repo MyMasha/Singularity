@@ -405,7 +405,6 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     min-width: 0;
     overflow-x: auto;
     scrollbar-width: none;
-    scroll-behavior: smooth;
     padding: 2px 0;
   }
   .tabs-strip::-webkit-scrollbar { display: none; }
@@ -455,12 +454,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     color: #090a0e;
   }
 
+  /* Fixed content-independent width prevents tabs from jumping when background page titles change */
   .tab-pill {
     position: relative;
-    flex: 1 1 168px;
+    flex: 0 1 172px;
+    width: 172px;
     height: 30px;
-    max-width: 204px;
-    min-width: 68px;
+    max-width: 172px;
+    min-width: 72px;
+    box-sizing: border-box;
     padding: 0 6px 0 8px;
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.028);
@@ -472,6 +474,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     align-items: center;
     gap: 6px;
     cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
     contain: layout style;
     transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, opacity 0.14s ease;
   }
@@ -588,6 +592,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     white-space: nowrap;
     pointer-events: none;
     flex: 1 1 0;
+    width: 0;
     min-width: 0;
     line-height: 1.2;
   }
@@ -600,10 +605,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .tab-close-btn:hover { background: rgba(255, 255, 255, 0.16); color: #ffffff; opacity: 1; }
 
   /* Compact Brave/Chrome Tab Density when many tabs are open:
-     Favicons stay 100% crisp; close button reveals on hover so every tab stays recognizable! */
+     Identical widths for active & inactive pills prevent horizontal jitter on selection/hover! */
   .tabs-strip.compact-tabs .tab-pill {
-    flex: 1 1 118px;
-    min-width: 38px;
+    flex: 0 1 132px;
+    width: 132px;
+    max-width: 132px;
+    min-width: 48px;
     padding: 0 6px 0 7px;
     gap: 5px;
   }
@@ -618,13 +625,77 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     display: inline-flex;
     opacity: 0.95;
   }
-  .tabs-strip.very-compact .tab-pill:not(.active) {
-    min-width: 34px;
-    max-width: 96px;
+  .tabs-strip.very-compact .tab-pill {
+    flex: 0 1 84px;
+    width: 84px;
+    max-width: 84px;
+    min-width: 44px;
     padding: 0 7px;
   }
-  .tabs-strip.very-compact .tab-pill.active {
-    min-width: 78px;
+
+  /* Real-Time Update Download Progress Bar (Settings + Compact Floating Overlay) */
+  .update-progress-track {
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+    position: relative;
+  }
+  .update-progress-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--gold-core, #d89b3c), var(--gold-bright, #f6c453));
+    box-shadow: 0 0 12px rgba(246, 196, 83, 0.45);
+    transition: width 0.22s ease;
+  }
+  .update-progress-fill.indeterminate {
+    width: 36% !important;
+    animation: updateBarPulse 1.2s ease-in-out infinite;
+  }
+  @keyframes updateBarPulse {
+    0% { transform: translateX(-100%); }
+    50% { transform: translateX(120%); }
+    100% { transform: translateX(280%); }
+  }
+  #update-floating-bar {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 260;
+    width: 320px;
+    max-width: calc(100vw - 32px);
+    padding: 11px 14px;
+    border-radius: 12px;
+    background: rgba(14, 16, 24, 0.96);
+    border: 1px solid rgba(246, 196, 83, 0.42);
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.65);
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    backdrop-filter: blur(14px);
+  }
+  #update-floating-bar.visible { display: flex; }
+  #topbar-update-line {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: rgba(255, 255, 255, 0.06);
+    pointer-events: none;
+    overflow: hidden;
+    display: none;
+    z-index: 40;
+  }
+  #topbar-update-line.visible { display: block; }
+  #topbar-update-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--gold-core, #d89b3c), var(--gold-bright, #f6c453));
+    box-shadow: 0 0 8px rgba(246, 196, 83, 0.65);
+    transition: width 0.22s ease;
   }
 
   /* Inline Tab Group Name/Color Editor (Strictly fits inside 46px bar, never clipped!) */
@@ -2040,6 +2111,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </button>
         </div>
       </div>
+      <div id="topbar-update-line"><div id="topbar-update-fill"></div></div>
     </header>
 
     <!-- VIEWPORT STAGE -->
@@ -2284,7 +2356,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.7</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.8</div>
         </div>
       </aside>
 
@@ -2309,10 +2381,23 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <button type="button" class="btn-subtle" data-i18n="btn_check_updates" onclick="checkUpdatesUI()">Check for updates</button>
-            <button type="button" class="btn-gold" style="height:30px;padding:0 14px;" data-i18n="btn_update_now" onclick="triggerUpdate()">Update</button>
+            <button type="button" id="btn-trigger-update" class="btn-gold" style="height:30px;padding:0 14px;" data-i18n="btn_update_now" onclick="triggerUpdate()">Update</button>
           </div>
         </div>
-        <div id="update-check-banner" style="display:none;" class="info-card"></div>
+        <div id="update-check-banner" style="display:none;flex-direction:row;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;" class="info-card"></div>
+        <div id="update-progress-wrap" style="display:none;" class="info-card">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <span id="update-progress-phase" style="font-size:12.5px;font-weight:600;color:var(--gold-bright);">Downloading update...</span>
+            <span id="update-progress-pct" style="font-size:12px;font-family:var(--font-mono);color:#ffffff;">0%</span>
+          </div>
+          <div class="update-progress-track">
+            <div id="update-progress-bar-fill" class="update-progress-fill"></div>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--text-secondary);font-family:var(--font-mono);">
+            <span id="update-progress-meta">—</span>
+            <span id="update-progress-speed"></span>
+          </div>
+        </div>
 
         <div class="info-card">
           <div class="card-label" data-i18n="gen_startup_card">Language, Startup &amp; Browser Import</div>
@@ -2671,6 +2756,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <button type="button" class="crash-btn-close" id="btn-crash-close" onclick="closeCrashReportModal()">Close</button>
       </div>
     </div>
+  </div>
+
+  <div id="update-floating-bar" role="status" aria-live="polite">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <span id="update-floating-phase" style="font-size:12px;font-weight:600;color:var(--gold-bright);">Downloading update...</span>
+      <span id="update-floating-pct" style="font-size:11.5px;font-family:var(--font-mono);color:#ffffff;">0%</span>
+    </div>
+    <div class="update-progress-track">
+      <div id="update-floating-fill" class="update-progress-fill"></div>
+    </div>
+    <div id="update-floating-meta" style="font-size:10.5px;color:var(--text-secondary);font-family:var(--font-mono);">—</div>
   </div>
 
   <div id="toast"></div>
@@ -3410,9 +3506,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const leftBtn = document.getElementById("tabs-scroll-left");
     const rightBtn = document.getElementById("tabs-scroll-right");
     if (!strip || !leftBtn || !rightBtn) return;
-    const overflows = strip.scrollWidth > strip.clientWidth + 2;
-    leftBtn.classList.toggle("visible", overflows && strip.scrollLeft > 2);
-    rightBtn.classList.toggle("visible", overflows && (strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 2));
+    const overflows = strip.scrollWidth > strip.clientWidth + 6;
+    leftBtn.classList.toggle("visible", overflows && strip.scrollLeft > 4);
+    rightBtn.classList.toggle("visible", overflows && (strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 4));
   }
 
   function scrollTabsStrip(deltaPx) {
@@ -3423,7 +3519,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   // Smooth hardware-accelerated FLIP animation moving the URL bar from dead-center
-  // to the right whenever many tabs are open (doubling visible tab strip width!).
+  // to the right ONLY when tab count or viewport width crosses the threshold (never on title updates!).
   let isOmnibarDockedRight = false;
   function syncOmnibarLayout(allowAnimate) {
     if (!appleBar) return;
@@ -3432,9 +3528,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (!omniWrap || !strip) return;
 
     const narrow = window.innerWidth < 960;
-    const wantRight = isOmnibarDockedRight
-      ? (tabs.length >= 4 || (narrow && tabs.length >= 3))
-      : (tabs.length >= 4 || (narrow && tabs.length >= 3) || strip.scrollWidth > strip.clientWidth + 4);
+    const wantRight = tabs.length >= 4 || (narrow && tabs.length >= 3);
 
     if (wantRight === isOmnibarDockedRight) return;
 
@@ -4230,10 +4324,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
     strip.addEventListener("pointermove", (ev) => {
       if (!dragState || ev.pointerId !== dragState.pointerId) return;
+      // Guard against stuck drag state if mouseup happened over a child CEF HWND or outside strip
+      if ((ev.buttons & 1) === 0) {
+        finishTabDrag(true);
+        return;
+      }
       const dx = ev.clientX - dragState.startX;
       const dy = ev.clientY - dragState.startY;
       if (!dragState.started) {
-        if (dx * dx + dy * dy < 36) return; // 6px deadzone keeps clicks instantaneous
+        if (dx * dx + dy * dy < 81) return; // 9px deadzone keeps normal clicks rock-steady
         dragState.started = true;
         dragState.pill.classList.add("dragging");
         try { strip.setPointerCapture(ev.pointerId); } catch (_) {}
@@ -4287,13 +4386,22 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       }
     });
 
-    strip.addEventListener("pointerup", (ev) => {
+    window.addEventListener("pointerup", (ev) => {
       if (!dragState || ev.pointerId !== dragState.pointerId) return;
       finishTabDrag(false);
     });
-    strip.addEventListener("pointercancel", (ev) => {
+    window.addEventListener("pointercancel", (ev) => {
       if (!dragState || ev.pointerId !== dragState.pointerId) return;
       finishTabDrag(true);
+    });
+    strip.addEventListener("lostpointercapture", () => {
+      if (dragState) finishTabDrag(true);
+    });
+    window.addEventListener("blur", () => {
+      if (dragState) finishTabDrag(true);
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && dragState) finishTabDrag(true);
     });
 
     barWrap.addEventListener("contextmenu", (ev) => {
@@ -4519,8 +4627,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
 
     syncOmnibarLayout(bootInitialized);
-    if (scrollActiveIntoView && activePill) {
-      activePill.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+    if (scrollActiveIntoView && activePill && strip.scrollWidth > strip.clientWidth + 4) {
+      const sRect = strip.getBoundingClientRect();
+      const pRect = activePill.getBoundingClientRect();
+      if (pRect.left < sRect.left - 1) {
+        strip.scrollLeft = Math.max(0, strip.scrollLeft - (sRect.left - pRect.left) - 4);
+      } else if (pRect.right > sRect.right + 1) {
+        strip.scrollLeft = strip.scrollLeft + (pRect.right - sRect.right) + 4;
+      }
     }
     requestAnimationFrame(updateTabsScrollArrows);
     updateRamStatusUI();
@@ -6310,6 +6424,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       if (ext) openExtensionPopupUI(ext, btn, false);
     } else if (action === "open_options") {
       if (ext) openExtensionPopupUI(ext, btn, true);
+    } else if (action === "reload_ext") {
+      reloadExtensionUI(extId, ext ? ext.name : extId, null);
     } else if (action === "unpin_ext") {
       toggleExtensionPinnedUI(extId, false);
     } else if (action === "disable_ext") {
@@ -6383,10 +6499,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
   }
 
+  let dynamicExtensionsSupported = false;
+
   async function loadExtensionsPanel() {
     try {
       const res = await apiFetch("/api/extensions/list");
       const d = await res.json();
+      dynamicExtensionsSupported = !!d.dynamic_supported;
+      if (dynamicExtensionsSupported) {
+        hideExtensionRestartBanner();
+      }
       const dirEl = document.getElementById("ext-dir-path");
       if (dirEl) dirEl.textContent = d.extensions_dir || "";
       renderExtensionsToolbar(d.installed || []);
@@ -6440,6 +6562,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           desc.textContent = ext.description || ext.id;
           meta.appendChild(titleLine);
           meta.appendChild(desc);
+
+          if (ext.source_path) {
+            const srcLine = document.createElement("div");
+            srcLine.style.cssText = "font-size:10.5px;color:var(--text-secondary);font-family:var(--font-mono);margin-top:2px;opacity:0.78;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:460px;";
+            srcLine.title = ext.source_path;
+            srcLine.textContent = L(`Source: ${ext.source_path}`, `Source : ${ext.source_path}`);
+            meta.appendChild(srcLine);
+          }
           left.appendChild(meta);
 
           const acts = document.createElement("div");
@@ -6463,6 +6593,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             optBtn.addEventListener("click", () => openExtensionPopupUI(ext, optBtn, true));
             acts.appendChild(optBtn);
           }
+
+          const reloadBtn = document.createElement("button");
+          reloadBtn.type = "button";
+          reloadBtn.className = "btn-subtle";
+          reloadBtn.style.height = "26px";
+          reloadBtn.title = L(
+            "Re-read updated files from source and reload this extension live",
+            "Recharger les fichiers modifiés depuis la source et actualiser l'extension à chaud"
+          );
+          reloadBtn.textContent = L("↻ Reload", "↻ Actualiser");
+          reloadBtn.addEventListener("click", () => reloadExtensionUI(ext.id, ext.name, reloadBtn));
+          acts.appendChild(reloadBtn);
 
           const pinBtn = document.createElement("button");
           pinBtn.type = "button";
@@ -6566,8 +6708,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             const out = await r.json();
             if (out.ok) {
               sendNativeIpc({ cmd: "reload_extensions" });
-              showExtensionRestartBanner();
-              showToast(L(`Extension "${ext.name}" imported — restart Singularity to activate`, `Extension « ${ext.name} » importée — redémarrez Singularity pour l'activer`));
+              if (out.dynamic) {
+                hideExtensionRestartBanner();
+                showToast(L(`Extension "${ext.name}" imported and active immediately!`, `Extension « ${ext.name} » importée et active immédiatement !`));
+              } else {
+                showExtensionRestartBanner();
+                showToast(L(`Extension "${ext.name}" imported — restart Singularity to activate`, `Extension « ${ext.name} » importée — redémarrez Singularity pour l'activer`));
+              }
               await loadExtensionsPanel();
             } else {
               btn.disabled = false;
@@ -6588,6 +6735,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   function showExtensionRestartBanner() {
     const banner = document.getElementById("ext-restart-banner");
     if (banner) banner.style.display = "flex";
+  }
+
+  function hideExtensionRestartBanner() {
+    const banner = document.getElementById("ext-restart-banner");
+    if (banner) banner.style.display = "none";
   }
 
   function pickLocalExtensionUI(mode) {
@@ -6617,6 +6769,43 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
   }
 
+  async function reloadExtensionUI(id, label, btn) {
+    const origText = btn ? btn.textContent : "";
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = L("Reloading...", "Actualisation...");
+    }
+    try {
+      const res = await apiPost("/api/extensions/reload", { id });
+      const d = await res.json();
+      if (d.ok) {
+        renderExtensionsToolbar(d.installed || []);
+        sendNativeIpc({ cmd: "reload_extensions" });
+        const extName = (d.extension && d.extension.name) || label || id;
+        if (d.dynamic) {
+          hideExtensionRestartBanner();
+          showToast(L(
+            `Extension "${extName}" reloaded live!`,
+            `Extension « ${extName} » actualisée à chaud !`
+          ));
+        } else {
+          showExtensionRestartBanner();
+          showToast(L(
+            `Extension "${extName}" refreshed — restart Singularity to apply`,
+            `Extension « ${extName} » rafraîchie — redémarrez Singularity pour appliquer`
+          ));
+        }
+        await loadExtensionsPanel();
+      } else {
+        showToast(d.error || L("Reload failed", "Échec de l'actualisation"));
+        if (btn) { btn.disabled = false; btn.textContent = origText; }
+      }
+    } catch (_) {
+      showToast(L("Error while reloading extension", "Erreur lors de l'actualisation de l'extension"));
+      if (btn) { btn.disabled = false; btn.textContent = origText; }
+    }
+  }
+
   async function installExtensionByIdUI(id, label, btn) {
     if (btn) { btn.disabled = true; btn.textContent = L("Downloading...", "Téléchargement..."); }
     showToast(L(`Downloading ${label || id} from Chrome Web Store...`, `Téléchargement de ${label || id} depuis le Chrome Web Store...`));
@@ -6625,8 +6814,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       const d = await res.json();
       if (d.ok) {
         sendNativeIpc({ cmd: "reload_extensions" });
-        showExtensionRestartBanner();
-        showToast(L(`Extension "${d.extension.name}" installed — restart Singularity to activate`, `Extension « ${d.extension.name} » installée — redémarrez Singularity pour l'activer`));
+        if (d.dynamic) {
+          hideExtensionRestartBanner();
+          showToast(L(
+            `Extension "${d.extension.name}" installed and active immediately!`,
+            `Extension « ${d.extension.name} » installée et active immédiatement !`
+          ));
+        } else {
+          showExtensionRestartBanner();
+          showToast(L(`Extension "${d.extension.name}" installed — restart Singularity to activate`, `Extension « ${d.extension.name} » installée — redémarrez Singularity pour l'activer`));
+        }
         await loadExtensionsPanel();
       } else {
         showToast(d.error || L("Installation failed", "Échec d'installation"));
@@ -6663,11 +6860,19 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (d.ok) {
       inp.value = "";
       sendNativeIpc({ cmd: "reload_extensions" });
-      showExtensionRestartBanner();
-      showToast(L(
-        `Extension "${d.extension.name}" loaded — restart Singularity to activate`,
-        `Extension « ${d.extension.name} » chargée — redémarrez Singularity pour l'activer`
-      ));
+      if (d.dynamic) {
+        hideExtensionRestartBanner();
+        showToast(L(
+          `Extension "${d.extension.name}" loaded and active immediately!`,
+          `Extension « ${d.extension.name} » chargée et active immédiatement !`
+        ));
+      } else {
+        showExtensionRestartBanner();
+        showToast(L(
+          `Extension "${d.extension.name}" loaded — restart Singularity to activate`,
+          `Extension « ${d.extension.name} » chargée — redémarrez Singularity pour l'activer`
+        ));
+      }
       await loadExtensionsPanel();
     } else {
       showToast(d.error || L("Local load failed", "Erreur de chargement local"));
@@ -6678,11 +6883,19 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const res = await apiPost("/api/extensions/toggle", { id, enabled });
     const d = await res.json();
     if (d.ok) {
+      renderExtensionsToolbar(d.installed || []);
       sendNativeIpc({ cmd: "reload_extensions" });
-      showExtensionRestartBanner();
-      showToast(enabled
-        ? L("Extension enabled — restart Singularity to activate", "Extension activée — redémarrez Singularity pour l'activer")
-        : L("Extension disabled — restart Singularity to apply", "Extension désactivée — redémarrez Singularity pour appliquer"));
+      if (d.dynamic) {
+        hideExtensionRestartBanner();
+        showToast(enabled
+          ? L("Extension enabled immediately!", "Extension activée immédiatement !")
+          : L("Extension disabled immediately!", "Extension désactivée immédiatement !"));
+      } else {
+        showExtensionRestartBanner();
+        showToast(enabled
+          ? L("Extension enabled — restart Singularity to activate", "Extension activée — redémarrez Singularity pour l'activer")
+          : L("Extension disabled — restart Singularity to apply", "Extension désactivée — redémarrez Singularity pour appliquer"));
+      }
       await loadExtensionsPanel();
     } else {
       showToast(d.error || L("Error", "Erreur"));
@@ -6703,8 +6916,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const d = await res.json();
     if (d.ok) {
       renderExtensionsToolbar(d.installed || []);
-      showExtensionRestartBanner();
-      showToast(L("Extension removed — restart Singularity to apply", "Extension supprimée — redémarrez Singularity pour appliquer"));
+      if (d.dynamic) {
+        hideExtensionRestartBanner();
+        showToast(L("Extension removed immediately!", "Extension supprimée immédiatement !"));
+      } else {
+        showExtensionRestartBanner();
+        showToast(L("Extension removed — restart Singularity to apply", "Extension supprimée — redémarrez Singularity pour appliquer"));
+      }
       await loadExtensionsPanel();
     } else {
       showToast(d.error || L("Failed to remove extension", "Erreur de suppression"));
@@ -6823,7 +7041,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
-    if (sec === "general") await refreshHeaderState();
+    if (sec === "general") {
+      await refreshHeaderState();
+      syncUpdateProgressOnce();
+    }
     else if (sec === "appearance") renderThemeGalleries();
     else if (sec === "extensions") await loadExtensionsPanel();
     else if (sec === "tokens") await loadTokensPanel();
@@ -6833,7 +7054,167 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     else if (sec === "settings") { await loadCategories(); await querySettings(true); }
   }
 
-  /* --- TAB 1: GENERAL & UPDATES --- */
+  /* --- TAB 1: GENERAL & UPDATES (REAL-TIME DOWNLOAD PROGRESS BAR) --- */
+  let updateProgressTimer = null;
+
+  function formatUpdateBytes(bytes) {
+    const n = Number(bytes || 0);
+    if (!isFinite(n) || n <= 0) return "0 B";
+    if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+    if (n >= 1024) return (n / 1024).toFixed(0) + " KB";
+    return Math.round(n) + " B";
+  }
+
+  function formatUpdateSpeed(bps) {
+    const n = Number(bps || 0);
+    if (!isFinite(n) || n <= 0) return "";
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB/s";
+    if (n >= 1024) return (n / 1024).toFixed(0) + " KB/s";
+    return Math.round(n) + " B/s";
+  }
+
+  function localizedUpdatePhaseLabel(snap) {
+    const ver = snap.latest_version ? ` v${snap.latest_version}` : "";
+    switch (snap.phase) {
+      case "checking":
+        return L("Checking GitHub Releases...", "Vérification sur GitHub Releases...");
+      case "downloading":
+        return L(`Downloading Singularity${ver}...`, `Téléchargement de Singularity${ver}...`);
+      case "verifying":
+        return L(`Verifying SHA-256 checksum${ver}...`, `Vérification SHA-256${ver}...`);
+      case "installing":
+        return L(`Installing Singularity${ver} & restarting...`, `Installation de Singularity${ver} et redémarrage...`);
+      case "done":
+        return L(`Update${ver} ready`, `Mise à jour${ver} terminée`);
+      case "error":
+        return L("Update failed", "Échec de la mise à jour");
+      default:
+        return "";
+    }
+  }
+
+  function renderUpdateProgress(snap) {
+    if (!snap || !snap.phase || snap.phase === "idle") return;
+
+    const wrap = document.getElementById("update-progress-wrap");
+    const phaseEl = document.getElementById("update-progress-phase");
+    const pctEl = document.getElementById("update-progress-pct");
+    const fillEl = document.getElementById("update-progress-bar-fill");
+    const metaEl = document.getElementById("update-progress-meta");
+    const speedEl = document.getElementById("update-progress-speed");
+    const btn = document.getElementById("btn-trigger-update");
+
+    const flBar = document.getElementById("update-floating-bar");
+    const flPhase = document.getElementById("update-floating-phase");
+    const flPct = document.getElementById("update-floating-pct");
+    const flFill = document.getElementById("update-floating-fill");
+    const flMeta = document.getElementById("update-floating-meta");
+
+    const phaseText = localizedUpdatePhaseLabel(snap);
+    const pctNum = Math.max(0, Math.min(100, Math.round(Number(snap.percent || 0))));
+    const indeterminate = snap.phase === "checking" || (snap.phase === "downloading" && Number(snap.total_bytes || 0) === 0);
+    const pctText = indeterminate ? "…" : `${pctNum}%`;
+
+    let metaText = snap.message || "";
+    if (snap.phase === "downloading") {
+      if (snap.total_bytes > 0) {
+        metaText = `${formatUpdateBytes(snap.downloaded_bytes)} / ${formatUpdateBytes(snap.total_bytes)}`;
+      } else if (snap.downloaded_bytes > 0) {
+        metaText = `${formatUpdateBytes(snap.downloaded_bytes)} ${L("downloaded", "téléchargés")}`;
+      }
+    } else if (snap.phase === "error") {
+      metaText = snap.error || L("Update error", "Erreur de mise à jour");
+    }
+    const speedText = snap.phase === "downloading" ? formatUpdateSpeed(snap.speed_bps) : "";
+
+    if (wrap) wrap.style.display = "flex";
+    if (phaseEl) {
+      phaseEl.textContent = phaseText;
+      phaseEl.style.color = snap.phase === "error"
+        ? "#ff6b6b"
+        : (snap.phase === "done" || snap.phase === "installing" ? "var(--status-ok)" : "var(--gold-bright)");
+    }
+    if (pctEl) pctEl.textContent = pctText;
+    if (fillEl) {
+      fillEl.classList.toggle("indeterminate", indeterminate);
+      if (!indeterminate) fillEl.style.width = `${pctNum}%`;
+    }
+    if (metaEl) metaEl.textContent = metaText || "—";
+    if (speedEl) speedEl.textContent = speedText;
+
+    if (btn) {
+      btn.disabled = !!snap.active;
+    }
+
+    const generalVisible = document.getElementById("settings-modal")?.classList.contains("open")
+      && document.getElementById("pane-general")?.style.display === "flex";
+    if (flBar) {
+      flBar.classList.toggle("visible", !!snap.active && !generalVisible);
+      if (flPhase) flPhase.textContent = phaseText;
+      if (flPct) flPct.textContent = pctText;
+      if (flFill) {
+        flFill.classList.toggle("indeterminate", indeterminate);
+        if (!indeterminate) flFill.style.width = `${pctNum}%`;
+      }
+      if (flMeta) {
+        flMeta.textContent = speedText ? `${metaText} · ${speedText}` : (metaText || "—");
+      }
+    }
+
+    const topLine = document.getElementById("topbar-update-line");
+    const topFill = document.getElementById("topbar-update-fill");
+    if (topLine && topFill) {
+      topLine.classList.toggle("visible", !!snap.active);
+      topFill.classList.toggle("indeterminate", indeterminate);
+      if (!indeterminate) topFill.style.width = `${pctNum}%`;
+    }
+  }
+
+  function stopUpdateProgressPolling() {
+    if (updateProgressTimer) {
+      clearInterval(updateProgressTimer);
+      updateProgressTimer = null;
+    }
+  }
+
+  async function syncUpdateProgressOnce() {
+    try {
+      const res = await apiFetch("/api/updater/progress");
+      const snap = await res.json();
+      if (snap && snap.phase && snap.phase !== "idle") {
+        renderUpdateProgress(snap);
+        if (snap.active) {
+          startUpdateProgressPolling();
+        } else {
+          stopUpdateProgressPolling();
+          if (snap.phase === "error" && snap.error) {
+            showToast(snap.error, null, 5000);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  function startUpdateProgressPolling() {
+    if (updateProgressTimer) return;
+    updateProgressTimer = setInterval(async () => {
+      try {
+        const res = await apiFetch("/api/updater/progress");
+        const snap = await res.json();
+        renderUpdateProgress(snap);
+        if (!snap.active) {
+          stopUpdateProgressPolling();
+          if (snap.phase === "error" && snap.error) {
+            showToast(snap.error, null, 5000);
+          } else if (snap.phase === "done" && snap.message) {
+            showToast(snap.message, null, 4500);
+          }
+        }
+      } catch (_) {}
+    }, 250);
+  }
+
   async function checkUpdatesUI() {
     const box = document.getElementById("update-check-banner");
     box.style.display = "flex";
@@ -6851,7 +7232,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           `New version available: v${d.latest_version} (current: v${d.current_version})`,
           `Nouvelle version disponible : v${d.latest_version} (actuelle : v${d.current_version})`
         );
+        const dlBtn = document.createElement("button");
+        dlBtn.type = "button";
+        dlBtn.className = "btn-gold";
+        dlBtn.style.cssText = "height:28px;padding:0 12px;white-space:nowrap;";
+        dlBtn.textContent = L(`Download & Install v${d.latest_version}`, `Télécharger et installer v${d.latest_version}`);
+        dlBtn.addEventListener("click", () => triggerUpdate());
         box.appendChild(sp);
+        box.appendChild(dlBtn);
       } else {
         const sp = document.createElement("span");
         sp.style.color = "var(--status-ok)";
@@ -6867,12 +7255,30 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   async function triggerUpdate() {
-    showToast(L("Downloading, verifying SHA-256, and installing...", "Téléchargement, vérification SHA-256 et installation..."));
+    renderUpdateProgress({
+      phase: "checking",
+      active: true,
+      downloaded_bytes: 0,
+      total_bytes: 0,
+      percent: 0,
+      speed_bps: 0,
+      message: L("Connecting to GitHub Releases...", "Connexion à GitHub Releases...")
+    });
     try {
       const res = await apiPost("/api/updater/run", {});
       const data = await res.json();
-      if (data.status !== "ok") showToast(data.error || L("Update error", "Erreur de mise à jour"));
-    } catch (_) {}
+      if (data && data.progress) {
+        renderUpdateProgress(data.progress);
+      }
+      startUpdateProgressPolling();
+    } catch (_) {
+      renderUpdateProgress({
+        phase: "error",
+        active: false,
+        percent: 0,
+        error: L("Unable to start update download.", "Impossible de démarrer le téléchargement de la mise à jour.")
+      });
+    }
   }
 
   async function clearBrowsingDataUI(clearTokens) {

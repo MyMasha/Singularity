@@ -12,7 +12,7 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand_core::{OsRng, RngCore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,16 @@ pub struct ChromeExtensionInfo {
     pub options_path: Option<String>,
     pub permissions: Vec<String>,
     pub install_path: String,
+    pub source_path: Option<String>,
+    pub runtime_id: Option<String>,
+}
+
+/// Out-of-band Singularity metadata stored in `%APPDATA%\.singularity\extensions_meta\<dir_id>.json`
+/// (outside the extension directory so Chromium never sees extra files inside the unpacked root).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtensionMeta {
+    pub source_path: Option<String>,
+    pub runtime_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +122,80 @@ pub fn disabled_extensions_dir(roaming_root: &Path) -> PathBuf {
     roaming_root.join("extensions-disabled")
 }
 
+pub fn extensions_meta_dir(roaming_root: &Path) -> PathBuf {
+    roaming_root.join("extensions_meta")
+}
+
+pub fn read_extension_meta(roaming_root: &Path, dir_id: &str) -> ExtensionMeta {
+    if !is_valid_extension_dir_id(dir_id) {
+        return ExtensionMeta::default();
+    }
+    let path = extensions_meta_dir(roaming_root).join(format!("{}.json", dir_id));
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ExtensionMeta>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_extension_meta(roaming_root: &Path, dir_id: &str, meta: &ExtensionMeta) {
+    if !is_valid_extension_dir_id(dir_id) {
+        return;
+    }
+    let dir = extensions_meta_dir(roaming_root);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.json", dir_id));
+    if let Ok(json) = serde_json::to_string_pretty(meta) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+pub fn save_extension_source_path(roaming_root: &Path, dir_id: &str, source_path: &str) {
+    let trimmed = source_path.trim();
+    if trimmed.is_empty() || !is_valid_extension_dir_id(dir_id) {
+        return;
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    meta.source_path = Some(trimmed.to_string());
+    write_extension_meta(roaming_root, dir_id, &meta);
+}
+
+pub fn save_extension_runtime_id(roaming_root: &Path, dir_id: &str, runtime_id: &str) {
+    let clean = runtime_id.trim().to_ascii_lowercase();
+    if !is_chrome_store_id(&clean) || !is_valid_extension_dir_id(dir_id) {
+        return;
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    if meta.runtime_id.as_deref() == Some(clean.as_str()) {
+        return;
+    }
+    meta.runtime_id = Some(clean);
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+}
+
+pub fn remove_extension_meta(roaming_root: &Path, dir_id: &str) {
+    if !is_valid_extension_dir_id(dir_id) {
+        return;
+    }
+    let _ = std::fs::remove_file(extensions_meta_dir(roaming_root).join(format!("{}.json", dir_id)));
+}
+
+/// Returns `(install_dir, is_enabled)` for an installed extension directory ID.
+pub fn locate_extension_dir(roaming_root: &Path, id: &str) -> Option<(PathBuf, bool)> {
+    if !is_valid_extension_dir_id(id) {
+        return None;
+    }
+    let enabled = enabled_extensions_dir(roaming_root).join(id);
+    if enabled.is_dir() {
+        return Some((enabled, true));
+    }
+    let disabled = disabled_extensions_dir(roaming_root).join(id);
+    if disabled.is_dir() {
+        return Some((disabled, false));
+    }
+    None
+}
+
 /// Validates a safe extension directory ID (no slashes, no `..`, ASCII alnum / `_` / `-`).
 pub fn is_valid_extension_dir_id(id: &str) -> bool {
     !id.is_empty()
@@ -142,7 +226,7 @@ pub fn parse_chrome_web_store_id(input: &str) -> Option<String> {
     None
 }
 
-fn is_chrome_store_id(s: &str) -> bool {
+pub fn is_chrome_store_id(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| (b'a'..=b'p').contains(&b.to_ascii_lowercase()))
 }
 
@@ -336,10 +420,22 @@ fn pick_manifest_icon_rel_path(manifest: &serde_json::Value) -> Option<String> {
 }
 
 fn parse_extension_dir(
+    roaming_root: &Path,
     ext_dir: &Path,
     id: &str,
     enabled: bool,
     pinned_ids: &[String],
+) -> Option<ChromeExtensionInfo> {
+    let meta = read_extension_meta(roaming_root, id);
+    parse_extension_dir_with_meta(ext_dir, id, enabled, pinned_ids, meta)
+}
+
+fn parse_extension_dir_with_meta(
+    ext_dir: &Path,
+    id: &str,
+    enabled: bool,
+    pinned_ids: &[String],
+    meta: ExtensionMeta,
 ) -> Option<ChromeExtensionInfo> {
     let manifest_path = ext_dir.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path).ok()?;
@@ -413,6 +509,8 @@ fn parse_extension_dir(
         options_path,
         permissions,
         install_path: ext_dir.to_string_lossy().to_string(),
+        source_path: meta.source_path,
+        runtime_id: meta.runtime_id,
     })
 }
 
@@ -452,7 +550,7 @@ pub fn list_extensions(roaming_root: &Path, pinned_ids: &[String]) -> Vec<Chrome
             if !is_valid_extension_dir_id(id) {
                 continue;
             }
-            if let Some(info) = parse_extension_dir(&p, id, enabled, pinned_ids) {
+            if let Some(info) = parse_extension_dir(roaming_root, &p, id, enabled, pinned_ids) {
                 out.push(info);
             }
         }
@@ -891,7 +989,7 @@ pub fn resolve_extension_runtime_url(
     let manifest: serde_json::Value =
         serde_json::from_str(manifest_raw.trim_start_matches('\u{feff}')).ok()?;
 
-    let info = parse_extension_dir(&ext_dir, dir_id, true, &[])?;
+    let info = parse_extension_dir(roaming_root, &ext_dir, dir_id, true, &[])?;
     let rel_raw = if open_options {
         info.options_path.as_deref().or(info.popup_path.as_deref())
     } else {
@@ -912,7 +1010,10 @@ pub fn resolve_extension_runtime_url(
         .unwrap_or(rel_clean);
     resolve_safe_child_path(&ext_dir, rel_file)?;
 
-    let runtime_id = find_runtime_extension_id(roaming_root, &ext_dir, dir_id, &info.name)
+    let runtime_id = read_extension_meta(roaming_root, dir_id)
+        .runtime_id
+        .filter(|id| is_chrome_store_id(id))
+        .or_else(|| find_runtime_extension_id(roaming_root, &ext_dir, dir_id, &info.name))
         .or_else(|| {
             manifest
                 .get("key")
@@ -1060,7 +1161,7 @@ fn install_bytes_under_id(
         let _ = std::fs::remove_dir_all(&stage_dir);
     }
 
-    parse_extension_dir(&final_dir, ext_id, true, pinned_ids)
+    parse_extension_dir(roaming_root, &final_dir, ext_id, true, pinned_ids)
         .ok_or_else(|| "Extension installed, but manifest.json could not be parsed.".to_string())
 }
 
@@ -1384,6 +1485,7 @@ pub fn install_from_local_path(
                 .and_then(|s| s.to_str())
                 .unwrap_or("local_ext");
             let id = derive_safe_id(explicit_id.unwrap_or(stem));
+            save_extension_source_path(roaming_root, &id, &trimmed);
             return install_bytes_under_id(roaming_root, &id, &raw, pinned_ids);
         }
     } else {
@@ -1507,10 +1609,48 @@ pub fn install_from_local_path(
                     .map_err(|e| format!("Failed writing manifest.json: {}", e))?;
             }
         }
+        save_extension_source_path(roaming_root, &id, &trimmed);
     }
 
-    parse_extension_dir(&final_dir, &id, true, pinned_ids)
+    parse_extension_dir(roaming_root, &final_dir, &id, true, pinned_ids)
         .ok_or_else(|| "Extension copied, but manifest.json is invalid.".to_string())
+}
+
+/// Refreshes an installed extension from its recorded local source (`manifest.json`, folder, or
+/// `.crx`/`.zip`) when available, or re-validates its installed directory on disk otherwise.
+pub fn refresh_installed_extension(
+    roaming_root: &Path,
+    id: &str,
+    pinned_ids: &[String],
+) -> Result<ChromeExtensionInfo, String> {
+    if !is_valid_extension_dir_id(id) {
+        return Err("Invalid extension identifier.".into());
+    }
+    let (ext_dir, was_enabled) = locate_extension_dir(roaming_root, id)
+        .ok_or_else(|| "Extension not found.".to_string())?;
+    let meta = read_extension_meta(roaming_root, id);
+
+    let updated = if let Some(ref src) = meta.source_path {
+        if Path::new(src).exists() {
+            let mut info = install_from_local_path(roaming_root, src, Some(id), pinned_ids)?;
+            if !was_enabled {
+                set_extension_enabled(roaming_root, id, false)?;
+                let disabled_path = disabled_extensions_dir(roaming_root).join(id);
+                info = parse_extension_dir(roaming_root, &disabled_path, id, false, pinned_ids)
+                    .ok_or_else(|| "Extension refreshed, but manifest.json is invalid.".to_string())?;
+            }
+            info
+        } else {
+            parse_extension_dir(roaming_root, &ext_dir, id, was_enabled, pinned_ids)
+                .ok_or_else(|| "Extension manifest.json could not be parsed.".to_string())?
+        }
+    } else {
+        parse_extension_dir(roaming_root, &ext_dir, id, was_enabled, pinned_ids)
+            .ok_or_else(|| "Extension manifest.json could not be parsed.".to_string())?
+    };
+
+    invalidate_extensions_cache();
+    Ok(updated)
 }
 
 fn derive_safe_id(raw: &str) -> String {
@@ -1577,6 +1717,7 @@ pub fn remove_extension(roaming_root: &Path, id: &str) -> Result<(), String> {
     }
     let _ = std::fs::remove_dir_all(enabled_extensions_dir(roaming_root).join(id));
     let _ = std::fs::remove_dir_all(disabled_extensions_dir(roaming_root).join(id));
+    remove_extension_meta(roaming_root, id);
     Ok(())
 }
 
@@ -1655,7 +1796,9 @@ pub fn scan_installed_browsers_extensions() -> Vec<DetectedExternalExtension> {
             let Some(ver_dir) = pick_latest_version_subdir(&p) else {
                 continue;
             };
-            if let Some(info) = parse_extension_dir(&ver_dir, id, true, &[]) {
+            if let Some(info) =
+                parse_extension_dir_with_meta(&ver_dir, id, true, &[], ExtensionMeta::default())
+            {
                 // Skip Chromium internal component helpers without human-readable names
                 if info.name.starts_with("__MSG_") {
                     continue;

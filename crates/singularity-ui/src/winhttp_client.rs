@@ -170,6 +170,7 @@ mod win32_impl {
     const WINHTTP_DECOMPRESSION_FLAG_ALL: u32 = 0x0000_0003;
     const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: u32 = 0x0000_0800;
     const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: u32 = 0x0000_2000;
+    const WINHTTP_QUERY_CONTENT_LENGTH: u32 = 5;
     const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
     const WINHTTP_QUERY_LOCATION: u32 = 33;
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
@@ -302,6 +303,28 @@ mod win32_impl {
         }
     }
 
+    fn query_content_length_header(h_req: HInternet) -> Option<u64> {
+        let mut buf = [0u16; 64];
+        let mut byte_len = (buf.len() * 2) as u32;
+        let mut idx: u32 = 0;
+        let ok = unsafe {
+            WinHttpQueryHeaders(
+                h_req,
+                WINHTTP_QUERY_CONTENT_LENGTH,
+                core::ptr::null(),
+                buf.as_mut_ptr() as *mut c_void,
+                &mut byte_len,
+                &mut idx,
+            )
+        };
+        if ok == 0 || byte_len < 2 {
+            return None;
+        }
+        let u16_len = (byte_len as usize / 2).min(buf.len());
+        let s = String::from_utf16_lossy(&buf[..u16_len]);
+        s.trim_end_matches('\0').trim().parse::<u64>().ok()
+    }
+
     /// Executes a single HTTP/HTTPS GET without following redirects, writing body chunks into `sink`.
     fn single_hop_get<F>(
         url: &str,
@@ -313,7 +336,7 @@ mod win32_impl {
         mut on_chunk: F,
     ) -> Result<(u16, Option<String>), String>
     where
-        F: FnMut(&[u8]) -> Result<(), String>,
+        F: FnMut(&[u8], u64, u64) -> Result<(), String>,
     {
         let parsed = parse_http_url_parts(url)?;
         let ua_w = to_wide(user_agent);
@@ -481,6 +504,7 @@ mod win32_impl {
             return Ok((status_code, location));
         }
 
+        let content_length = query_content_length_header(h_request).unwrap_or(0);
         let mut total_read: usize = 0;
         let mut buf = vec![0u8; 32 * 1024];
         loop {
@@ -512,7 +536,7 @@ mod win32_impl {
             if total_read > max_bytes {
                 return Err("HTTP response exceeded maximum allowed size".into());
             }
-            on_chunk(&buf[..n])?;
+            on_chunk(&buf[..n], total_read as u64, content_length)?;
         }
 
         Ok((status_code, location))
@@ -535,7 +559,7 @@ mod win32_impl {
             connect_timeout_ms,
             receive_timeout_ms,
             max_bytes,
-            |chunk| {
+            |chunk, _, _| {
                 body.extend_from_slice(chunk);
                 Ok(())
             },
@@ -596,8 +620,10 @@ mod win32_impl {
         Err("Too many HTTPS redirects".into())
     }
 
-    /// Streams an HTTPS-only download directly to `dest_path` (following up to 6 HTTPS redirects).
-    pub fn winhttp_download_https_to_file(
+    /// Streams an HTTPS-only download directly to `dest_path` (following up to 6 HTTPS redirects),
+    /// invoking `on_progress(downloaded_bytes, total_bytes)` as chunks arrive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn winhttp_download_https_to_file_with_progress<F>(
         start_url: &str,
         dest_path: &Path,
         user_agent: &str,
@@ -605,7 +631,11 @@ mod win32_impl {
         connect_timeout_ms: i32,
         receive_timeout_ms: i32,
         max_bytes: usize,
-    ) -> Result<(), String> {
+        mut on_progress: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(u64, u64),
+    {
         let initial_host = parse_http_url_parts(start_url)?.host.to_ascii_lowercase();
         let mut current = start_url.to_string();
 
@@ -629,7 +659,7 @@ mod win32_impl {
                 connect_timeout_ms,
                 receive_timeout_ms,
                 max_bytes,
-                |chunk| {
+                |chunk, downloaded, total| {
                     if file_opt.is_none() {
                         let f = std::fs::File::create(dest_path)
                             .map_err(|e| format!("Failed creating {}: {}", dest_path.display(), e))?;
@@ -639,6 +669,7 @@ mod win32_impl {
                         f.write_all(chunk)
                             .map_err(|e| format!("Failed writing download: {}", e))?;
                     }
+                    on_progress(downloaded, total);
                     Ok(())
                 },
             )?;
@@ -664,9 +695,32 @@ mod win32_impl {
         let _ = std::fs::remove_file(dest_path);
         Err("Too many HTTPS redirects".into())
     }
+
+    /// Streams an HTTPS-only download directly to `dest_path` (following up to 6 HTTPS redirects).
+    pub fn winhttp_download_https_to_file(
+        start_url: &str,
+        dest_path: &Path,
+        user_agent: &str,
+        extra_headers: &[(&str, &str)],
+        connect_timeout_ms: i32,
+        receive_timeout_ms: i32,
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        winhttp_download_https_to_file_with_progress(
+            start_url,
+            dest_path,
+            user_agent,
+            extra_headers,
+            connect_timeout_ms,
+            receive_timeout_ms,
+            max_bytes,
+            |_, _| {},
+        )
+    }
 }
 
 #[cfg(target_os = "windows")]
 pub use win32_impl::{
-    winhttp_download_https_to_file, winhttp_get_https_bytes, winhttp_get_no_redirect,
+    winhttp_download_https_to_file, winhttp_download_https_to_file_with_progress,
+    winhttp_get_https_bytes, winhttp_get_no_redirect,
 };

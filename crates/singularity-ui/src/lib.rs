@@ -788,11 +788,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.7");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.8");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.8"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.8"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1337,7 +1337,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.7"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.8"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1422,7 +1422,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.7"));
+        assert!(txt.contains("v2.0.8"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1456,7 +1456,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.8"));
     }
 
     #[test]
@@ -1531,7 +1531,7 @@ mod tests {
         // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.7"}"#,
+            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.8"}"#,
         )
         .expect("write running.lock");
         let sessions_dir = tmp_dir.join("sessions");
@@ -1597,7 +1597,7 @@ mod tests {
         // even after the new process truncates `cef.log`!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.7"}"#,
+            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.8"}"#,
         )
         .expect("write dead lock");
         std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
@@ -1929,8 +1929,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.7");
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.8");
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.8"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -1948,6 +1948,129 @@ mod tests {
 
         let main_src = include_str!("main.rs");
         assert!(main_src.contains("--wait-pid"));
+    }
+
+    #[test]
+    fn test_v208_stable_tabs_update_progress_and_dynamic_extensions() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity_v208_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let roaming = tmp_dir.join("roaming");
+        let src_dir = tmp_dir.join("dev-ext");
+        std::fs::create_dir_all(&src_dir).expect("create dev-ext");
+
+        // 1. Install local extension from manifest.json -> persists source_path
+        let manifest_path = src_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{"manifest_version":3,"name":"Dev Hot Reload Ext","version":"1.0.0","action":{"default_popup":"popup.html"}}"#,
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("popup.html"), "<html>v1</html>").unwrap();
+
+        let info1 = extensions::install_from_local_path(
+            &roaming,
+            &manifest_path.to_string_lossy(),
+            None,
+            &[],
+        )
+        .expect("install local manifest.json");
+        assert_eq!(info1.version, "1.0.0");
+        assert!(info1.source_path.is_some());
+
+        // Persist a simulated live Chromium 32-char runtime_id from Extensions.loadUnpacked
+        let fake_rt_id = "abcdefghijklmnopabcdefghijklmnop";
+        extensions::save_extension_runtime_id(&roaming, &info1.id, fake_rt_id);
+        let (popup_url, popup_name) =
+            extensions::resolve_extension_runtime_url(&roaming, &info1.id, false)
+                .expect("resolve popup url from persisted runtime_id");
+        assert_eq!(popup_url, format!("chrome-extension://{}/popup.html", fake_rt_id));
+        assert_eq!(popup_name, "Dev Hot Reload Ext");
+
+        // 2. Edit original source files and call refresh_installed_extension -> re-copies & keeps runtime_id
+        std::fs::write(
+            &manifest_path,
+            r#"{"manifest_version":3,"name":"Dev Hot Reload Ext","version":"1.2.0","action":{"default_popup":"popup.html"}}"#,
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("popup.html"), "<html>v1.2</html>").unwrap();
+
+        let info2 = extensions::refresh_installed_extension(&roaming, &info1.id, &[])
+            .expect("refresh installed extension from source");
+        assert_eq!(info2.version, "1.2.0");
+        assert_eq!(info2.runtime_id.as_deref(), Some(fake_rt_id));
+        let copied_popup = std::fs::read_to_string(
+            extensions::enabled_extensions_dir(&roaming)
+                .join(&info1.id)
+                .join("popup.html"),
+        )
+        .unwrap();
+        assert_eq!(copied_popup, "<html>v1.2</html>");
+
+        // 3. Refreshing a disabled extension refreshes files while keeping it disabled
+        extensions::set_extension_enabled(&roaming, &info1.id, false).expect("disable ext");
+        std::fs::write(
+            &manifest_path,
+            r#"{"manifest_version":3,"name":"Dev Hot Reload Ext","version":"1.3.0","action":{"default_popup":"popup.html"}}"#,
+        )
+        .unwrap();
+        let info3 = extensions::refresh_installed_extension(&roaming, &info1.id, &[])
+            .expect("refresh disabled ext");
+        assert!(!info3.enabled);
+        assert_eq!(info3.version, "1.3.0");
+
+        // 4. Removing extension cleans up extensions_meta/<id>.json
+        extensions::remove_extension(&roaming, &info1.id).expect("remove ext");
+        let meta_after = extensions::read_extension_meta(&roaming, &info1.id);
+        assert!(meta_after.source_path.is_none());
+        assert!(meta_after.runtime_id.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 5. Updater progress snapshot serializes cleanly
+        let prog = updater::get_update_progress();
+        let prog_json = serde_json::to_value(&prog).expect("serialize UpdateProgressSnapshot");
+        assert!(prog_json.get("phase").is_some());
+        assert!(prog_json.get("downloaded_bytes").is_some());
+        assert!(prog_json.get("total_bytes").is_some());
+        assert!(prog_json.get("percent").is_some());
+        assert!(prog_json.get("speed_bps").is_some());
+
+        // 6. Verify v2.0.8 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.8");
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.8"));
+        assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
+        assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
+        assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));
+        assert!(SINGULARITY_UI_HTML.contains("flex: 0 1 172px;"));
+        assert!(SINGULARITY_UI_HTML.contains("width: 172px;"));
+        assert!(!SINGULARITY_UI_HTML.contains("|| strip.scrollWidth > strip.clientWidth + 4"));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"update-progress-wrap\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"update-progress-bar-fill\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"update-floating-bar\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"topbar-update-line\""));
+        assert!(SINGULARITY_UI_HTML.contains("/api/updater/progress"));
+        assert!(SINGULARITY_UI_HTML.contains("startUpdateProgressPolling"));
+        assert!(SINGULARITY_UI_HTML.contains("/api/extensions/reload"));
+        assert!(SINGULARITY_UI_HTML.contains("reloadExtensionUI"));
+        assert!(SINGULARITY_UI_HTML.contains("hideExtensionRestartBanner"));
+        assert!(SINGULARITY_UI_HTML.contains("reload_ext"));
+
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("\"/api/updater/progress\""));
+        assert!(server_src.contains("\"/api/extensions/reload\""));
+        assert!(server_src.contains("init_and_sync_dynamic_extensions_cef"));
+        assert!(server_src.contains("dynamic_ext_ok"));
+        assert!(server_src.contains("Some(\"reload_ext\")"));
+
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("remote-debugging-pipe"));
+        assert!(cef_src.contains("remote-debugging-io-pipes"));
+        assert!(cef_src.contains("enable-unsafe-extension-debugging"));
+        assert!(cef_src.contains("Extensions.loadUnpacked"));
+        assert!(cef_src.contains("Extensions.uninstall"));
     }
 }
 

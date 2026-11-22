@@ -29,8 +29,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const WINDOWS_TO_UNIX_EPOCH_US: i64 = 11_644_473_600_000_000;
 const IPC_MESSAGE_NAME: &str = "sg_ipc";
@@ -61,6 +61,27 @@ extern "system" {
 extern "system" {
     fn GetCurrentProcess() -> *mut core::ffi::c_void;
     fn K32EmptyWorkingSet(hprocess: *mut core::ffi::c_void) -> i32;
+    fn CreatePipe(
+        h_read_pipe: *mut *mut core::ffi::c_void,
+        h_write_pipe: *mut *mut core::ffi::c_void,
+        lp_pipe_attributes: *const core::ffi::c_void,
+        n_size: u32,
+    ) -> i32;
+    fn ReadFile(
+        h_file: *mut core::ffi::c_void,
+        lp_buffer: *mut u8,
+        n_number_of_bytes_to_read: u32,
+        lp_number_of_bytes_read: *mut u32,
+        lp_overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn WriteFile(
+        h_file: *mut core::ffi::c_void,
+        lp_buffer: *const u8,
+        n_number_of_bytes_to_write: u32,
+        lp_number_of_bytes_written: *mut u32,
+        lp_overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
 }
 
 /// Releases idle working-set pages back to Windows when a window is minimized or idle.
@@ -492,7 +513,18 @@ wrap_app! {
                 cmd.append_switch_with_value(Some(&CefString::from(k)), Some(&CefString::from(v)));
             }
 
-            if let Some(ref ext_dir) = self.extensions_dir {
+            if let Some(io_pipes) = cdp_pipe_io_arg() {
+                // Zero-restart dynamic Chrome Extensions bridge over private in-process Win32
+                // anonymous kernel pipes (zero TCP port, zero external process access).
+                // Extensions are synced live via `Extensions.loadUnpacked` / `Extensions.uninstall`
+                // so Chromium registers them as `kUnpacked` instead of read-only `kCommandLine`.
+                cmd.append_switch(Some(&CefString::from("remote-debugging-pipe")));
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("remote-debugging-io-pipes")),
+                    Some(&CefString::from(io_pipes.as_str())),
+                );
+                cmd.append_switch(Some(&CefString::from("enable-unsafe-extension-debugging")));
+            } else if let Some(ref ext_dir) = self.extensions_dir {
                 let enabled = collect_enabled_extension_dirs(ext_dir);
                 if !enabled.is_empty() {
                     let joined = enabled
@@ -563,6 +595,10 @@ impl CefRuntimeGuard {
     ) -> Result<Self, String> {
         let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
         let _ = std::fs::create_dir_all(profile_dir);
+
+        // Create private in-process Win32 anonymous pipes BEFORE `cef::initialize` so
+        // `on_before_command_line_processing` attaches `--remote-debugging-io-pipes`.
+        let _ = init_cdp_pipe_bridge();
 
         let context_initialized = Arc::new(AtomicBool::new(false));
         let args = args::Args::new();
@@ -2276,4 +2312,501 @@ pub fn clear_all_cookies_cef() {
         let _ = mgr.delete_cookies(None, None, None);
         let _ = mgr.flush_store(None);
     }
+}
+
+// =================================================================================================
+// Zero-Restart Dynamic Chrome Extensions Bridge (Private In-Process Anonymous Win32 CDP Pipes)
+// =================================================================================================
+
+type CdpPendingMap =
+    HashMap<u64, std::sync::mpsc::Sender<Result<serde_json::Value, String>>>;
+
+struct CdpPipeBridge {
+    rust_write: Mutex<usize>,
+    chrome_io_arg: String,
+    pending: Arc<Mutex<CdpPendingMap>>,
+    next_id: AtomicU64,
+    alive: Arc<AtomicBool>,
+}
+
+static CDP_PIPE_BRIDGE: OnceLock<Option<CdpPipeBridge>> = OnceLock::new();
+static DYNAMIC_EXTENSIONS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn init_cdp_pipe_bridge() -> Option<&'static CdpPipeBridge> {
+    CDP_PIPE_BRIDGE
+        .get_or_init(|| unsafe {
+            let mut chrome_read: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut rust_write: *mut core::ffi::c_void = std::ptr::null_mut();
+            if CreatePipe(&mut chrome_read, &mut rust_write, std::ptr::null(), 65536) == 0 {
+                return None;
+            }
+            let mut rust_read: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut chrome_write: *mut core::ffi::c_void = std::ptr::null_mut();
+            if CreatePipe(&mut rust_read, &mut chrome_write, std::ptr::null(), 65536) == 0 {
+                let _ = CloseHandle(chrome_read);
+                let _ = CloseHandle(rust_write);
+                return None;
+            }
+            let cr_val = chrome_read as usize;
+            let cw_val = chrome_write as usize;
+            if cr_val == 0 || cw_val == 0 || cr_val > u32::MAX as usize || cw_val > u32::MAX as usize
+            {
+                let _ = CloseHandle(chrome_read);
+                let _ = CloseHandle(rust_write);
+                let _ = CloseHandle(rust_read);
+                let _ = CloseHandle(chrome_write);
+                return None;
+            }
+
+            let pending: Arc<Mutex<CdpPendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+            let alive = Arc::new(AtomicBool::new(true));
+            let reader_pending = Arc::clone(&pending);
+            let reader_alive = Arc::clone(&alive);
+            let reader_handle = rust_read as usize;
+
+            let _ = std::thread::Builder::new()
+                .name("singularity-cdp-reader".into())
+                .spawn(move || {
+                    let h = reader_handle as *mut core::ffi::c_void;
+                    let mut chunk = [0u8; 4096];
+                    let mut acc: Vec<u8> = Vec::with_capacity(8192);
+                    loop {
+                        let mut nread: u32 = 0;
+                        let ok = ReadFile(
+                            h,
+                            chunk.as_mut_ptr(),
+                            chunk.len() as u32,
+                            &mut nread,
+                            std::ptr::null_mut(),
+                        );
+                        if ok == 0 || nread == 0 {
+                            break;
+                        }
+                        acc.extend_from_slice(&chunk[..nread as usize]);
+                        while let Some(pos) = acc.iter().position(|&b| b == 0) {
+                            let frame: Vec<u8> = acc.drain(..=pos).collect();
+                            let body = &frame[..frame.len().saturating_sub(1)];
+                            if body.is_empty() {
+                                continue;
+                            }
+                            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
+                                if let Some(id) = val.get("id").and_then(|v| v.as_u64()) {
+                                    let reply = if let Some(err) = val.get("error") {
+                                        let msg = err
+                                            .get("message")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("CDP command error")
+                                            .to_string();
+                                        Err(msg)
+                                    } else {
+                                        Ok(val
+                                            .get("result")
+                                            .cloned()
+                                            .unwrap_or_else(|| serde_json::json!({})))
+                                    };
+                                    if let Ok(mut map) = reader_pending.lock() {
+                                        if let Some(tx) = map.remove(&id) {
+                                            let _ = tx.send(reply);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if acc.len() > 4 * 1024 * 1024 {
+                            acc.clear();
+                        }
+                    }
+                    reader_alive.store(false, Ordering::Release);
+                    if let Ok(mut map) = reader_pending.lock() {
+                        for (_, tx) in map.drain() {
+                            let _ = tx.send(Err("CDP pipe closed".into()));
+                        }
+                    }
+                    let _ = CloseHandle(h);
+                });
+
+            Some(CdpPipeBridge {
+                rust_write: Mutex::new(rust_write as usize),
+                chrome_io_arg: format!("{},{}", cr_val as u32, cw_val as u32),
+                pending,
+                next_id: AtomicU64::new(1),
+                alive,
+            })
+        })
+        .as_ref()
+}
+
+fn cdp_pipe_io_arg() -> Option<String> {
+    CDP_PIPE_BRIDGE
+        .get()
+        .and_then(|opt| opt.as_ref())
+        .map(|b| b.chrome_io_arg.clone())
+}
+
+fn cdp_call(
+    method: &str,
+    params: serde_json::Value,
+    timeout: std::time::Duration,
+    pump_ui: bool,
+) -> Result<serde_json::Value, String> {
+    let bridge = CDP_PIPE_BRIDGE
+        .get()
+        .and_then(|opt| opt.as_ref())
+        .ok_or_else(|| "CDP pipe bridge not initialized".to_string())?;
+    if !bridge.alive.load(Ordering::Acquire) {
+        return Err("CDP pipe is closed".into());
+    }
+
+    let id = bridge.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut map = bridge
+            .pending
+            .lock()
+            .map_err(|_| "CDP pending lock poisoned".to_string())?;
+        map.insert(id, tx);
+    }
+
+    let payload = serde_json::json!({
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    let mut bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    bytes.push(0u8);
+
+    {
+        let write_guard = bridge
+            .rust_write
+            .lock()
+            .map_err(|_| "CDP write lock poisoned".to_string())?;
+        let h = (*write_guard) as *mut core::ffi::c_void;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let mut written: u32 = 0;
+            let remaining = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+            let ok = unsafe {
+                WriteFile(
+                    h,
+                    bytes.as_ptr().add(offset),
+                    remaining,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || written == 0 {
+                if let Ok(mut map) = bridge.pending.lock() {
+                    map.remove(&id);
+                }
+                return Err("Failed writing CDP frame to Chromium pipe".into());
+            }
+            offset += written as usize;
+        }
+    }
+
+    if pump_ui {
+        let start = std::time::Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(res) => return res,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("CDP pipe reader disconnected".into());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if start.elapsed() >= timeout {
+                if let Ok(mut map) = bridge.pending.lock() {
+                    map.remove(&id);
+                }
+                return Err(format!(
+                    "CDP '{}' timed out after {}ms",
+                    method,
+                    timeout.as_millis()
+                ));
+            }
+            pump_cef_message_loop();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    } else {
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(mut map) = bridge.pending.lock() {
+                    map.remove(&id);
+                }
+                Err(format!(
+                    "CDP '{}' timed out after {}ms",
+                    method,
+                    timeout.as_millis()
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("CDP pipe reader disconnected".into())
+            }
+        }
+    }
+}
+
+fn clean_win_abs_path(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy().into_owned();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    stripped.replace('/', "\\")
+}
+
+fn normalize_win_ext_path(raw: &str) -> String {
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+    stripped
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn query_loaded_unpacked_extensions(pump_ui: bool) -> Option<Vec<(String, String)>> {
+    let res = cdp_call(
+        "Extensions.getExtensions",
+        serde_json::json!({}),
+        std::time::Duration::from_millis(2500),
+        pump_ui,
+    )
+    .ok()?;
+    let arr = res.get("extensions")?.as_array()?;
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        out.push((id.to_ascii_lowercase(), path.to_string()));
+    }
+    Some(out)
+}
+
+/// Returns `true` when Chromium's live dynamic extension bridge (zero-restart) is active.
+pub fn is_dynamic_extensions_active() -> bool {
+    DYNAMIC_EXTENSIONS_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Connects to Chromium's private anonymous CDP pipe immediately after CEF initialization
+/// and reconciles `%APPDATA%\.singularity\extensions\` live via `Extensions.loadUnpacked` and
+/// `Extensions.uninstall` so extensions can be installed, reloaded, toggled, and removed at
+/// runtime with ZERO browser restart.
+pub fn init_and_sync_dynamic_extensions_cef(roaming_root: &Path) -> bool {
+    // Verify the private CDP pipe is responding before marking dynamic mode active.
+    if let Err(err) = cdp_call(
+        "Browser.getVersion",
+        serde_json::json!({}),
+        std::time::Duration::from_millis(3000),
+        true,
+    ) {
+        eprintln!(
+            "[singularity-cef] Dynamic extension CDP pipe probe failed ({}); falling back to restart-required mode.",
+            err
+        );
+        DYNAMIC_EXTENSIONS_ACTIVE.store(false, Ordering::Release);
+        return false;
+    }
+
+    let enabled_root = crate::extensions::enabled_extensions_dir(roaming_root);
+    let disabled_root = crate::extensions::disabled_extensions_dir(roaming_root);
+    let enabled_prefix = format!("{}\\", normalize_win_ext_path(&clean_win_abs_path(&enabled_root)));
+    let disabled_prefix = format!("{}\\", normalize_win_ext_path(&clean_win_abs_path(&disabled_root)));
+
+    let enabled_dirs = collect_enabled_extension_dirs(&enabled_root);
+    let mut wanted_by_norm: HashMap<String, (String, PathBuf)> = HashMap::new();
+    for dir in &enabled_dirs {
+        if let Some(dir_id) = dir.file_name().and_then(|n| n.to_str()) {
+            let abs = clean_win_abs_path(dir);
+            let norm = normalize_win_ext_path(&abs);
+            wanted_by_norm.insert(norm, (dir_id.to_string(), dir.clone()));
+        }
+    }
+
+    let mut loaded_by_norm: HashMap<String, String> = HashMap::new();
+    if let Some(loaded) = query_loaded_unpacked_extensions(true) {
+        for (rt_id, loaded_path) in loaded {
+            let norm = normalize_win_ext_path(&loaded_path);
+            let is_managed = norm.starts_with(&enabled_prefix) || norm.starts_with(&disabled_prefix);
+            if is_managed && !wanted_by_norm.contains_key(&norm) {
+                let _ = cdp_call(
+                    "Extensions.uninstall",
+                    serde_json::json!({ "id": rt_id }),
+                    std::time::Duration::from_millis(3000),
+                    true,
+                );
+            } else {
+                loaded_by_norm.insert(norm, rt_id);
+            }
+        }
+    } else if let Ok(entries) = std::fs::read_dir(&disabled_root) {
+        // Fallback cleanup when `Extensions.getExtensions` is unavailable: uninstall known disabled IDs
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if let Some(dir_id) = p.file_name().and_then(|n| n.to_str()) {
+                if let Some(rt_id) = crate::extensions::read_extension_meta(roaming_root, dir_id).runtime_id {
+                    let _ = cdp_call(
+                        "Extensions.uninstall",
+                        serde_json::json!({ "id": rt_id }),
+                        std::time::Duration::from_millis(2000),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    for (norm, (dir_id, dir_path)) in &wanted_by_norm {
+        if let Some(rt_id) = loaded_by_norm.get(norm) {
+            crate::extensions::save_extension_runtime_id(roaming_root, dir_id, rt_id);
+            continue;
+        }
+        let abs = clean_win_abs_path(dir_path);
+        match cdp_call(
+            "Extensions.loadUnpacked",
+            serde_json::json!({ "path": abs }),
+            std::time::Duration::from_millis(5000),
+            true,
+        ) {
+            Ok(val) => {
+                if let Some(rt_id) = val.get("id").and_then(|v| v.as_str()) {
+                    crate::extensions::save_extension_runtime_id(roaming_root, dir_id, rt_id);
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[singularity-cef] Dynamic startup load failed for '{}': {}",
+                    dir_id, err
+                );
+            }
+        }
+    }
+
+    DYNAMIC_EXTENSIONS_ACTIVE.store(true, Ordering::Release);
+    true
+}
+
+/// Loads (or reloads) an unpacked extension directory LIVE into Chromium with zero restart.
+pub fn dynamic_load_extension_cef(
+    roaming_root: &Path,
+    dir_id: &str,
+    install_path: &Path,
+    pump_ui: bool,
+) -> Result<String, String> {
+    if !is_dynamic_extensions_active() {
+        return Err("Dynamic extensions bridge is not active".into());
+    }
+    let abs = clean_win_abs_path(install_path);
+    let val = cdp_call(
+        "Extensions.loadUnpacked",
+        serde_json::json!({ "path": abs }),
+        std::time::Duration::from_millis(6000),
+        pump_ui,
+    )?;
+    let rt_id = val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| "Chromium did not return an extension ID from Extensions.loadUnpacked".to_string())?;
+    crate::extensions::save_extension_runtime_id(roaming_root, dir_id, &rt_id);
+    Ok(rt_id)
+}
+
+fn resolve_live_runtime_id(
+    roaming_root: &Path,
+    dir_id: &str,
+    install_path: &Path,
+    pump_ui: bool,
+) -> Option<String> {
+    if let Some(rt_id) = crate::extensions::read_extension_meta(roaming_root, dir_id)
+        .runtime_id
+        .filter(|id| crate::extensions::is_chrome_store_id(id))
+    {
+        return Some(rt_id);
+    }
+    let norm_target = normalize_win_ext_path(&clean_win_abs_path(install_path));
+    if let Some(loaded) = query_loaded_unpacked_extensions(pump_ui) {
+        for (rt_id, loaded_path) in loaded {
+            if normalize_win_ext_path(&loaded_path) == norm_target {
+                return Some(rt_id);
+            }
+        }
+    }
+    if let Some(rt_id) = crate::extensions::find_runtime_extension_id(
+        roaming_root,
+        install_path,
+        dir_id,
+        "",
+    ) {
+        return Some(rt_id);
+    }
+    if let Ok(raw) = std::fs::read_to_string(install_path.join("manifest.json")) {
+        if let Ok(m) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+        {
+            if let Some(rt_id) = m
+                .get("key")
+                .and_then(|v| v.as_str())
+                .and_then(crate::extensions::chromium_id_from_public_key_b64)
+            {
+                return Some(rt_id);
+            }
+        }
+    }
+    if crate::extensions::is_chrome_store_id(dir_id) {
+        return Some(dir_id.to_ascii_lowercase());
+    }
+    None
+}
+
+/// Unloads and uninstalls an unpacked extension LIVE from Chromium with zero restart.
+pub fn dynamic_unload_extension_cef(
+    roaming_root: &Path,
+    dir_id: &str,
+    install_path: &Path,
+    pump_ui: bool,
+) -> Result<(), String> {
+    if !is_dynamic_extensions_active() {
+        return Err("Dynamic extensions bridge is not active".into());
+    }
+    let Some(rt_id) = resolve_live_runtime_id(roaming_root, dir_id, install_path, pump_ui) else {
+        return Ok(());
+    };
+    let res = cdp_call(
+        "Extensions.uninstall",
+        serde_json::json!({ "id": rt_id }),
+        std::time::Duration::from_millis(5000),
+        pump_ui,
+    );
+    match res {
+        Ok(_) => {
+            // Brief settle so Windows releases any file handle inside the unpacked directory.
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            Ok(())
+        }
+        Err(msg) => {
+            let low = msg.to_ascii_lowercase();
+            if low.contains("not found")
+                || low.contains("not installed")
+                || low.contains("no extension")
+                || low.contains("cannot find")
+            {
+                Ok(())
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+/// Hot-reloads an unpacked extension LIVE inside Chromium (uninstall + re-loadUnpacked).
+pub fn dynamic_reload_extension_cef(
+    roaming_root: &Path,
+    dir_id: &str,
+    install_path: &Path,
+    pump_ui: bool,
+) -> Result<String, String> {
+    let _ = dynamic_unload_extension_cef(roaming_root, dir_id, install_path, pump_ui);
+    dynamic_load_extension_cef(roaming_root, dir_id, install_path, pump_ui)
 }

@@ -2115,6 +2115,12 @@ fn run_windows_frameless_browser(
             if has_options {
                 add_item(hmenu, 502, t("Extension options", "Options de l'extension"), false);
             }
+            add_item(
+                hmenu,
+                506,
+                t("Reload extension", "Actualiser l'extension"),
+                false,
+            );
             add_sep(hmenu);
             add_item(hmenu, 503, t("Unpin from toolbar", "Détacher de la barre d'outils"), false);
             add_item(hmenu, 504, t("Disable extension", "Désactiver l'extension"), false);
@@ -2141,6 +2147,7 @@ fn run_windows_frameless_browser(
                 503 => Some("unpin_ext"),
                 504 => Some("disable_ext"),
                 505 => Some("manage_ext"),
+                506 => Some("reload_ext"),
                 _ => None,
             }
         }
@@ -2840,6 +2847,20 @@ fn run_windows_frameless_browser(
             "CEF initialized (log={}), on_context_initialized={}",
             cef_guard.log_path().display(),
             ctx_ready
+        ));
+    }
+
+    // Reconcile installed Chrome extensions live via Chromium's private anonymous CDP pipe
+    // so extensions can be loaded, reloaded, enabled, disabled, and removed with ZERO restart!
+    let ext_sync_root = smoke_opt
+        .as_ref()
+        .map(|o| o.profile_dir.as_path())
+        .unwrap_or(root_dir.as_path());
+    let dyn_ext_active = cef_runtime::init_and_sync_dynamic_extensions_cef(ext_sync_root);
+    if let Some(ref mut sm) = smoke_tracker {
+        sm.log(&format!(
+            "Dynamic zero-restart extensions CDP pipe active={}",
+            dyn_ext_active
         ));
     }
 
@@ -4122,8 +4143,101 @@ fn run_windows_frameless_browser(
                             parent_alive
                         ));
 
-                        let exit_code = if fail_reasons.is_empty() {
-                            sm.log("RESULT=PASS (Pure Chromium CEF UI rendered cleanly & single-tab close kept parent window alive!)");
+                        // Live Zero-Restart Dynamic Extensions Smoke Check on real CEF 150:
+                        let smoke_ext_dir = sm
+                            .opts
+                            .profile_dir
+                            .join("extensions")
+                            .join("smoke_dyn_ext");
+                        let _ = std::fs::create_dir_all(&smoke_ext_dir);
+                        let _ = std::fs::write(
+                            smoke_ext_dir.join("manifest.json"),
+                            r#"{"manifest_version":3,"name":"Singularity Smoke Ext","version":"1.0.0","description":"Live zero-restart smoke check"}"#,
+                        );
+                        let dynamic_ext_ok = if cef_runtime::is_dynamic_extensions_active() {
+                            match cef_runtime::dynamic_load_extension_cef(
+                                &sm.opts.profile_dir,
+                                "smoke_dyn_ext",
+                                &smoke_ext_dir,
+                                true,
+                            ) {
+                                Ok(rt_id_1) if extensions::is_chrome_store_id(&rt_id_1) => {
+                                    let _ = std::fs::write(
+                                        smoke_ext_dir.join("manifest.json"),
+                                        r#"{"manifest_version":3,"name":"Singularity Smoke Ext","version":"1.0.1","description":"Live zero-restart smoke check reloaded"}"#,
+                                    );
+                                    match cef_runtime::dynamic_reload_extension_cef(
+                                        &sm.opts.profile_dir,
+                                        "smoke_dyn_ext",
+                                        &smoke_ext_dir,
+                                        true,
+                                    ) {
+                                        Ok(rt_id_2) if extensions::is_chrome_store_id(&rt_id_2) => {
+                                            match cef_runtime::dynamic_unload_extension_cef(
+                                                &sm.opts.profile_dir,
+                                                "smoke_dyn_ext",
+                                                &smoke_ext_dir,
+                                                true,
+                                            ) {
+                                                Ok(()) => {
+                                                    sm.log(&format!(
+                                                        "Dynamic extensions smoke check: PASS (load={}, reload={}, uninstall=ok)",
+                                                        rt_id_1, rt_id_2
+                                                    ));
+                                                    true
+                                                }
+                                                Err(e) => {
+                                                    fail_reasons.push(format!(
+                                                        "dynamic extension uninstall failed: {}",
+                                                        e
+                                                    ));
+                                                    false
+                                                }
+                                            }
+                                        }
+                                        Ok(bad) => {
+                                            fail_reasons.push(format!(
+                                                "dynamic extension reload returned invalid id '{}'",
+                                                bad
+                                            ));
+                                            false
+                                        }
+                                        Err(e) => {
+                                            fail_reasons.push(format!(
+                                                "dynamic extension reload failed: {}",
+                                                e
+                                            ));
+                                            false
+                                        }
+                                    }
+                                }
+                                Ok(bad) => {
+                                    fail_reasons.push(format!(
+                                        "dynamic extension loadUnpacked returned invalid id '{}'",
+                                        bad
+                                    ));
+                                    false
+                                }
+                                Err(e) => {
+                                    fail_reasons.push(format!(
+                                        "dynamic extension loadUnpacked failed: {}",
+                                        e
+                                    ));
+                                    false
+                                }
+                            }
+                        } else {
+                            fail_reasons.push(
+                                "dynamic extensions CDP pipe bridge was not active after CEF init"
+                                    .to_string(),
+                            );
+                            false
+                        };
+                        let _ = std::fs::remove_dir_all(&smoke_ext_dir);
+                        sm.log(&format!("Dynamic extensions live check: dynamic_ext_ok={}", dynamic_ext_ok));
+
+                        let exit_code = if fail_reasons.is_empty() && dynamic_ext_ok {
+                            sm.log("RESULT=PASS (Pure Chromium CEF UI rendered cleanly, zero-restart dynamic extensions verified & single-tab close kept parent window alive!)");
                             0
                         } else {
                             sm.log(&format!("RESULT=FAIL: {}", fail_reasons.join(" | ")));
@@ -7225,11 +7339,16 @@ fn dispatch_http_request(
             };
             let installed = extensions::list_extensions(&root, &pinned);
             let detected = extensions::scan_installed_browsers_extensions();
+            #[cfg(target_os = "windows")]
+            let dynamic_supported = cef_runtime::is_dynamic_extensions_active();
+            #[cfg(not(target_os = "windows"))]
+            let dynamic_supported = false;
             let out = serde_json::json!({
                 "extensions_dir": extensions::enabled_extensions_dir(&root).to_string_lossy(),
                 "installed": installed,
                 "catalog": extensions::curated_catalog(),
-                "detected_browsers": detected
+                "detected_browsers": detected,
+                "dynamic_supported": dynamic_supported
             });
             HttpResponse::json("200 OK", &out)
         }
@@ -7246,8 +7365,36 @@ fn dispatch_http_request(
                     shell.roaming.profile.pinned_extensions.clone(),
                 )
             };
+            #[cfg(target_os = "windows")]
+            if let Some(store_id) = extensions::parse_chrome_web_store_id(input) {
+                let existing = extensions::enabled_extensions_dir(&root).join(&store_id);
+                if existing.is_dir() && cef_runtime::is_dynamic_extensions_active() {
+                    let _ = cef_runtime::dynamic_unload_extension_cef(&root, &store_id, &existing, false);
+                }
+            }
             match extensions::install_from_chrome_web_store(&root, input, &pinned) {
                 Ok(mut info) => {
+                    #[cfg(target_os = "windows")]
+                    let (dynamic, dyn_err) = if cef_runtime::is_dynamic_extensions_active() {
+                        match cef_runtime::dynamic_load_extension_cef(
+                            &root,
+                            &info.id,
+                            std::path::Path::new(&info.install_path),
+                            false,
+                        ) {
+                            Ok(rt_id) => {
+                                info.runtime_id = Some(rt_id);
+                                (true, None)
+                            }
+                            Err(e) => (false, Some(e)),
+                        }
+                    } else {
+                        (false, None)
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
+
+                    extensions::invalidate_extensions_cache();
                     let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                     if !shell.roaming.profile.pinned_extensions.contains(&info.id) {
                         shell.roaming.profile.pinned_extensions.push(info.id.clone());
@@ -7260,7 +7407,13 @@ fn dispatch_http_request(
                     );
                     HttpResponse::json(
                         "200 OK",
-                        &serde_json::json!({ "ok": true, "extension": info, "installed": all }),
+                        &serde_json::json!({
+                            "ok": true,
+                            "dynamic": dynamic,
+                            "dynamic_error": dyn_err,
+                            "extension": info,
+                            "installed": all
+                        }),
                     )
                 }
                 Err(e) => HttpResponse::json(
@@ -7283,8 +7436,37 @@ fn dispatch_http_request(
                     shell.roaming.profile.pinned_extensions.clone(),
                 )
             };
+            #[cfg(target_os = "windows")]
+            if let Some(eid) = explicit_id {
+                if let Some((existing, true)) = extensions::locate_extension_dir(&root, eid) {
+                    if cef_runtime::is_dynamic_extensions_active() {
+                        let _ = cef_runtime::dynamic_unload_extension_cef(&root, eid, &existing, false);
+                    }
+                }
+            }
             match extensions::install_from_local_path(&root, path_str, explicit_id, &pinned) {
                 Ok(mut info) => {
+                    #[cfg(target_os = "windows")]
+                    let (dynamic, dyn_err) = if cef_runtime::is_dynamic_extensions_active() {
+                        match cef_runtime::dynamic_reload_extension_cef(
+                            &root,
+                            &info.id,
+                            std::path::Path::new(&info.install_path),
+                            false,
+                        ) {
+                            Ok(rt_id) => {
+                                info.runtime_id = Some(rt_id);
+                                (true, None)
+                            }
+                            Err(e) => (false, Some(e)),
+                        }
+                    } else {
+                        (false, None)
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
+
+                    extensions::invalidate_extensions_cache();
                     let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                     if !shell.roaming.profile.pinned_extensions.contains(&info.id) {
                         shell.roaming.profile.pinned_extensions.push(info.id.clone());
@@ -7297,7 +7479,79 @@ fn dispatch_http_request(
                     );
                     HttpResponse::json(
                         "200 OK",
-                        &serde_json::json!({ "ok": true, "extension": info, "installed": all }),
+                        &serde_json::json!({
+                            "ok": true,
+                            "dynamic": dynamic,
+                            "dynamic_error": dyn_err,
+                            "extension": info,
+                            "installed": all
+                        }),
+                    )
+                }
+                Err(e) => HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "ok": false, "error": e }),
+                ),
+            }
+        }
+        "/api/extensions/reload" => {
+            let body = match require_post() {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let (root, pinned) = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    shell.roaming.root_dir().to_path_buf(),
+                    shell.roaming.profile.pinned_extensions.clone(),
+                )
+            };
+            // Unload from Chromium BEFORE refreshing files on disk to avoid Windows file locks.
+            #[cfg(target_os = "windows")]
+            if let Some((existing_dir, true)) = extensions::locate_extension_dir(&root, id) {
+                if cef_runtime::is_dynamic_extensions_active() {
+                    let _ = cef_runtime::dynamic_unload_extension_cef(&root, id, &existing_dir, false);
+                }
+            }
+            match extensions::refresh_installed_extension(&root, id, &pinned) {
+                #[allow(unused_mut)]
+                Ok(mut info) => {
+                    #[cfg(target_os = "windows")]
+                    let (dynamic, dyn_err) = if cef_runtime::is_dynamic_extensions_active() {
+                        if info.enabled {
+                            match cef_runtime::dynamic_load_extension_cef(
+                                &root,
+                                &info.id,
+                                std::path::Path::new(&info.install_path),
+                                false,
+                            ) {
+                                Ok(rt_id) => {
+                                    info.runtime_id = Some(rt_id);
+                                    (true, None)
+                                }
+                                Err(e) => (false, Some(e)),
+                            }
+                        } else {
+                            (true, None)
+                        }
+                    } else {
+                        (false, None)
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
+
+                    extensions::invalidate_extensions_cache();
+                    let all = extensions::list_extensions(&root, &pinned);
+                    HttpResponse::json(
+                        "200 OK",
+                        &serde_json::json!({
+                            "ok": true,
+                            "dynamic": dynamic,
+                            "dynamic_error": dyn_err,
+                            "extension": info,
+                            "installed": all
+                        }),
                     )
                 }
                 Err(e) => HttpResponse::json(
@@ -7313,16 +7567,58 @@ fn dispatch_http_request(
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            match extensions::set_extension_enabled(shell.roaming.root_dir(), id, enabled) {
+            let (root, pinned) = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    shell.roaming.root_dir().to_path_buf(),
+                    shell.roaming.profile.pinned_extensions.clone(),
+                )
+            };
+
+            #[cfg(target_os = "windows")]
+            let mut dynamic = false;
+            #[cfg(target_os = "windows")]
+            let mut dyn_err: Option<String> = None;
+            #[cfg(not(target_os = "windows"))]
+            let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
+
+            // When disabling: unload from Chromium FIRST so directory rename has zero open locks.
+            #[cfg(target_os = "windows")]
+            if !enabled && cef_runtime::is_dynamic_extensions_active() {
+                let enabled_path = extensions::enabled_extensions_dir(&root).join(id);
+                if enabled_path.is_dir() {
+                    match cef_runtime::dynamic_unload_extension_cef(&root, id, &enabled_path, false)
+                    {
+                        Ok(()) => dynamic = true,
+                        Err(e) => dyn_err = Some(e),
+                    }
+                } else {
+                    dynamic = true;
+                }
+            }
+
+            match extensions::set_extension_enabled(&root, id, enabled) {
                 Ok(()) => {
-                    let all = extensions::list_extensions(
-                        shell.roaming.root_dir(),
-                        &shell.roaming.profile.pinned_extensions,
-                    );
+                    // When enabling: load into Chromium live right after moving to `extensions/`.
+                    #[cfg(target_os = "windows")]
+                    if enabled && cef_runtime::is_dynamic_extensions_active() {
+                        let enabled_path = extensions::enabled_extensions_dir(&root).join(id);
+                        match cef_runtime::dynamic_load_extension_cef(&root, id, &enabled_path, false)
+                        {
+                            Ok(_) => dynamic = true,
+                            Err(e) => dyn_err = Some(e),
+                        }
+                    }
+                    extensions::invalidate_extensions_cache();
+                    let all = extensions::list_extensions(&root, &pinned);
                     HttpResponse::json(
                         "200 OK",
-                        &serde_json::json!({ "ok": true, "installed": all }),
+                        &serde_json::json!({
+                            "ok": true,
+                            "dynamic": dynamic,
+                            "dynamic_error": dyn_err,
+                            "installed": all
+                        }),
                     )
                 }
                 Err(e) => HttpResponse::json(
@@ -7368,9 +7664,34 @@ fn dispatch_http_request(
                 Err(r) => return r,
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            match extensions::remove_extension(shell.roaming.root_dir(), id) {
+            let root = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.roaming.root_dir().to_path_buf()
+            };
+
+            // Unload from Chromium BEFORE deleting files on disk.
+            #[cfg(target_os = "windows")]
+            let (dynamic, dyn_err) = if cef_runtime::is_dynamic_extensions_active() {
+                let enabled_path = extensions::enabled_extensions_dir(&root).join(id);
+                if enabled_path.is_dir() {
+                    match cef_runtime::dynamic_unload_extension_cef(&root, id, &enabled_path, false)
+                    {
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    }
+                } else {
+                    (true, None)
+                }
+            } else {
+                (false, None)
+            };
+            #[cfg(not(target_os = "windows"))]
+            let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
+
+            match extensions::remove_extension(&root, id) {
                 Ok(()) => {
+                    extensions::invalidate_extensions_cache();
+                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                     shell.roaming.profile.pinned_extensions.retain(|p| p != id);
                     let _ = shell.roaming.save_profile();
                     let all = extensions::list_extensions(
@@ -7379,7 +7700,12 @@ fn dispatch_http_request(
                     );
                     HttpResponse::json(
                         "200 OK",
-                        &serde_json::json!({ "ok": true, "installed": all }),
+                        &serde_json::json!({
+                            "ok": true,
+                            "dynamic": dynamic,
+                            "dynamic_error": dyn_err,
+                            "installed": all
+                        }),
                     )
                 }
                 Err(e) => HttpResponse::json(
@@ -8525,20 +8851,23 @@ fn dispatch_http_request(
                 &serde_json::json!({ "error": err, "current_version": env!("CARGO_PKG_VERSION") }),
             ),
         },
+        "/api/updater/progress" => {
+            let snap = crate::updater::get_update_progress();
+            let body = serde_json::to_vec(&snap).unwrap_or_default();
+            HttpResponse::new("200 OK", "application/json; charset=utf-8", body)
+        }
         "/api/updater/run" => {
             if let Err(r) = require_post() {
                 return r;
             }
-            match crate::updater::execute_self_update() {
-                Ok(msg) => HttpResponse::json(
-                    "200 OK",
-                    &serde_json::json!({ "status": "ok", "message": msg }),
-                ),
-                Err(err) => HttpResponse::json(
-                    "200 OK",
-                    &serde_json::json!({ "status": "error", "error": err }),
-                ),
-            }
+            let snap = crate::updater::start_self_update_async();
+            HttpResponse::json(
+                "200 OK",
+                &serde_json::json!({
+                    "status": "started",
+                    "progress": snap
+                }),
+            )
         }
         _ => HttpResponse::text("404 Not Found", "Not Found"),
     }

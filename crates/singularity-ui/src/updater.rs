@@ -52,6 +52,60 @@ pub struct UpdateCheckInfo {
     pub release_url: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateProgressSnapshot {
+    pub phase: String,
+    pub active: bool,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: u8,
+    pub speed_bps: u64,
+    pub latest_version: String,
+    pub message: String,
+    pub error: Option<String>,
+}
+
+impl Default for UpdateProgressSnapshot {
+    fn default() -> Self {
+        Self {
+            phase: "idle".into(),
+            active: false,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            percent: 0,
+            speed_bps: 0,
+            latest_version: String::new(),
+            message: String::new(),
+            error: None,
+        }
+    }
+}
+
+static UPDATE_PROGRESS: std::sync::OnceLock<std::sync::Mutex<UpdateProgressSnapshot>> =
+    std::sync::OnceLock::new();
+
+fn update_progress_lock() -> &'static std::sync::Mutex<UpdateProgressSnapshot> {
+    UPDATE_PROGRESS.get_or_init(|| std::sync::Mutex::new(UpdateProgressSnapshot::default()))
+}
+
+fn update_progress_state<F>(f: F) -> UpdateProgressSnapshot
+where
+    F: FnOnce(&mut UpdateProgressSnapshot),
+{
+    let mut guard = update_progress_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f(&mut guard);
+    guard.clone()
+}
+
+pub fn get_update_progress() -> UpdateProgressSnapshot {
+    update_progress_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Cleans up leftover `.old` executable backups and temporary installer updates, and ensures
 /// `%APPDATA%\.singularity` exists without stripping Windows SmartScreen protections.
 pub fn perform_startup_maintenance() {
@@ -411,33 +465,62 @@ fn download_and_run_verified_setup_installer(target_dir: &Path) -> Result<(), St
         None => fetch_api(None),
     }?;
 
+    let latest_ver = rel
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
     let assets = rel
         .get("assets")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let find_asset_url = |name: &str| -> Option<String> {
+    let find_asset_info = |name: &str| -> Option<(String, u64)> {
         assets.iter().find_map(|a| {
             if a.get("name").and_then(|n| n.as_str()) == Some(name) {
-                a.get("browser_download_url")
+                let url = a
+                    .get("browser_download_url")
                     .and_then(|u| u.as_str())
-                    .filter(|u| u.starts_with("https://"))
-                    .map(|s| s.to_string())
+                    .filter(|u| u.starts_with("https://"))?
+                    .to_string();
+                let sz = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                Some((url, sz))
             } else {
                 None
             }
         })
     };
 
-    let Some(setup_url) = find_asset_url("Singularity-setup.exe") else {
+    let Some((setup_url, setup_api_size)) = find_asset_info("Singularity-setup.exe") else {
         return Err("Release asset 'Singularity-setup.exe' is unavailable for the latest release.".into());
     };
-    let Some(sums_url) = find_asset_url("SHA256SUMS.txt") else {
+    let Some((sums_url, _)) = find_asset_info("SHA256SUMS.txt") else {
         return Err("Release asset 'SHA256SUMS.txt' is unavailable for the latest release.".into());
     };
-    let sig_url = find_asset_url("SHA256SUMS.txt.sig");
+    let sig_url = find_asset_info("SHA256SUMS.txt.sig").map(|(u, _)| u);
 
-    let dl_setup = crate::winhttp_client::winhttp_download_https_to_file(
+    update_progress_state(|st| {
+        st.phase = "downloading".into();
+        st.active = true;
+        st.latest_version = latest_ver.clone();
+        st.downloaded_bytes = 0;
+        st.total_bytes = setup_api_size;
+        st.percent = 0;
+        st.speed_bps = 0;
+        st.error = None;
+        st.message = if latest_ver.is_empty() {
+            "Downloading Singularity update...".into()
+        } else {
+            format!("Downloading Singularity v{}...", latest_ver)
+        };
+    });
+
+    let dl_started = std::time::Instant::now();
+    let mut last_report = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(200))
+        .unwrap_or(dl_started);
+    let dl_setup = crate::winhttp_client::winhttp_download_https_to_file_with_progress(
         &setup_url,
         &setup_tmp,
         &ua,
@@ -445,8 +528,41 @@ fn download_and_run_verified_setup_installer(target_dir: &Path) -> Result<(), St
         10_000,
         240_000,
         350 * 1024 * 1024,
+        |downloaded, http_total| {
+            let total = if http_total > 0 {
+                http_total
+            } else {
+                setup_api_size
+            };
+            let now = std::time::Instant::now();
+            if now.duration_since(last_report) >= std::time::Duration::from_millis(80)
+                || (total > 0 && downloaded >= total)
+            {
+                last_report = now;
+                let elapsed = now.duration_since(dl_started).as_secs_f64().max(0.05);
+                let speed = (downloaded as f64 / elapsed) as u64;
+                let pct = if total > 0 {
+                    ((downloaded.saturating_mul(99)) / total).min(99) as u8
+                } else {
+                    0
+                };
+                update_progress_state(|st| {
+                    st.phase = "downloading".into();
+                    st.downloaded_bytes = downloaded;
+                    st.total_bytes = total;
+                    st.percent = pct;
+                    st.speed_bps = speed;
+                });
+            }
+        },
     );
     let dl_sums = if dl_setup.is_ok() {
+        update_progress_state(|st| {
+            st.phase = "verifying".into();
+            st.percent = 99;
+            st.speed_bps = 0;
+            st.message = "Verifying SHA-256 cryptographic checksum...".into();
+        });
         crate::winhttp_client::winhttp_download_https_to_file(
             &sums_url,
             &sums_file,
@@ -505,6 +621,17 @@ fn download_and_run_verified_setup_installer(target_dir: &Path) -> Result<(), St
         return Err(err);
     }
 
+    update_progress_state(|st| {
+        st.phase = "installing".into();
+        st.percent = 100;
+        if st.total_bytes > 0 {
+            st.downloaded_bytes = st.total_bytes;
+        }
+        st.speed_bps = 0;
+        st.message = "Installing update and relaunching Singularity...".into();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(220));
+
     // Clear `running.lock` and arm `planned_restart.flag` so the upgraded browser restores all
     // open windows silently without triggering a false-positive `unclean_shutdown` crash popup.
     crate::crash_guard::mark_planned_restart(
@@ -538,18 +665,81 @@ pub fn bootstrap_missing_cef_runtime() -> Result<(), String> {
     download_and_run_verified_setup_installer(target_dir)
 }
 
+/// Starts a background non-blocking self-update job so the UI can stream a live download
+/// progress bar via `GET /api/updater/progress`.
+pub fn start_self_update_async() -> UpdateProgressSnapshot {
+    let mut should_spawn = false;
+    let snap = update_progress_state(|st| {
+        if !st.active {
+            *st = UpdateProgressSnapshot {
+                phase: "checking".into(),
+                active: true,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                percent: 0,
+                speed_bps: 0,
+                latest_version: String::new(),
+                message: "Checking GitHub Releases...".into(),
+                error: None,
+            };
+            should_spawn = true;
+        }
+    });
+    if should_spawn {
+        let _ = std::thread::Builder::new()
+            .name("singularity-self-updater".into())
+            .spawn(|| match execute_self_update() {
+                Ok(msg) => {
+                    update_progress_state(|st| {
+                        st.active = false;
+                        if st.phase != "installing" {
+                            st.phase = "up_to_date".into();
+                            st.percent = 100;
+                            st.message = msg;
+                        }
+                    });
+                }
+                Err(err) => {
+                    update_progress_state(|st| {
+                        st.active = false;
+                        st.phase = "error".into();
+                        st.speed_bps = 0;
+                        st.message = err.clone();
+                        st.error = Some(err);
+                    });
+                }
+            });
+    }
+    snap
+}
+
 /// Downloads, verifies SHA-256 integrity (and Ed25519 signature when configured), and atomically
 /// updates the installation directly from public GitHub Release Assets at
 /// `https://github.com/MyMasha/Singularity`.
 pub fn execute_self_update() -> Result<String, String> {
+    update_progress_state(|st| {
+        st.phase = "checking".into();
+        st.active = true;
+        st.error = None;
+    });
     let force = std::env::var("SINGULARITY_FORCE_UPDATE").as_deref() == Ok("1");
     if !force {
         if let Ok(info) = check_for_updates() {
+            update_progress_state(|st| {
+                st.latest_version = info.latest_version.clone();
+            });
             if !info.update_available {
-                return Ok(format!(
+                let msg = format!(
                     "Singularity is already up to date (v{}).",
                     info.current_version
-                ));
+                );
+                update_progress_state(|st| {
+                    st.phase = "up_to_date".into();
+                    st.active = false;
+                    st.percent = 100;
+                    st.message = msg.clone();
+                });
+                return Ok(msg);
             }
         }
     }
