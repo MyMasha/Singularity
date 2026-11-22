@@ -2284,7 +2284,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.6</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.7</div>
         </div>
       </aside>
 
@@ -2445,11 +2445,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             <button type="button" class="btn-gold" style="height:32px;padding:0 16px;" id="btn-ext-install-store" data-i18n="btn_install" onclick="installExtensionFromStoreUI()">Install</button>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
-            <input id="ext-local-input" class="text-field" style="flex:1;min-width:260px;" type="text"
-                   placeholder="Or local path to an unpacked folder (manifest.json) / .crx / .zip file"
+            <input id="ext-local-input" class="text-field" style="flex:1;min-width:240px;" type="text"
+                   placeholder="Or path to manifest.json, unpacked folder, .crx, or .zip"
                    data-i18n-placeholder="ext_local_ph"
                    onkeydown="if(event.key==='Enter') installExtensionFromLocalUI()" />
+            <button type="button" class="btn-subtle" style="height:32px;" id="btn-pick-ext-file" data-i18n="btn_pick_ext_file" onclick="pickLocalExtensionUI('file')">Choose manifest.json / .crx / .zip</button>
+            <button type="button" class="btn-subtle" style="height:32px;" id="btn-pick-ext-folder" data-i18n="btn_pick_ext_folder" onclick="pickLocalExtensionUI('folder')">Choose folder</button>
             <button type="button" class="btn-subtle" style="height:32px;" data-i18n="btn_load_local" onclick="installExtensionFromLocalUI()">Load local</button>
+          </div>
+          <div id="ext-restart-banner" style="display:none;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px;padding:10px 12px;border-radius:10px;border:1px solid rgba(246,196,83,0.42);background:rgba(246,196,83,0.10);">
+            <span style="font-size:12px;color:var(--gold-bright);flex:1;min-width:220px;" data-i18n="ext_restart_banner_text">Extensions updated — restart Singularity to activate them in Chromium (your open tabs and videos will restore automatically).</span>
+            <button type="button" class="btn-gold" style="height:32px;padding:0 14px;white-space:nowrap;" id="btn-ext-restart-now" data-i18n="btn_restart_now" onclick="restartBrowserForExtensions()">Restart Singularity to activate</button>
           </div>
         </div>
 
@@ -2856,8 +2862,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     ext_install_desc: "Collez une URL du Chrome Web Store ou un ID à 32 lettres : Singularity télécharge le paquet .crx officiel, le vérifie et le charge nativement dans Chromium pur",
     ext_store_ph: "URL Chrome Web Store ou ID à 32 lettres (ex: ddkjiahejlhfcafbddmgiahcphecmpfh)",
     btn_install: "Installer",
-    ext_local_ph: "Ou chemin local d'un dossier décompressé (manifest.json) / .crx / .zip",
+    ext_local_ph: "Ou chemin vers manifest.json, un dossier décompressé, .crx ou .zip",
     btn_load_local: "Charger en local",
+    btn_pick_ext_file: "Choisir manifest.json / .crx / .zip",
+    btn_pick_ext_folder: "Choisir un dossier",
+    ext_restart_banner_text: "Extensions modifiées — redémarrez Singularity pour les activer dans Chromium (vos onglets et vidéos seront restaurés automatiquement).",
+    btn_restart_now: "Redémarrer Singularity pour activer",
     ext_installed_title: "Extensions Installées & Épinglées dans la Barre",
     ext_catalog_title: "Installation Rapide — Extensions Chrome Populaires",
     ext_detected_title: "Importer en 1 Clic depuis Chrome / Brave / Edge",
@@ -5867,6 +5877,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   // Native Chromium per-tab synchronization callback
   window.__singularitySyncWeb = function(msg) {
     if (!msg) return;
+    if (msg.picked_local_ext_path && typeof msg.picked_local_ext_path === "string") {
+      const inp = document.getElementById("ext-local-input");
+      if (inp) inp.value = msg.picked_local_ext_path;
+      installExtensionFromLocalUI();
+      return;
+    }
     if (msg.crash_report) {
       openCrashReportModal(msg.crash_report);
     }
@@ -6550,7 +6566,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             const out = await r.json();
             if (out.ok) {
               sendNativeIpc({ cmd: "reload_extensions" });
-              showToast(L(`Extension "${ext.name}" imported and enabled`, `Extension « ${ext.name} » importée et activée`));
+              showExtensionRestartBanner();
+              showToast(L(`Extension "${ext.name}" imported — restart Singularity to activate`, `Extension « ${ext.name} » importée — redémarrez Singularity pour l'activer`));
               await loadExtensionsPanel();
             } else {
               btn.disabled = false;
@@ -6568,6 +6585,38 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     } catch (_) {}
   }
 
+  function showExtensionRestartBanner() {
+    const banner = document.getElementById("ext-restart-banner");
+    if (banner) banner.style.display = "flex";
+  }
+
+  function pickLocalExtensionUI(mode) {
+    const pickMode = mode === "folder" ? "folder" : "file";
+    if (!sendNativeIpc({ cmd: "pick_local_extension_path", mode: pickMode })) {
+      const inp = document.getElementById("ext-local-input");
+      if (inp) inp.focus();
+      showToast(L(
+        "Paste the full path to manifest.json, an unpacked folder, .crx, or .zip",
+        "Collez le chemin complet vers manifest.json, un dossier décompressé, .crx ou .zip"
+      ));
+    }
+  }
+
+  function restartBrowserForExtensions() {
+    const btn = document.getElementById("btn-ext-restart-now");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = L("Restarting...", "Redémarrage...");
+    }
+    if (!sendNativeIpc({ cmd: "restart_browser" })) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = L("Restart Singularity to activate", "Redémarrer Singularity pour activer");
+      }
+      showToast(L("Please close and reopen Singularity to activate extensions", "Fermez puis rouvrez Singularity pour activer les extensions"));
+    }
+  }
+
   async function installExtensionByIdUI(id, label, btn) {
     if (btn) { btn.disabled = true; btn.textContent = L("Downloading...", "Téléchargement..."); }
     showToast(L(`Downloading ${label || id} from Chrome Web Store...`, `Téléchargement de ${label || id} depuis le Chrome Web Store...`));
@@ -6576,7 +6625,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       const d = await res.json();
       if (d.ok) {
         sendNativeIpc({ cmd: "reload_extensions" });
-        showToast(L(`Extension "${d.extension.name}" installed and enabled`, `Extension « ${d.extension.name} » installée et activée`));
+        showExtensionRestartBanner();
+        showToast(L(`Extension "${d.extension.name}" installed — restart Singularity to activate`, `Extension « ${d.extension.name} » installée — redémarrez Singularity pour l'activer`));
         await loadExtensionsPanel();
       } else {
         showToast(d.error || L("Installation failed", "Échec d'installation"));
@@ -6601,13 +6651,23 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   async function installExtensionFromLocalUI() {
     const inp = document.getElementById("ext-local-input");
     const val = (inp.value || "").trim();
-    if (!val) { showToast(L("Enter a local folder or .crx/.zip file path", "Saisissez le chemin d'un dossier ou fichier .crx/.zip")); return; }
+    if (!val) {
+      showToast(L(
+        "Select or paste a manifest.json file, unpacked folder, or .crx/.zip path",
+        "Sélectionnez ou collez un fichier manifest.json, un dossier décompressé ou un .crx/.zip"
+      ));
+      return;
+    }
     const res = await apiPost("/api/extensions/install_local", { path: val });
     const d = await res.json();
     if (d.ok) {
       inp.value = "";
       sendNativeIpc({ cmd: "reload_extensions" });
-      showToast(L(`Extension "${d.extension.name}" loaded`, `Extension « ${d.extension.name} » chargée`));
+      showExtensionRestartBanner();
+      showToast(L(
+        `Extension "${d.extension.name}" loaded — restart Singularity to activate`,
+        `Extension « ${d.extension.name} » chargée — redémarrez Singularity pour l'activer`
+      ));
       await loadExtensionsPanel();
     } else {
       showToast(d.error || L("Local load failed", "Erreur de chargement local"));
@@ -6619,9 +6679,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const d = await res.json();
     if (d.ok) {
       sendNativeIpc({ cmd: "reload_extensions" });
+      showExtensionRestartBanner();
       showToast(enabled
-        ? L("Extension enabled", "Extension activée")
-        : L("Extension disabled (effective on next restart)", "Extension désactivée (effectif au prochain redémarrage)"));
+        ? L("Extension enabled — restart Singularity to activate", "Extension activée — redémarrez Singularity pour l'activer")
+        : L("Extension disabled — restart Singularity to apply", "Extension désactivée — redémarrez Singularity pour appliquer"));
       await loadExtensionsPanel();
     } else {
       showToast(d.error || L("Error", "Erreur"));
@@ -6642,7 +6703,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const d = await res.json();
     if (d.ok) {
       renderExtensionsToolbar(d.installed || []);
-      showToast(L("Extension removed", "Extension supprimée"));
+      showExtensionRestartBanner();
+      showToast(L("Extension removed — restart Singularity to apply", "Extension supprimée — redémarrez Singularity pour appliquer"));
       await loadExtensionsPanel();
     } else {
       showToast(d.error || L("Failed to remove extension", "Erreur de suppression"));

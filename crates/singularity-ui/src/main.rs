@@ -30,6 +30,44 @@ fn main() {
         return;
     }
 
+    // Wait cleanly for previous instance to release CEF profile lock during planned in-app restart
+    #[cfg(target_os = "windows")]
+    {
+        let cli_args: Vec<String> = std::env::args().collect();
+        if let Some(pid_str) = cli_args
+            .windows(2)
+            .find(|w| w[0] == "--wait-pid")
+            .map(|w| w[1].as_str())
+        {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid != 0 && pid != std::process::id() {
+                    #[link(name = "kernel32")]
+                    extern "system" {
+                        fn OpenProcess(
+                            dw_desired_access: u32,
+                            b_inherit_handle: i32,
+                            dw_process_id: u32,
+                        ) -> *mut core::ffi::c_void;
+                        fn WaitForSingleObject(
+                            h_handle: *mut core::ffi::c_void,
+                            dw_milliseconds: u32,
+                        ) -> u32;
+                        fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+                    }
+                    const SYNCHRONIZE: u32 = 0x0010_0000;
+                    unsafe {
+                        let h = OpenProcess(SYNCHRONIZE, 0, pid);
+                        if !h.is_null() {
+                            let _ = WaitForSingleObject(h, 8000);
+                            let _ = CloseHandle(h);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+            }
+        }
+    }
+
     // 1. In-binary maintenance: initialize `%APPDATA%\.singularity` and clean up `.old` backup
     perform_startup_maintenance();
 

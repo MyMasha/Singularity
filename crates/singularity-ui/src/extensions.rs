@@ -246,7 +246,13 @@ pub fn extract_crx_or_zip_to_dir(raw: &[u8], dest_dir: &Path) -> Result<(), Stri
             .flatten()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| !n.eq_ignore_ascii_case("__MACOSX"))
+                        .unwrap_or(true)
+            })
             .collect();
         if subdirs.len() == 1 && subdirs[0].join("manifest.json").is_file() {
             let inner = &subdirs[0];
@@ -1064,6 +1070,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path, total_bytes: &mut u64) -> Result<(
     let entries = std::fs::read_dir(src)
         .map_err(|e| format!("Failed reading directory {}: {}", src.display(), e))?;
     for entry in entries.flatten() {
+        let fname = entry.file_name();
+        if let Some(name_str) = fname.to_str() {
+            if name_str.eq_ignore_ascii_case(".git")
+                || name_str.eq_ignore_ascii_case("__MACOSX")
+            {
+                continue;
+            }
+        }
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -1071,7 +1085,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path, total_bytes: &mut u64) -> Result<(
         if meta.file_type().is_symlink() {
             continue;
         }
-        let target = dst.join(entry.file_name());
+        let target = dst.join(&fname);
         if meta.is_dir() {
             copy_dir_recursive(&path, &target, total_bytes)?;
         } else if meta.is_file() {
@@ -1086,60 +1100,365 @@ fn copy_dir_recursive(src: &Path, dst: &Path, total_bytes: &mut u64) -> Result<(
     Ok(())
 }
 
-/// Installs an extension from a local unpacked folder (containing `manifest.json`) or a `.crx`/`.zip` file.
+fn normalize_local_extension_input(raw: &str) -> String {
+    let mut s = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .to_string();
+    if let Some(rest) = s
+        .strip_prefix("file:///")
+        .or_else(|| s.strip_prefix("FILE:///"))
+    {
+        // Decode basic %XX escapes (e.g., %20 for spaces)
+        let mut decoded = Vec::with_capacity(rest.len());
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(val) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+                    decoded.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+        let mut out = String::from_utf8_lossy(&decoded).into_owned();
+        if cfg!(target_os = "windows") {
+            out = out.replace('/', "\\");
+        } else if !out.starts_with('/') {
+            out.insert(0, '/');
+        }
+        s = out;
+    }
+    s
+}
+
+fn is_shared_user_or_root_dir(dir: &Path) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
+    for env_key in ["USERPROFILE", "HOME", "TEMP", "TMP"] {
+        if let Some(val) = std::env::var_os(env_key) {
+            if PathBuf::from(val) == dir {
+                return true;
+            }
+        }
+    }
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "downloads"
+                | "téléchargements"
+                | "telechargements"
+                | "desktop"
+                | "bureau"
+                | "documents"
+                | "temp"
+                | "tmp"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_manifest_referenced_rel_paths(manifest: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_clean = |raw: &str| {
+        let mut clean = raw
+            .trim()
+            .split(&['?', '#'][..])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('\\', "/");
+        while let Some(stripped) = clean.strip_prefix("./").or_else(|| clean.strip_prefix('/')) {
+            clean = stripped.to_string();
+        }
+        if !clean.is_empty()
+            && !clean.contains("://")
+            && !clean.contains("..")
+            && !clean.contains('*')
+        {
+            out.push(clean);
+        }
+    };
+
+    if let Some(icons) = manifest.get("icons").and_then(|v| v.as_object()) {
+        for v in icons.values() {
+            if let Some(s) = v.as_str() {
+                push_clean(s);
+            }
+        }
+    }
+    for key in ["action", "browser_action", "page_action"] {
+        if let Some(act) = manifest.get(key) {
+            if let Some(p) = act.get("default_popup").and_then(|v| v.as_str()) {
+                push_clean(p);
+            }
+            if let Some(ic) = act.get("default_icon") {
+                if let Some(s) = ic.as_str() {
+                    push_clean(s);
+                } else if let Some(obj) = ic.as_object() {
+                    for v in obj.values() {
+                        if let Some(s) = v.as_str() {
+                            push_clean(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(p) = manifest.get("options_page").and_then(|v| v.as_str()) {
+        push_clean(p);
+    }
+    if let Some(p) = manifest
+        .get("options_ui")
+        .and_then(|o| o.get("page"))
+        .and_then(|v| v.as_str())
+    {
+        push_clean(p);
+    }
+    if let Some(p) = manifest
+        .get("side_panel")
+        .and_then(|sp| sp.get("default_path"))
+        .and_then(|v| v.as_str())
+    {
+        push_clean(p);
+    }
+    if let Some(p) = manifest.get("devtools_page").and_then(|v| v.as_str()) {
+        push_clean(p);
+    }
+    if let Some(overrides) = manifest
+        .get("chrome_url_overrides")
+        .and_then(|v| v.as_object())
+    {
+        for v in overrides.values() {
+            if let Some(s) = v.as_str() {
+                push_clean(s);
+            }
+        }
+    }
+    if let Some(bg) = manifest.get("background") {
+        if let Some(sw) = bg.get("service_worker").and_then(|v| v.as_str()) {
+            push_clean(sw);
+        }
+        if let Some(page) = bg.get("page").and_then(|v| v.as_str()) {
+            push_clean(page);
+        }
+        if let Some(scripts) = bg.get("scripts").and_then(|v| v.as_array()) {
+            for item in scripts {
+                if let Some(s) = item.as_str() {
+                    push_clean(s);
+                }
+            }
+        }
+    }
+    if let Some(cs_arr) = manifest.get("content_scripts").and_then(|v| v.as_array()) {
+        for cs in cs_arr {
+            for field in ["js", "css"] {
+                if let Some(arr) = cs.get(field).and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            push_clean(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(dnr_rules) = manifest
+        .get("declarative_net_request")
+        .and_then(|v| v.get("rule_resources"))
+        .and_then(|v| v.as_array())
+    {
+        for r in dnr_rules {
+            if let Some(p) = r.get("path").and_then(|v| v.as_str()) {
+                push_clean(p);
+            }
+        }
+    }
+    if let Some(war_arr) = manifest
+        .get("web_accessible_resources")
+        .and_then(|v| v.as_array())
+    {
+        for item in war_arr {
+            if let Some(s) = item.as_str() {
+                push_clean(s);
+            } else if let Some(res) = item.get("resources").and_then(|v| v.as_array()) {
+                for r in res {
+                    if let Some(s) = r.as_str() {
+                        push_clean(s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn copy_manifest_and_referenced_files(
+    src_dir: &Path,
+    src_manifest_file: &Path,
+    manifest: &serde_json::Value,
+    dst_dir: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dst_dir)
+        .map_err(|e| format!("Failed creating directory {}: {}", dst_dir.display(), e))?;
+    std::fs::copy(src_manifest_file, dst_dir.join("manifest.json"))
+        .map_err(|e| format!("Failed copying manifest.json: {}", e))?;
+
+    let mut total_bytes = std::fs::metadata(src_manifest_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if src_dir.join("_locales").is_dir() {
+        let _ = copy_dir_recursive(
+            &src_dir.join("_locales"),
+            &dst_dir.join("_locales"),
+            &mut total_bytes,
+        );
+    }
+    for rel in collect_manifest_referenced_rel_paths(manifest) {
+        if let Some(src_file) = resolve_safe_child_path(src_dir, &rel) {
+            if src_file.is_file() {
+                let Ok(meta) = std::fs::symlink_metadata(&src_file) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                total_bytes = total_bytes.saturating_add(meta.len());
+                if total_bytes > MAX_EXTRACTED_BYTES {
+                    return Err("Local extension exceeds 64 MiB limit.".into());
+                }
+                let target = dst_dir.join(&rel);
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::copy(&src_file, &target);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Installs an extension from a direct `manifest.json` (or `.json` manifest) file, a local
+/// unpacked folder (containing `manifest.json`), or a `.crx`/`.zip` archive.
 pub fn install_from_local_path(
     roaming_root: &Path,
     source_path: &str,
     explicit_id: Option<&str>,
     pinned_ids: &[String],
 ) -> Result<ChromeExtensionInfo, String> {
-    let trimmed = source_path.trim().trim_matches('"');
+    let trimmed = normalize_local_extension_input(source_path);
     if trimmed.is_empty() {
         return Err("Local extension path is empty.".into());
     }
-    let src = PathBuf::from(trimmed);
+    let src = PathBuf::from(&trimmed);
     if !src.exists() {
         return Err(format!("Path not found: {}", src.display()));
     }
 
-    if src.is_file() {
-        let raw = std::fs::read(&src).map_err(|e| format!("Failed reading file: {}", e))?;
-        let stem = src
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("local_ext");
-        let id = derive_safe_id(explicit_id.unwrap_or(stem));
-        return install_bytes_under_id(roaming_root, &id, &raw, pinned_ids);
-    }
-
-    // Folder install: accept either folder directly containing manifest.json or Chrome's <ext_id>/<version>/ layout
-    let manifest_dir = if src.join("manifest.json").is_file() {
-        src.clone()
+    let mut from_manifest_file = false;
+    let mut explicit_manifest_file: Option<PathBuf> = None;
+    let folder_src = if src.is_file() {
+        let is_json_file = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+        if is_json_file {
+            from_manifest_file = true;
+            explicit_manifest_file = Some(src.clone());
+            src.parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "Invalid manifest.json path (no parent folder).".to_string())?
+        } else {
+            let raw = std::fs::read(&src).map_err(|e| format!("Failed reading file: {}", e))?;
+            let stem = src
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("local_ext");
+            let id = derive_safe_id(explicit_id.unwrap_or(stem));
+            return install_bytes_under_id(roaming_root, &id, &raw, pinned_ids);
+        }
     } else {
-        pick_latest_version_subdir(&src).ok_or_else(|| {
-            "manifest.json not found inside this Chrome extension directory.".to_string()
-        })?
+        src.clone()
     };
 
+    // Folder install: accept direct manifest.json file, folder containing manifest.json, or Chrome's <ext_id>/<version>/ layout
+    let (manifest_dir, manifest_file) = if let Some(ref mf) = explicit_manifest_file {
+        (folder_src.clone(), mf.clone())
+    } else if folder_src.join("manifest.json").is_file() {
+        (folder_src.clone(), folder_src.join("manifest.json"))
+    } else {
+        let sub = pick_latest_version_subdir(&folder_src).ok_or_else(|| {
+            "manifest.json not found inside this Chrome extension directory.".to_string()
+        })?;
+        let mf = sub.join("manifest.json");
+        (sub, mf)
+    };
+
+    let manifest_raw = std::fs::read_to_string(&manifest_file)
+        .map_err(|e| format!("Failed reading manifest.json: {}", e))?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(manifest_raw.trim_start_matches('\u{feff}'))
+            .map_err(|e| format!("Invalid manifest.json JSON syntax: {}", e))?;
+    if !manifest.is_object() {
+        return Err("Invalid manifest.json: root value must be a JSON object.".into());
+    }
+    let is_standard_manifest_name = manifest_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("manifest.json"))
+        .unwrap_or(false);
+    if !is_standard_manifest_name && manifest.get("manifest_version").is_none() {
+        return Err(
+            "Selected JSON file is not a Chrome extension manifest (missing \"manifest_version\")."
+                .into(),
+        );
+    }
+
+    let manifest_key_id = manifest
+        .get("key")
+        .and_then(|v| v.as_str())
+        .and_then(chromium_id_from_public_key_b64);
+    let manifest_name = manifest
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|raw| resolve_i18n_string(&manifest_dir, raw))
+        .filter(|s| !s.trim().is_empty() && !s.starts_with("__MSG_"));
+
+    let shared_parent = from_manifest_file && is_shared_user_or_root_dir(&manifest_dir);
     let inferred_id = explicit_id
         .map(|s| s.to_string())
+        .or(manifest_key_id)
         .or_else(|| {
             // If path looks like .../Extensions/<32-char-id>/<version>, grab the parent ID
-            if src.join("manifest.json").is_file() {
-                if let Some(parent_name) = src
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                {
-                    if is_chrome_store_id(parent_name) {
-                        return Some(parent_name.to_ascii_lowercase());
+            if let Some(parent_name) = manifest_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+            {
+                if is_chrome_store_id(parent_name) {
+                    return Some(parent_name.to_ascii_lowercase());
+                }
+            }
+            if !shared_parent {
+                if let Some(dir_name) = manifest_dir.file_name().and_then(|n| n.to_str()) {
+                    let lower = dir_name.to_ascii_lowercase();
+                    if !matches!(lower.as_str(), "dist" | "build" | "out" | "src" | "extension") {
+                        return Some(dir_name.to_string());
                     }
                 }
             }
-            src.file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
+            manifest_name.clone()
         })
+        .or(manifest_name)
         .unwrap_or_else(|| "local_ext".to_string());
 
     let id = derive_safe_id(&inferred_id);
@@ -1149,13 +1468,45 @@ pub fn install_from_local_path(
         .map_err(|e| format!("Failed creating extensions directory: {}", e))?;
 
     let final_dir = enabled_root.join(&id);
-    let _ = std::fs::remove_dir_all(&final_dir);
-    let _ = std::fs::remove_dir_all(disabled_root.join(&id));
-
-    let mut copied = 0u64;
-    if let Err(err) = copy_dir_recursive(&manifest_dir, &final_dir, &mut copied) {
+    let same_target = final_dir.exists()
+        && std::fs::canonicalize(&manifest_dir).ok() == std::fs::canonicalize(&final_dir).ok();
+    if !same_target {
         let _ = std::fs::remove_dir_all(&final_dir);
-        return Err(err);
+        let _ = std::fs::remove_dir_all(disabled_root.join(&id));
+
+        if shared_parent {
+            if let Err(err) = copy_manifest_and_referenced_files(
+                &manifest_dir,
+                &manifest_file,
+                &manifest,
+                &final_dir,
+            ) {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                return Err(err);
+            }
+        } else {
+            let mut copied = 0u64;
+            if let Err(err) = copy_dir_recursive(&manifest_dir, &final_dir, &mut copied) {
+                let _ = std::fs::remove_dir_all(&final_dir);
+                if from_manifest_file {
+                    // Fallback if user selected manifest.json inside a huge folder > 64 MiB
+                    if let Err(err2) = copy_manifest_and_referenced_files(
+                        &manifest_dir,
+                        &manifest_file,
+                        &manifest,
+                        &final_dir,
+                    ) {
+                        let _ = std::fs::remove_dir_all(&final_dir);
+                        return Err(err2);
+                    }
+                } else {
+                    return Err(err);
+                }
+            } else if !final_dir.join("manifest.json").is_file() {
+                std::fs::copy(&manifest_file, final_dir.join("manifest.json"))
+                    .map_err(|e| format!("Failed writing manifest.json: {}", e))?;
+            }
+        }
     }
 
     parse_extension_dir(&final_dir, &id, true, pinned_ids)

@@ -788,11 +788,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.6");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.7");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.6"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.6"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1337,7 +1337,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.6"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.7"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1422,7 +1422,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.6"));
+        assert!(txt.contains("v2.0.7"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1456,7 +1456,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.6"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
     }
 
     #[test]
@@ -1531,7 +1531,7 @@ mod tests {
         // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.6"}"#,
+            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.7"}"#,
         )
         .expect("write running.lock");
         let sessions_dir = tmp_dir.join("sessions");
@@ -1597,7 +1597,7 @@ mod tests {
         // even after the new process truncates `cef.log`!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.6"}"#,
+            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.7"}"#,
         )
         .expect("write dead lock");
         std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
@@ -1774,4 +1774,180 @@ mod tests {
         assert!(cef_src.contains("on_loading_state_change"));
         assert!(cef_src.contains("pub fn zoom_step"));
     }
+
+    #[test]
+    fn test_v207_manifest_json_local_extension_loading_and_restart() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity_v207_manifest_ext_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let roaming = tmp_dir.join("roaming");
+        std::fs::create_dir_all(&roaming).expect("mkdir roaming");
+
+        // 1. Direct path to manifest.json inside an unpacked extension folder (with spaces + .git)
+        let ext_src = tmp_dir.join("My Cool Extension");
+        std::fs::create_dir_all(ext_src.join("icons")).expect("mkdir icons");
+        std::fs::create_dir_all(ext_src.join(".git")).expect("mkdir .git");
+        std::fs::write(ext_src.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("write .git/HEAD");
+        std::fs::write(ext_src.join("popup.html"), "<html><body>Hi</body></html>")
+            .expect("write popup");
+        std::fs::write(ext_src.join("icons").join("icon16.png"), b"\x89PNG\r\n\x1a\n")
+            .expect("write icon");
+        let manifest_path = ext_src.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            "\u{feff}{\"manifest_version\":3,\"name\":\"Manifest Direct Ext\",\"version\":\"1.2.3\",\"action\":{\"default_popup\":\"popup.html\"},\"icons\":{\"16\":\"icons/icon16.png\"}}",
+        )
+        .expect("write manifest.json");
+
+        let info = extensions::install_from_local_path(
+            &roaming,
+            &format!("\"{}\"", manifest_path.display()),
+            None,
+            &[],
+        )
+        .expect("install from quoted manifest.json path");
+        assert_eq!(info.name, "Manifest Direct Ext");
+        assert_eq!(info.version, "1.2.3");
+        assert_eq!(info.popup_path.as_deref(), Some("popup.html"));
+        let installed_dir = roaming.join("extensions").join(&info.id);
+        assert!(installed_dir.join("manifest.json").is_file());
+        assert!(installed_dir.join("popup.html").is_file());
+        assert!(installed_dir.join("icons").join("icon16.png").is_file());
+        assert!(
+            !installed_dir.join(".git").exists(),
+            ".git directory must be skipped when copying unpacked extensions"
+        );
+
+        // 2. Re-picking the already-installed manifest.json must NOT self-delete
+        let re_info = extensions::install_from_local_path(
+            &roaming,
+            &installed_dir.join("manifest.json").to_string_lossy(),
+            None,
+            &[],
+        )
+        .expect("re-installing same manifest.json must succeed safely");
+        assert_eq!(re_info.id, info.id);
+        assert!(installed_dir.join("manifest.json").is_file());
+
+        // 3. file:/// URI with %20 encoded spaces loads cleanly
+        let uri = format!(
+            "file:///{}",
+            manifest_path
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .replace('\\', "/")
+                .replace(' ', "%20")
+        );
+        let uri_info = extensions::install_from_local_path(&roaming, &uri, None, &[])
+            .expect("install from file:/// manifest.json URI");
+        assert_eq!(uri_info.name, "Manifest Direct Ext");
+
+        // 4. Standalone renamed manifest inside Downloads copies ONLY manifest + referenced files
+        let downloads_dir = tmp_dir.join("Downloads");
+        std::fs::create_dir_all(downloads_dir.join("scripts")).expect("mkdir downloads/scripts");
+        std::fs::write(downloads_dir.join("unrelated_movie.bin"), b"DO_NOT_COPY")
+            .expect("write unrelated file");
+        std::fs::write(downloads_dir.join("scripts").join("inject.js"), b"console.log(1);")
+            .expect("write referenced script");
+        let renamed_manifest = downloads_dir.join("manifest (1).json");
+        std::fs::write(
+            &renamed_manifest,
+            r#"{"manifest_version":3,"name":"Downloads Manifest Only","version":"0.9.0","content_scripts":[{"matches":["<all_urls>"],"js":["./scripts/inject.js"]}]}"#,
+        )
+        .expect("write manifest (1).json");
+
+        let dl_info = extensions::install_from_local_path(
+            &roaming,
+            &renamed_manifest.to_string_lossy(),
+            None,
+            &[],
+        )
+        .expect("install standalone manifest (1).json from Downloads");
+        assert_eq!(dl_info.name, "Downloads Manifest Only");
+        let dl_installed = roaming.join("extensions").join(&dl_info.id);
+        assert!(dl_installed.join("manifest.json").is_file());
+        assert!(dl_installed.join("scripts").join("inject.js").is_file());
+        assert!(
+            !dl_installed.join("unrelated_movie.bin").exists(),
+            "Unrelated files in Downloads must NEVER be copied!"
+        );
+
+        // 5. Invalid JSON and non-manifest JSON files are rejected with clear errors
+        let bad_manifest = tmp_dir.join("bad_ext").join("manifest.json");
+        std::fs::create_dir_all(bad_manifest.parent().unwrap()).expect("mkdir bad_ext");
+        std::fs::write(&bad_manifest, "{ not valid json").expect("write bad json");
+        let err_bad = extensions::install_from_local_path(
+            &roaming,
+            &bad_manifest.to_string_lossy(),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err_bad.contains("Invalid manifest.json JSON syntax"));
+
+        let pkg_json = tmp_dir.join("bad_ext").join("package.json");
+        std::fs::write(&pkg_json, r#"{"name":"not-an-ext","version":"1.0.0"}"#)
+            .expect("write package.json");
+        let err_pkg = extensions::install_from_local_path(
+            &roaming,
+            &pkg_json.to_string_lossy(),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err_pkg.contains("manifest_version"));
+
+        // 6. .zip archive with __MACOSX + single root folder unwraps cleanly
+        let zip_path = tmp_dir.join("wrapped_ext.zip");
+        {
+            let file = std::fs::File::create(&zip_path).expect("create zip");
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("__MACOSX/._manifest.json", opts).unwrap();
+            std::io::Write::write_all(&mut zw, b"mac-junk").unwrap();
+            zw.start_file("wrapper-dir/manifest.json", opts).unwrap();
+            std::io::Write::write_all(
+                &mut zw,
+                br#"{"manifest_version":3,"name":"Zip Wrapped Ext","version":"2.0.0"}"#,
+            )
+            .unwrap();
+            zw.finish().unwrap();
+        }
+        let zip_info = extensions::install_from_local_path(
+            &roaming,
+            &zip_path.to_string_lossy(),
+            None,
+            &[],
+        )
+        .expect("install wrapped zip with __MACOSX");
+        assert_eq!(zip_info.name, "Zip Wrapped Ext");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.7");
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.7"));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
+        assert!(SINGULARITY_UI_HTML.contains("id=\"btn-ext-restart-now\""));
+        assert!(SINGULARITY_UI_HTML.contains("picked_local_ext_path"));
+        assert!(SINGULARITY_UI_HTML.contains("pick_local_extension_path"));
+        assert!(SINGULARITY_UI_HTML.contains("restart_browser"));
+
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("fn pick_win32_extension_file"));
+        assert!(server_src.contains("fn pick_win32_extension_folder"));
+        assert!(server_src.contains("PickLocalExtensionPath"));
+        assert!(server_src.contains("RestartBrowser"));
+        assert!(server_src.contains("LocalExtensionPicked"));
+
+        let main_src = include_str!("main.rs");
+        assert!(main_src.contains("--wait-pid"));
+    }
 }
+

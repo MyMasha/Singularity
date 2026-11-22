@@ -440,6 +440,10 @@ fn run_windows_frameless_browser(
             malicious: usize,
             synced: usize,
         },
+        LocalExtensionPicked {
+            win_id: WindowId,
+            path: String,
+        },
     }
 
     #[derive(Debug, Deserialize)]
@@ -527,6 +531,11 @@ fn run_windows_frameless_browser(
             tab_id: u64,
         },
         ReloadExtensions,
+        PickLocalExtensionPath {
+            #[serde(default)]
+            mode: String,
+        },
+        RestartBrowser,
         ToggleExtensionPopup {
             ext_id: String,
             #[serde(default)]
@@ -1592,6 +1601,174 @@ fn run_windows_frameless_browser(
                 || belongs(GetFocus())
                 || belongs(GetActiveWindow())
         }
+    }
+
+    /// Opens the native Windows file chooser filtered for `manifest.json`, `.crx`, and `.zip`.
+    /// Runs with a null owner HWND on a worker thread to avoid cross-thread modal input deadlocks.
+    fn pick_win32_extension_file() -> Option<String> {
+        #[repr(C)]
+        struct OpenFileNameW {
+            l_struct_size: u32,
+            hwnd_owner: *mut core::ffi::c_void,
+            h_instance: *mut core::ffi::c_void,
+            lpstr_filter: *const u16,
+            lpstr_custom_filter: *mut u16,
+            n_max_cust_filter: u32,
+            n_filter_index: u32,
+            lpstr_file: *mut u16,
+            n_max_file: u32,
+            lpstr_file_title: *mut u16,
+            n_max_file_title: u32,
+            lpstr_initial_dir: *const u16,
+            lpstr_title: *const u16,
+            flags: u32,
+            n_file_offset: u16,
+            n_file_extension: u16,
+            lpstr_def_ext: *const u16,
+            l_cust_data: isize,
+            lpfn_hook: *const core::ffi::c_void,
+            lp_template_name: *const u16,
+            pv_reserved: *mut core::ffi::c_void,
+            dw_reserved: u32,
+            flags_ex: u32,
+        }
+        #[link(name = "comdlg32")]
+        extern "system" {
+            fn GetOpenFileNameW(lpofn: *mut OpenFileNameW) -> i32;
+        }
+        const OFN_NOCHANGEDIR: u32 = 0x0000_0008;
+        const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
+        const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
+        const OFN_EXPLORER: u32 = 0x0008_0000;
+
+        let filter: Vec<u16> =
+            "Chrome Extension (manifest.json, *.crx, *.zip)\0manifest.json;*.json;*.crx;*.zip\0Extension Manifest (manifest.json, *.json)\0manifest.json;*.json\0All Files (*.*)\0*.*\0\0"
+                .encode_utf16()
+                .collect();
+        let title: Vec<u16> =
+            "Select Chrome Extension (manifest.json, .crx, or .zip)\0"
+                .encode_utf16()
+                .collect();
+        let mut file_buf = vec![0u16; 4096];
+
+        let mut ofn = OpenFileNameW {
+            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner: std::ptr::null_mut(),
+            h_instance: std::ptr::null_mut(),
+            lpstr_filter: filter.as_ptr(),
+            lpstr_custom_filter: std::ptr::null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: file_buf.as_mut_ptr(),
+            n_max_file: file_buf.len() as u32,
+            lpstr_file_title: std::ptr::null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: std::ptr::null(),
+            lpstr_title: title.as_ptr(),
+            flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: std::ptr::null(),
+            l_cust_data: 0,
+            lpfn_hook: std::ptr::null(),
+            lp_template_name: std::ptr::null(),
+            pv_reserved: std::ptr::null_mut(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+
+        let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+        if ok == 0 {
+            return None;
+        }
+        let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        if len == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&file_buf[..len]))
+    }
+
+    /// Opens the native Windows folder chooser for an unpacked Chrome extension directory.
+    fn pick_win32_extension_folder() -> Option<String> {
+        #[repr(C)]
+        struct BrowseInfoW {
+            hwnd_owner: *mut core::ffi::c_void,
+            pidl_root: *const core::ffi::c_void,
+            psz_display_name: *mut u16,
+            lpsz_title: *const u16,
+            ul_flags: u32,
+            lpfn: *const core::ffi::c_void,
+            lparam: isize,
+            i_image: i32,
+        }
+        #[link(name = "ole32")]
+        extern "system" {
+            fn CoInitializeEx(pv_reserved: *mut core::ffi::c_void, dw_co_init: u32) -> i32;
+            fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+            fn CoUninitialize();
+        }
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SHBrowseForFolderW(lpbi: *mut BrowseInfoW) -> *mut core::ffi::c_void;
+            fn SHGetPathFromIDListW(
+                pidl: *const core::ffi::c_void,
+                psz_path: *mut u16,
+            ) -> i32;
+        }
+        const COINIT_APARTMENTTHREADED: u32 = 0x2;
+        const BIF_RETURNONLYFSDIRS: u32 = 0x0001;
+        const BIF_NEWDIALOGSTYLE: u32 = 0x0040;
+        const BIF_NONEWFOLDERBUTTON: u32 = 0x0200;
+
+        let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED) };
+        let com_inited = hr == 0 || hr == 1;
+
+        let title: Vec<u16> =
+            "Select Unpacked Chrome Extension Folder (containing manifest.json)\0"
+                .encode_utf16()
+                .collect();
+        let mut display_buf = [0u16; 260];
+        let mut bi = BrowseInfoW {
+            hwnd_owner: std::ptr::null_mut(),
+            pidl_root: std::ptr::null(),
+            psz_display_name: display_buf.as_mut_ptr(),
+            lpsz_title: title.as_ptr(),
+            ul_flags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_NONEWFOLDERBUTTON,
+            lpfn: std::ptr::null(),
+            lparam: 0,
+            i_image: 0,
+        };
+
+        let result = unsafe {
+            let pidl = SHBrowseForFolderW(&mut bi);
+            if pidl.is_null() {
+                None
+            } else {
+                let mut path_buf = vec![0u16; 1024];
+                let ok = SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr());
+                CoTaskMemFree(pidl);
+                if ok != 0 {
+                    let len = path_buf
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(path_buf.len());
+                    if len > 0 {
+                        Some(String::from_utf16_lossy(&path_buf[..len]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if com_inited {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+        result
     }
 
     fn is_cursor_clicking_top_bar(window: &Window) -> bool {
@@ -4037,6 +4214,15 @@ fn run_windows_frameless_browser(
                         }
                     }
                 }
+                WinEvent::LocalExtensionPicked { win_id, path } => {
+                    if let Some(st) = windows.get(&win_id) {
+                        bring_win32_window_to_front(st.window.hwnd());
+                        emit_ui_sync(
+                            &st.ui_browser,
+                            &serde_json::json!({ "picked_local_ext_path": path }),
+                        );
+                    }
+                }
                 WinEvent::CefCallback(wid, cb_evt) => match cb_evt {
                     CefCallbackEvent::DestroyChildHwnd { hwnd } => {
                         destroy_cef_child_hwnd(hwnd);
@@ -5428,6 +5614,80 @@ fn run_windows_frameless_browser(
                                         b.reload();
                                     }
                                 }
+                            }
+                            UiIpcCmd::PickLocalExtensionPath { mode } => {
+                                static EXT_PICKER_BUSY: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if EXT_PICKER_BUSY
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::AcqRel,
+                                        std::sync::atomic::Ordering::Acquire,
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let pick_proxy = proxy.clone();
+                                let pick_folder = mode.eq_ignore_ascii_case("folder");
+                                if std::thread::Builder::new()
+                                    .name("singularity-ext-picker".into())
+                                    .spawn(move || {
+                                        let picked = if pick_folder {
+                                            pick_win32_extension_folder()
+                                        } else {
+                                            pick_win32_extension_file()
+                                        };
+                                        EXT_PICKER_BUSY
+                                            .store(false, std::sync::atomic::Ordering::Release);
+                                        if let Some(path) = picked {
+                                            let _ = pick_proxy.send_event(
+                                                WinEvent::LocalExtensionPicked { win_id: wid, path },
+                                            );
+                                        }
+                                    })
+                                    .is_err()
+                                {
+                                    EXT_PICKER_BUSY
+                                        .store(false, std::sync::atomic::Ordering::Release);
+                                }
+                            }
+                            UiIpcCmd::RestartBrowser => {
+                                if smoke_tracker.is_none() {
+                                    flush_live_crash_checkpoint(
+                                        &windows,
+                                        &cfg_clone,
+                                        &shared_shell,
+                                    );
+                                    cef_runtime::flush_cookie_store_cef_sync(
+                                        Duration::from_millis(500),
+                                    );
+                                    if let Ok(shell) = shared_shell.lock() {
+                                        let _ = shell.roaming.save_profile();
+                                        shell.roaming.flush_async_persistence();
+                                    }
+                                    crate::crash_guard::mark_planned_restart(&root_dir);
+                                    if let Ok(exe) = std::env::current_exe() {
+                                        use std::os::windows::process::CommandExt;
+                                        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                                        let _ = Command::new(exe)
+                                            .arg("--wait-pid")
+                                            .arg(std::process::id().to_string())
+                                            .creation_flags(CREATE_NO_WINDOW)
+                                            .spawn();
+                                    }
+                                }
+                                for (_, st) in windows.drain() {
+                                    st.close_cleanly();
+                                }
+                                let _ = cef_runtime::drain_browsers_before_shutdown(
+                                    Duration::from_millis(1200),
+                                );
+                                crate::crash_guard::mark_clean_shutdown(&root_dir);
+                                drop(incognito_ctx.take());
+                                drop(cef_guard.take());
+                                *control_flow = ControlFlow::Exit;
                             }
                             UiIpcCmd::ToggleExtensionPopup {
                                 ext_id,
