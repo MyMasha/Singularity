@@ -505,6 +505,12 @@ fn download_and_run_verified_setup_installer(target_dir: &Path) -> Result<(), St
         return Err(err);
     }
 
+    // Clear `running.lock` and arm `planned_restart.flag` so the upgraded browser restores all
+    // open windows silently without triggering a false-positive `unclean_shutdown` crash popup.
+    crate::crash_guard::mark_planned_restart(
+        &crate::roaming_store::resolve_roaming_singularity_dir(),
+    );
+
     // Launch the verified native Win32 installer silently so it atomically installs/updates
     // `singularity.exe`, `libcef.dll`, and all Pure Chromium CEF runtime files, then relaunches.
     Command::new(&setup_tmp)
@@ -731,6 +737,9 @@ pub fn execute_self_update() -> Result<String, String> {
 
         std::fs::rename(&new_exe, &current_exe)
             .map_err(|e| format!("Failed replacing binary: {}", e))?;
+        crate::crash_guard::mark_planned_restart(
+            &crate::roaming_store::resolve_roaming_singularity_dir(),
+        );
         let _ = Command::new(&current_exe).stdin(Stdio::null()).spawn();
         std::process::exit(0);
     }

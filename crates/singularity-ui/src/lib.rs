@@ -788,11 +788,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.4");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.5");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.4"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.5"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.4"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.5"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1337,7 +1337,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.4"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.5"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1422,7 +1422,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.4"));
+        assert!(txt.contains("v2.0.5"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1456,7 +1456,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.4"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.5"));
     }
 
     #[test]
@@ -1514,5 +1514,122 @@ mod tests {
         assert!(workflow.contains("prepare-cef-win64.py"));
         assert!(workflow.contains("CEF_DOWNLOAD_URL=http://127.0.0.1:1/forbidden-spotify-fallback"));
         assert!(workflow.contains("cef-win64-obs-7871-54cd191a"));
+    }
+
+    #[test]
+    fn test_v205_os_shutdown_update_clean_restart_and_prev_cef_log() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity_v205_restart_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp_dir");
+
+        // 1. Simulate Windows Shutdown (`WM_ENDSESSION`) or in-place update while 2 windows are open:
+        // `mark_planned_restart` clears `running.lock` and arms `planned_restart.flag` so ALL open
+        // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
+        std::fs::write(
+            tmp_dir.join("running.lock"),
+            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.5"}"#,
+        )
+        .expect("write running.lock");
+        let sessions_dir = tmp_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+        let checkpoint_windows = vec![
+            WindowSessionFile {
+                window_id: "win-os-1".into(),
+                pid: 999_996,
+                updated_unix: 2000,
+                active_tab_index: 0,
+                tabs: vec![SavedTabEntry {
+                    title: "Video Window 1".into(),
+                    url: "https://www.youtube.com/watch?v=osshutdown1".into(),
+                    media_time_sec: Some(420),
+                    scroll_y: None,
+                    group_id: None,
+                    favicon_url: None,
+                }],
+                tab_groups: Vec::new(),
+                geometry: WindowGeometry::default(),
+                closed_while_other_live: true,
+            },
+            WindowSessionFile {
+                window_id: "win-os-2".into(),
+                pid: 999_996,
+                updated_unix: 2001,
+                active_tab_index: 0,
+                tabs: vec![SavedTabEntry {
+                    title: "TikTok Window 2".into(),
+                    url: "https://www.tiktok.com/".into(),
+                    media_time_sec: None,
+                    scroll_y: None,
+                    group_id: None,
+                    favicon_url: None,
+                }],
+                tab_groups: Vec::new(),
+                geometry: WindowGeometry::default(),
+                closed_while_other_live: false,
+            },
+        ];
+        std::fs::write(
+            sessions_dir.join("crash_checkpoint.json"),
+            serde_json::to_vec(&checkpoint_windows).expect("ser checkpoint"),
+        )
+        .expect("write checkpoint");
+
+        crash_guard::mark_planned_restart(&tmp_dir);
+        assert!(!crash_guard::has_unclean_crash_sentinel(&tmp_dir));
+        assert!(
+            crash_guard::detect_previous_crash_and_mark_running_with_cef_log(&tmp_dir, "").is_none(),
+            "Planned OS shutdown / update must NEVER produce a false crash report!"
+        );
+
+        let restored = RoamingSingularityStore::open_at(tmp_dir.clone()).expect("open after planned restart");
+        assert_eq!(restored.restored_windows_count, 2);
+        assert_eq!(restored.pending_restore_window_ids.len(), 1);
+        assert!(
+            !crash_guard::consume_planned_restart_flag(&tmp_dir),
+            "planned_restart.flag must be single-use and consumed on startup"
+        );
+
+        // 2. When a REAL crash happens, pre-CEF-init log snapshot preserves the dead session's CEF log
+        // even after the new process truncates `cef.log`!
+        std::fs::write(
+            tmp_dir.join("running.lock"),
+            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.5"}"#,
+        )
+        .expect("write dead lock");
+        std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
+            .expect("overwrite cef.log");
+        let rep = crash_guard::detect_previous_crash_and_mark_running_with_cef_log(
+            &tmp_dir,
+            "[DEAD_PID] FATAL: actual crash reason from previous session",
+        )
+        .expect("real crash detected");
+        assert!(rep.cef_log_tail.contains("DEAD_PID"));
+        assert!(!rep.cef_log_tail.contains("NEW_PID"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 3. Verify source-level invariants for OS shutdown, installer/updater, and CEF drain
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("Event::LoopDestroyed"));
+        assert!(server_src.contains("detect_previous_crash_and_mark_running_with_cef_log"));
+        assert!(server_src.contains("fn close_cleanly("));
+        assert!(server_src.contains("drain_browsers_before_shutdown"));
+        assert!(server_src.contains("mark_planned_restart"));
+
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("on_before_close"));
+        assert!(cef_src.contains("OPEN_CEF_BROWSERS"));
+        assert!(cef_src.contains("drain_browsers_before_shutdown"));
+
+        let updater_src = include_str!("updater.rs");
+        assert!(updater_src.contains("mark_planned_restart"));
+
+        let installer_src = include_str!("../../singularity-installer/src/main.rs");
+        assert!(installer_src.contains("planned_restart.flag"));
+        assert!(installer_src.contains("terminated_live"));
     }
 }

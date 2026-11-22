@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v2.0.4)"
+        description: "Release tag to build and publish assets for (e.g. v2.0.5)"
         required: false
-        default: "v2.0.4"
+        default: "v2.0.5"
       publish:
         description: "Whether to publish assets to GitHub Releases (set false for CI verification dry-runs)"
         type: boolean
@@ -135,7 +135,7 @@ jobs:
           }
           Write-Host "[OK] Silent SFX extraction verified all Pure Chromium CEF runtime files"
 
-          # End-to-end REAL Pure Chromium (CEF) launch, V8 IPC, H.264/AAC/MSE codecs, DOM/rAF & non-black pixel smoke test!
+          # End-to-end REAL Pure Chromium (CEF) launch, V8 IPC, H.264/AAC/MSE codecs, DOM/rAF, pixel & clean-shutdown smoke test!
           $smokeLog = Join-Path $env:RUNNER_TEMP "singularity-cef-smoke.log"
           $smokeCefLog = Join-Path $env:RUNNER_TEMP "singularity-cef-runtime.log"
           $smokeProf = Join-Path $env:RUNNER_TEMP "singularity-cef-profile"
@@ -160,7 +160,15 @@ jobs:
             Write-Error "Real CEF UI launch smoke test FAILED with exit code $($pLaunch.ExitCode)"
             exit 1
           }
-          Write-Host "[OK] Real Windows Pure Chromium (CEF) UI launch, H.264/AAC/MSE codecs, V8 IPC, DOM/rAF & pixel check PASSED!"
+          if (Test-Path (Join-Path $smokeProf "running.lock")) {
+            Write-Error "Clean shutdown check FAILED: running.lock was left behind in $smokeProf!"
+            exit 1
+          }
+          if (Test-Path (Join-Path $smokeProf "crashes\last_crash.json")) {
+            Write-Error "Clean shutdown check FAILED: unexpected crash report written during smoke test!"
+            exit 1
+          }
+          Write-Host "[OK] Real Windows Pure Chromium (CEF) UI launch, H.264/AAC/MSE codecs, V8 IPC, DOM/rAF, pixel & clean-shutdown check PASSED!"
           Remove-Item -Recurse -Force $smokeDir, $smokeProf -ErrorAction SilentlyContinue
           Remove-Item -Force $smokeLog, $smokeCefLog -ErrorAction SilentlyContinue
 
@@ -232,7 +240,7 @@ jobs:
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v2.0.4"
+            TARGET_TAG="v2.0.5"
           fi
           if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes

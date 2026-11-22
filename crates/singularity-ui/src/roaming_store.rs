@@ -733,6 +733,8 @@ impl RoamingSingularityStore {
             //   non-empty dead window session as a single-use `--restore-session <id>` handoff
             //   so EVERY previously open window reopens separately with its own tabs (never merged!).
             let crashed_prev = crate::crash_guard::has_unclean_crash_sentinel(&root_dir);
+            let planned_restart = crate::crash_guard::consume_planned_restart_flag(&root_dir);
+            let restore_all_checkpoint = crashed_prev || planned_restart;
             let mut live_other_windows = 0usize;
             let mut dead_sessions: Vec<(PathBuf, WindowSessionFile)> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
@@ -770,7 +772,7 @@ impl RoamingSingularityStore {
                         all_non_empty.push(sess);
                     }
                 }
-                if crashed_prev || all_non_empty.is_empty() {
+                if restore_all_checkpoint || all_non_empty.is_empty() {
                     for cp_sess in Self::load_crash_checkpoint_at(&root_dir) {
                         if cp_sess.tabs.is_empty() {
                             continue;
@@ -794,13 +796,14 @@ impl RoamingSingularityStore {
                         .max()
                         .or_else(|| all_non_empty.iter().map(|s| s.updated_unix).max())
                         .unwrap_or(0);
-                    // On crash recovery, restore EVERY non-empty window from the last checkpoint.
-                    // On normal restart, restore every window still open at exit (`!closed_while_other_live`)
-                    // OR closed within 20s of the last window (Windows Restart / multi-window exit).
+                    // On crash recovery or planned OS/updater restart, restore EVERY non-empty
+                    // window from the last checkpoint. On normal restart, restore every window
+                    // still open at exit (`!closed_while_other_live`) OR closed within 20s of the
+                    // last window (multi-window exit).
                     let non_empty_dead: Vec<WindowSessionFile> = all_non_empty
                         .into_iter()
                         .filter(|s| {
-                            crashed_prev
+                            restore_all_checkpoint
                                 || !s.closed_while_other_live
                                 || latest_active_unix.saturating_sub(s.updated_unix) <= 20
                         })

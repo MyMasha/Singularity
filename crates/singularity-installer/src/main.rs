@@ -399,7 +399,16 @@ fn perform_installation<F: Fn()>(
 
     #[cfg(target_os = "windows")]
     {
-        win32_ops::terminate_running_singularity(&exe_path);
+        let terminated_live = win32_ops::terminate_running_singularity(&exe_path);
+        if terminated_live {
+            // The installer intentionally closed a running Singularity instance to upgrade it;
+            // remove `running.lock` and set `planned_restart.flag` so the updated browser restores
+            // all open windows cleanly without a false-positive crash dialog.
+            let roam = roaming_singularity_dir();
+            let _ = std::fs::remove_file(roam.join("running.lock"));
+            let _ = std::fs::create_dir_all(&roam);
+            let _ = std::fs::write(roam.join("planned_restart.flag"), b"1");
+        }
         // Allow Windows to release DLL/EXE file locks after subprocess teardown
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -586,11 +595,13 @@ mod win32_ops {
 
     /// Terminates ONLY running `singularity.exe` processes whose full executable path matches
     /// `target_exe`, preventing accidental termination of unrelated programs with the same name.
-    pub fn terminate_running_singularity(target_exe: &Path) {
+    /// Returns `true` if at least one live matching Singularity process was terminated.
+    pub fn terminate_running_singularity(target_exe: &Path) -> bool {
         let expected_path = normalize_win_path(target_exe);
+        let mut terminated_any = false;
         unsafe {
             let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-                return;
+                return false;
             };
             let my_pid = std::process::id();
             let mut entry = PROCESSENTRY32W {
@@ -631,6 +642,7 @@ mod win32_ops {
                                         normalize_win_path(Path::new(&actual)) == expected_path
                                     };
                                 if path_matches {
+                                    terminated_any = true;
                                     let _ = TerminateProcess(proc_h, 0);
                                     let _ = WaitForSingleObject(proc_h, 400);
                                 }
@@ -645,6 +657,7 @@ mod win32_ops {
             }
             let _ = CloseHandle(snap);
         }
+        terminated_any
     }
 
     /// Writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Singularity` via `advapi32.dll`.

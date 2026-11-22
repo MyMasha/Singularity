@@ -643,9 +643,13 @@ fn run_windows_frameless_browser(
 
     struct BrowserWindowState {
         session_id: String,
-        window: Window,
-        ui_browser: CefBrowserHandle,
+        // Drop order matters on Windows: child CEF browsers (`ui_browser`, `tab_browsers`,
+        // `ext_popup`) MUST be closed and released BEFORE the parent `tao::Window` destroys
+        // the top-level HWND, preventing use-after-destroy crashes inside Chromium teardown!
+        ext_popup: Option<(String, WindowId, bool, Window, CefBrowserHandle)>,
         tab_browsers: HashMap<u64, CefBrowserHandle>,
+        ui_browser: CefBrowserHandle,
+        window: Window,
         tab_last_urls: HashMap<u64, String>,
         tab_media_times: HashMap<u64, u64>,
         tab_scroll_ys: HashMap<u64, u32>,
@@ -662,7 +666,6 @@ fn run_windows_frameless_browser(
         ui_ready_received: bool,
         ui_recovery_attempts: u8,
         was_minimized: bool,
-        ext_popup: Option<(String, WindowId, bool, Window, CefBrowserHandle)>,
         last_ext_popup_closed: Option<(String, std::time::Instant)>,
     }
 
@@ -673,6 +676,19 @@ fn run_windows_frameless_browser(
                 drop(pb);
                 drop(pwin);
             }
+        }
+
+        /// Hides the top-level window immediately for instant perceived responsiveness, then
+        /// cleanly closes all child CEF browsers before destroying the parent Win32 HWND.
+        fn close_cleanly(mut self) {
+            self.close_ext_popup();
+            self.window.set_visible(false);
+            for (_, b) in self.tab_browsers.drain() {
+                drop(b);
+            }
+            self.ui_browser.close_force();
+            cef_runtime::pump_cef_message_loop();
+            drop(self);
         }
 
         fn sync_layout(&mut self) {
@@ -2406,6 +2422,14 @@ fn run_windows_frameless_browser(
         ));
     }
 
+    // Capture previous session's `cef.log` tail BEFORE `CefRuntimeGuard::initialize()` opens and
+    // truncates `cef.log`, so any real crash report preserves the dead session's actual error lines!
+    let prev_cef_log_tail = if smoke_opt.is_none() {
+        crate::crash_guard::read_cef_log_tail(&root_dir, 40)
+    } else {
+        String::new()
+    };
+
     let pump_proxy = proxy.clone();
     let relaunch_proxy = proxy.clone();
     let cef_guard_res = CefRuntimeGuard::initialize(
@@ -2444,8 +2468,13 @@ fn run_windows_frameless_browser(
     // Detect any previous crash (panic, Win32 SEH, or stale dead-PID lock) and arm `running.lock`
     // ONLY after acquiring ownership of the single Chromium profile so relaunches never clobber it.
     let mut pending_crash_report: Option<crate::crash_guard::CrashReport> = if smoke_opt.is_none() {
-        crate::crash_guard::detect_previous_crash_and_mark_running(&root_dir)
+        crate::crash_guard::detect_previous_crash_and_mark_running_with_cef_log(
+            &root_dir,
+            &prev_cef_log_tail,
+        )
     } else {
+        // Also arm `running.lock` inside the isolated smoke profile so CI verifies clean removal!
+        let _ = crate::crash_guard::detect_previous_crash_and_mark_running(&cef_profile_dir);
         None
     };
 
@@ -2945,7 +2974,7 @@ fn run_windows_frameless_browser(
                     st.close_ext_popup();
                     let others_alive = !windows.is_empty();
                     persist_window_on_close(&st, others_alive, &cfg_clone, &shared_shell);
-                    drop(st);
+                    st.close_cleanly();
                     if windows.is_empty() {
                         if history_dirty {
                             let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
@@ -2966,6 +2995,9 @@ fn run_windows_frameless_browser(
                         if smoke_tracker.is_none() {
                             crate::crash_guard::mark_clean_shutdown(&root_dir);
                         }
+                        let _ = cef_runtime::drain_browsers_before_shutdown(
+                            Duration::from_millis(1200),
+                        );
                         drop(incognito_ctx.take());
                         drop(cef_guard.take());
                         *control_flow = ControlFlow::Exit;
@@ -3310,10 +3342,20 @@ fn run_windows_frameless_browser(
                             sm.log(&format!("RESULT=FAIL: {}", fail_reasons.join(" | ")));
                             1
                         };
-                        windows.clear();
-                        for _ in 0..6 {
-                            cef_runtime::pump_cef_message_loop();
-                            std::thread::sleep(Duration::from_millis(10));
+                        let drained_wins: Vec<BrowserWindowState> =
+                            windows.drain().map(|(_, st)| st).collect();
+                        for st in drained_wins {
+                            st.close_cleanly();
+                        }
+                        let remaining_browsers = cef_runtime::drain_browsers_before_shutdown(
+                            Duration::from_millis(1200),
+                        );
+                        sm.log(&format!(
+                            "Phase 3 clean shutdown: open_browsers_after_drain={}",
+                            remaining_browsers
+                        ));
+                        if exit_code == 0 {
+                            crate::crash_guard::mark_clean_shutdown(&sm.opts.profile_dir);
                         }
                         drop(incognito_ctx.take());
                         drop(cef_guard.take());
@@ -4297,7 +4339,7 @@ fn run_windows_frameless_browser(
                                         &cfg_clone,
                                         &shared_shell,
                                     );
-                                    drop(st);
+                                    st.close_cleanly();
                                     if windows.is_empty() {
                                         if history_dirty {
                                             let shell = shared_shell
@@ -4329,6 +4371,9 @@ fn run_windows_frameless_browser(
                                         if smoke_tracker.is_none() {
                                             crate::crash_guard::mark_clean_shutdown(&root_dir);
                                         }
+                                        let _ = cef_runtime::drain_browsers_before_shutdown(
+                                            Duration::from_millis(1200),
+                                        );
                                         drop(incognito_ctx.take());
                                         drop(cef_guard.take());
                                         *control_flow = ControlFlow::Exit;
@@ -5193,7 +5238,7 @@ fn run_windows_frameless_browser(
                                                     .roaming
                                                     .delete_window_session_for(&st.session_id);
                                             }
-                                            drop(st);
+                                            st.close_cleanly();
                                         }
                                         if windows.is_empty() {
                                             cef_runtime::flush_cookie_store_cef_sync(
@@ -5202,6 +5247,9 @@ fn run_windows_frameless_browser(
                                             if smoke_tracker.is_none() {
                                                 crate::crash_guard::mark_clean_shutdown(&root_dir);
                                             }
+                                            let _ = cef_runtime::drain_browsers_before_shutdown(
+                                                Duration::from_millis(1200),
+                                            );
                                             drop(incognito_ctx.take());
                                             drop(cef_guard.take());
                                             *control_flow = ControlFlow::Exit;
@@ -5300,6 +5348,42 @@ fn run_windows_frameless_browser(
                     }
                 },
             },
+            Event::LoopDestroyed => {
+                // On Windows Shutdown / Restart / Logoff (`WM_ENDSESSION`), `tao` fires
+                // `Event::LoopDestroyed` and immediately exits without firing `CloseRequested`.
+                // Persist every live window, flush Chromium's cookie store, remove `running.lock`,
+                // and arm `planned_restart.flag` so next boot restores all windows cleanly with
+                // ZERO false-positive Crash Report popups!
+                let had_open_windows = !windows.is_empty();
+                if had_open_windows {
+                    flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
+                    let drained: Vec<BrowserWindowState> =
+                        windows.drain().map(|(_, st)| st).collect();
+                    for mut st in drained {
+                        st.close_ext_popup();
+                        persist_window_on_close(&st, false, &cfg_clone, &shared_shell);
+                        st.close_cleanly();
+                    }
+                    if history_dirty {
+                        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = shell.roaming.save_profile();
+                        history_dirty = false;
+                    }
+                    cef_runtime::flush_cookie_store_cef_sync(Duration::from_millis(500));
+                    {
+                        let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+                        shell.roaming.flush_async_persistence();
+                        shell.roaming.unregister_live_window();
+                    }
+                }
+                if smoke_tracker.is_none() {
+                    if had_open_windows {
+                        crate::crash_guard::mark_planned_restart(&root_dir);
+                    } else {
+                        crate::crash_guard::mark_clean_shutdown(&root_dir);
+                    }
+                }
+            }
             _ => {}
         }
     });

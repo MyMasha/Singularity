@@ -55,6 +55,10 @@ fn running_lock_path(roaming_root: &Path) -> PathBuf {
     roaming_root.join("running.lock")
 }
 
+fn planned_restart_flag_path(roaming_root: &Path) -> PathBuf {
+    roaming_root.join("planned_restart.flag")
+}
+
 impl CrashReport {
     pub fn format_copyable_text(&self) -> String {
         let mut out = String::with_capacity(1024);
@@ -107,6 +111,20 @@ fn save_crash_report_to_disk(roaming_root: &Path, report: &CrashReport) {
 }
 
 fn build_report(roaming_root: &Path, kind: &str, summary: &str, details: &str) -> CrashReport {
+    build_report_with_log(
+        kind,
+        summary,
+        details,
+        read_cef_log_tail(roaming_root, 35),
+    )
+}
+
+fn build_report_with_log(
+    kind: &str,
+    summary: &str,
+    details: &str,
+    cef_log_tail: String,
+) -> CrashReport {
     let ts = unix_now_secs();
     CrashReport {
         id: format!("crash-{}-{}", ts, std::process::id()),
@@ -116,7 +134,7 @@ fn build_report(roaming_root: &Path, kind: &str, summary: &str, details: &str) -
         kind: kind.to_string(),
         summary: summary.to_string(),
         details: details.to_string(),
-        cef_log_tail: read_cef_log_tail(roaming_root, 35),
+        cef_log_tail,
         acknowledged: false,
     }
 }
@@ -208,6 +226,15 @@ fn is_pid_alive(pid: u32) -> bool {
 /// Checks whether the previous Singularity run crashed (either an unacknowledged `last_crash.json`
 /// or a stale `running.lock` from a dead PID) and writes a fresh `running.lock` for this process.
 pub fn detect_previous_crash_and_mark_running(roaming_root: &Path) -> Option<CrashReport> {
+    detect_previous_crash_and_mark_running_with_cef_log(roaming_root, "")
+}
+
+/// Same as `detect_previous_crash_and_mark_running`, but preserves `prev_cef_log_tail` captured
+/// BEFORE `CefRuntimeGuard::initialize()` truncates `cef.log` on startup.
+pub fn detect_previous_crash_and_mark_running_with_cef_log(
+    roaming_root: &Path,
+    prev_cef_log_tail: &str,
+) -> Option<CrashReport> {
     let mut detected: Option<CrashReport> = None;
 
     let last_json = crashes_dir(roaming_root).join("last_crash.json");
@@ -239,7 +266,12 @@ pub fn detect_previous_crash_and_mark_running(roaming_root: &Path) -> Option<Cra
                     prev.started_unix,
                     unix_now_secs()
                 );
-                let mut rep = build_report(roaming_root, "unclean_shutdown", &summary, &details);
+                let log_tail = if !prev_cef_log_tail.trim().is_empty() {
+                    prev_cef_log_tail.to_string()
+                } else {
+                    read_cef_log_tail(roaming_root, 35)
+                };
+                let mut rep = build_report_with_log("unclean_shutdown", &summary, &details, log_tail);
                 rep.acknowledged = true;
                 save_crash_report_to_disk(roaming_root, &rep);
                 detected = Some(rep);
@@ -263,6 +295,28 @@ pub fn detect_previous_crash_and_mark_running(roaming_root: &Path) -> Option<Cra
 /// Removes `running.lock` on normal graceful browser exit so the next launch knows no crash occurred.
 pub fn mark_clean_shutdown(roaming_root: &Path) {
     let _ = std::fs::remove_file(running_lock_path(roaming_root));
+}
+
+/// Marks an intentional shutdown triggered by Windows OS Shutdown/Restart (`WM_ENDSESSION`) or an
+/// in-place Singularity self-update/installer upgrade: clears `running.lock` (preventing false
+/// crash popups) while writing a single-use `planned_restart.flag` so all live windows & timestamps
+/// are restored cleanly from `crash_checkpoint.json` on next launch.
+pub fn mark_planned_restart(roaming_root: &Path) {
+    mark_clean_shutdown(roaming_root);
+    let _ = std::fs::create_dir_all(roaming_root);
+    let _ = std::fs::write(planned_restart_flag_path(roaming_root), b"1");
+}
+
+/// Consumes `planned_restart.flag` once on startup so OS-shutdown / updater restarts restore every
+/// open window from the live checkpoint without surfacing a false Crash Report dialog.
+pub fn consume_planned_restart_flag(roaming_root: &Path) -> bool {
+    let p = planned_restart_flag_path(roaming_root);
+    if p.is_file() {
+        let _ = std::fs::remove_file(&p);
+        true
+    } else {
+        false
+    }
 }
 
 /// Checks whether an unclean previous crash lock exists (read-only, used before session restoration).

@@ -736,6 +736,28 @@ wrap_context_menu_handler! {
     }
 }
 
+static OPEN_CEF_BROWSERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the number of live Chromium CEF browser instances awaiting `on_before_close`.
+pub fn open_cef_browser_count() -> usize {
+    OPEN_CEF_BROWSERS.load(Ordering::Acquire)
+}
+
+/// Pumps CEF's external message loop until all closing child browsers complete `on_before_close`
+/// (up to `timeout`) so `cef::shutdown()` never hits Chromium's open-browser teardown assertion.
+pub fn drain_browsers_before_shutdown(timeout: std::time::Duration) -> usize {
+    let start = std::time::Instant::now();
+    while open_cef_browser_count() > 0 && start.elapsed() < timeout {
+        pump_cef_message_loop();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for _ in 0..3 {
+        pump_cef_message_loop();
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    open_cef_browser_count()
+}
+
 wrap_life_span_handler! {
     struct SingularityLifeSpanHandler {
         cfg: ClientConfig,
@@ -743,6 +765,7 @@ wrap_life_span_handler! {
 
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
+            OPEN_CEF_BROWSERS.fetch_add(1, Ordering::AcqRel);
             let hwnd = browser
                 .and_then(|b| b.host())
                 .map(|h| h.window_handle().0 as isize)
@@ -752,6 +775,21 @@ wrap_life_span_handler! {
                 is_ui: self.cfg.is_ui,
                 hwnd,
             });
+        }
+
+        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+            let mut cur = OPEN_CEF_BROWSERS.load(Ordering::Acquire);
+            while cur > 0 {
+                match OPEN_CEF_BROWSERS.compare_exchange_weak(
+                    cur,
+                    cur - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
         }
 
         fn on_before_popup(
