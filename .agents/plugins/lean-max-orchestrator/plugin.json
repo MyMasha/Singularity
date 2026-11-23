@@ -1,0 +1,13 @@
+{
+  "name": "lean-max-orchestrator",
+  "displayName": "Lean Main / Max Sub-Agents (x20)",
+  "version": "1.0.0",
+  "description": "Garde l'agent principal ultra-léger en tokens (briefs précis, rapports compacts) tout en lançant jusqu'à 20 sous-agents en parallèle qui travaillent à 100% au maximum sans économiser leurs propres tokens.",
+  "logo": "assets/logo.svg",
+  "author": "local",
+  "suggestedPrompts": [
+    "Découpe ce gros problème en sous-tâches indépendantes et lance des sous-agents en parallèle (jusqu'à 20)",
+    "Lance un audit complet multi-angles du projet en parallèle avec des rapports ultra-compacts",
+    "Ajuste la limite de sous-agents ou la taille des rapports dans lean-max-orchestrator"
+  ]
+}

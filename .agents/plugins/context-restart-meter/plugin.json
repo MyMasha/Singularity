@@ -1,0 +1,13 @@
+{
+  "name": "context-restart-meter",
+  "displayName": "Context Restart Meter",
+  "version": "1.0.0",
+  "description": "Mesure en temps réel le remplissage réel du contexte de la conversation et affiche à la fin de chaque message le pourcentage de relance conseillé (50% dans pas longtemps, 80% relancer, 100% relancer absolument).",
+  "logo": "assets/logo.svg",
+  "author": "local",
+  "suggestedPrompts": [
+    "Affiche un diagnostic détaillé du remplissage de cette conversation",
+    "Prépare un résumé de reprise pour relancer une nouvelle conversation propre",
+    "Ajuste les seuils ou la limite de tokens du module Context Restart Meter"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "maxConcurrentSubagents": 20,
+  "maxReportLines": 18,
+  "excludedSubagentTypes": [
+    "browser",
+    "image-generator"
+  ],
+  "contractMarker": "[MAX-DEPTH/LEAN-REPORT]",
+  "enforceOnInvokeSubagent": true
+}

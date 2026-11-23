@@ -1,0 +1,11 @@
+{
+  "context-restart-meter": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node scripts/context-meter.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

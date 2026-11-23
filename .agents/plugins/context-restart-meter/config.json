@@ -1,0 +1,31 @@
+{
+  "defaultMaxTokens": 200000,
+  "baseSystemTokens": 28000,
+  "postCheckpointBaseTokens": 42000,
+  "charsPerToken": 3.8,
+  "minDeltaPctToReinject": 3,
+  "modelBudgets": [
+    { "pattern": "neon", "maxTokens": 480000 },
+    { "pattern": "gemini-4-pro", "maxTokens": 480000 },
+    { "pattern": "gemini-3", "maxTokens": 480000 },
+    { "pattern": "gemini-2\\.5", "maxTokens": 480000 },
+    { "pattern": "carbon", "maxTokens": 250000 },
+    { "pattern": "hydrogen", "maxTokens": 165000 },
+    { "pattern": "claude", "maxTokens": 165000 },
+    { "pattern": "opus", "maxTokens": 165000 },
+    { "pattern": "sonnet", "maxTokens": 165000 },
+    { "pattern": "gpt-5", "maxTokens": 240000 },
+    { "pattern": "gpt-4", "maxTokens": 120000 }
+  ],
+  "thresholds": {
+    "soon": 50,
+    "restart": 80,
+    "critical": 100
+  },
+  "compactionWeight": {
+    "enabled": true,
+    "firstCheckpointFloorPct": 55,
+    "secondCheckpointFloorPct": 80,
+    "extraCheckpointBonusPct": 10
+  }
+}

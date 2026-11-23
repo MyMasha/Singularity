@@ -1,0 +1,16 @@
+{
+  "enforce-subagent-contract": {
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/enforce-subagent-contract.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
