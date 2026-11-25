@@ -2812,9 +2812,9 @@ fn populate_media_audio_video(entries: &mut Vec<SettingEntry>) {
             },
             {
                 key: "media.drm.widevine_cdm_opt_in",
-                title: "Widevine DRM CDM Binary Module (Disabled by Default for Privacy)",
-                description: "Stripped by default; enable only if user explicitly opts into proprietary EME DRM playback.",
-                default: SettingValue::Bool(false),
+                title: "Hybrid DRM Playback (CEF Widevine CDM + Signed PlayReady/VMP Tabs)",
+                description: "Enables Widevine CDM in Chromium CEF and routes VMP-restricted streaming tabs (Netflix, Disney+, Prime Video, Canal+, Apple TV+, Max) to the signed native Windows DRM engine.",
+                default: SettingValue::Bool(true),
                 constraint: ValueConstraint::Unconstrained,
                 switch: Some("enable-widevine-opt-in"),
                 hot_reload: false,

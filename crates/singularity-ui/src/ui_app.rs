@@ -924,6 +924,53 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
   .omnibar-act-btn:hover { color: var(--text-primary); background: rgba(255, 255, 255, 0.07); }
   .omnibar-act-btn.starred { color: var(--gold-bright); }
+  .omnibar-drm-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 5px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    line-height: 1;
+    opacity: 0.72;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: opacity 0.14s ease, color 0.14s ease, background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+  }
+  .omnibar-drm-pill:hover {
+    opacity: 1;
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.24);
+  }
+  .omnibar-drm-pill.active {
+    opacity: 1;
+    background: rgba(16, 185, 129, 0.18);
+    border-color: rgba(16, 185, 129, 0.55);
+    color: #34d399;
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.22);
+  }
+  .omnibar-drm-pill.active::before {
+    content: "";
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #34d399;
+    box-shadow: 0 0 6px rgba(52, 211, 153, 0.85);
+    flex-shrink: 0;
+  }
+  .omnibar-drm-pill.active:hover {
+    background: rgba(16, 185, 129, 0.26);
+    border-color: rgba(52, 211, 153, 0.75);
+    color: #6ee7b7;
+  }
 
   /* Right Utility Controls & Pinned Chrome Extension Icons */
   .toolbar-right { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; max-width: 100%; }
@@ -2120,6 +2167,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <input id="omnibar-input" class="omnibar-input" type="text" spellcheck="false"
                  placeholder="Search or enter website address"
                  data-i18n-placeholder="omnibar_placeholder" />
+          <button type="button" class="omnibar-drm-pill" id="btn-drm-mode" style="display:none" title="DRM Protected Playback Mode (PlayReady / Widevine VMP)">DRM</button>
           <button type="button" class="omnibar-act-btn" id="btn-bookmark-star" title="Bookmark this page (Ctrl+D)" data-i18n-title="nav_bookmark">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
@@ -3164,6 +3212,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (typeof syncRamModeUI === "function") syncRamModeUI();
     if (typeof renderBookmarksStrip === "function") renderBookmarksStrip();
     if (typeof renderTabs === "function") renderTabs(false);
+    if (typeof updateDrmBadge === "function") updateDrmBadge(getActiveTab());
     if (typeof updateOnboardingSummaryText === "function") updateOnboardingSummaryText();
     if (typeof renderTutorialStep === "function" && anyModalOpen()) {
       renderTutorialStep();
@@ -3293,7 +3342,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     { hex: "#ec4899", nameEn: "Pink", nameFr: "Rose" },
     { hex: "#f97316", nameEn: "Orange", nameFr: "Orange" }
   ];
-  let tabs = [{ id: 1, title: "New Tab", url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: Date.now(), unloaded: false, isPrivate: false }];
+  let tabs = [{ id: 1, title: "New Tab", url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: Date.now(), unloaded: false, isPrivate: false, drmEngine: false, drmService: null }];
   let tabGroups = [];
   let closedTabsStack = [];
   let editingGroupId = null;
@@ -3475,6 +3524,71 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const isStarred = !!(tab && tab.url && !isInternalSettingsUrl(tab.url) && currentBookmarks.some(b => b.url === tab.url));
     btn.classList.toggle("starred", isStarred);
     btn.querySelector("polygon").setAttribute("fill", isStarred ? "currentColor" : "none");
+  }
+
+  function isWebHttpUrl(url) {
+    return !!(url && /^https?:\/\//i.test(url) && !isInternalSettingsUrl(url));
+  }
+
+  function updateDrmBadge(tab) {
+    const btn = document.getElementById("btn-drm-mode");
+    if (!btn) return;
+    const t = tab || getActiveTab();
+    if (!t || !isWebHttpUrl(t.url)) {
+      btn.style.display = "none";
+      btn.classList.remove("active");
+      btn.setAttribute("aria-pressed", "false");
+      return;
+    }
+    const active = !!t.drmEngine;
+    btn.style.display = "inline-flex";
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", String(active));
+    btn.textContent = "DRM";
+    if (active) {
+      let svc = (t.drmService && String(t.drmService).trim()) ? String(t.drmService).trim() : "";
+      if (!svc) {
+        try {
+          svc = new URL(t.url).hostname.replace(/^www\./, "");
+        } catch (_) {}
+      }
+      if (!svc) svc = L("Streaming", "Streaming");
+      btn.title = L(
+        "Protected DRM Engine active (PlayReady / Widevine VMP — " + svc + "). Click to switch back to Chromium CEF.",
+        "Moteur DRM protégé actif (PlayReady / Widevine VMP — " + svc + "). Cliquer pour revenir à Chromium CEF."
+      );
+    } else {
+      btn.title = L(
+        "Standard Chromium CEF engine (Widevine L3). Click to enable signed DRM engine for Netflix/Disney+/Prime.",
+        "Moteur Chromium CEF standard (Widevine L3). Cliquer pour activer le moteur DRM signé (Netflix/Disney+/Prime)."
+      );
+    }
+  }
+
+  function toggleActiveTabDrmMode() {
+    const tab = getActiveTab();
+    if (!tab || !isWebHttpUrl(tab.url)) return;
+    const enabling = !tab.drmEngine;
+    if (!sendNativeIpc({ cmd: "toggle_tab_drm", tab_id: activeTabId })) {
+      showToast(L(
+        "DRM Hybrid Engine is only available in the native desktop browser",
+        "Le moteur Hybride DRM est disponible uniquement dans l'application native"
+      ));
+      return;
+    }
+    showToast(
+      enabling
+        ? L(
+            "Enabling Protected DRM Engine (PlayReady / Widevine VMP) for this tab...",
+            "Activation du moteur DRM protégé (PlayReady / Widevine VMP) pour cet onglet..."
+          )
+        : L(
+            "Switching tab back to Chromium CEF engine...",
+            "Retour de l'onglet vers le moteur Chromium CEF..."
+          ),
+      null,
+      3200
+    );
   }
 
   function createBookmarkIconNode(url) {
@@ -3802,7 +3916,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (editingGroupId === groupId) closeGroupEditor();
     if (tabs.length === 0) {
       const nid = nextTabId++;
-      tabs = [{ id: nid, title: L("New Tab", "Nouvel onglet"), url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: Date.now(), unloaded: false }];
+      tabs = [{ id: nid, title: L("New Tab", "Nouvel onglet"), url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: Date.now(), unloaded: false, drmEngine: false, drmService: null }];
       activeTabId = nid;
       syncViewportToActiveTab("view");
       focusSearchForNewTab();
@@ -4890,6 +5004,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     omni.value = tab.url || "";
     renderTabs(true);
     updateBookmarkStarState();
+    updateDrmBadge(tab);
     updateNavArrowsState(tab.canGoBack, tab.canGoForward);
     persistOpenTabsIfEnabled(false);
 
@@ -4933,6 +5048,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         if (checkedUrl && targetTab.url !== checkedUrl) {
           targetTab.url = checkedUrl;
           if (omni && document.activeElement !== omni) omni.value = checkedUrl;
+          if (targetTab.id === activeTabId) updateDrmBadge(targetTab);
         }
         const modalNow = anyModalOpen();
         settingsPageEl.classList.remove("open");
@@ -5048,7 +5164,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       openerTabId: openerId,
       lastActiveAt: Date.now(),
       unloaded: true,
-      isPrivate: !!privateMode
+      isPrivate: !!privateMode,
+      drmEngine: false,
+      drmService: null
     });
     normalizeTabGroupContiguity();
     renderTabs(false);
@@ -5093,7 +5211,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         faviconUrl: "",
         lastActiveAt: Date.now(),
         unloaded: false,
-        isPrivate: !!privateMode
+        isPrivate: !!privateMode,
+        drmEngine: false,
+        drmService: null
       };
       if (opts && typeof opts.insertIndex === "number") {
         const idx = Math.max(0, Math.min(opts.insertIndex, tabs.length));
@@ -5187,7 +5307,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       faviconUrl: item.faviconUrl || "",
       lastActiveAt: Date.now(),
       unloaded: false,
-      isPrivate: !!privateMode
+      isPrivate: !!privateMode,
+      drmEngine: false,
+      drmService: null
     });
     normalizeTabGroupContiguity();
     activeTabId = id;
@@ -5283,6 +5405,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       tabs[0].faviconUrl = "";
       tabs[0].unloaded = false;
       tabs[0].isPrivate = !!privateMode;
+      tabs[0].drmEngine = false;
+      tabs[0].drmService = null;
       tabs[0].lastActiveAt = Date.now();
       pruneEmptyGroups();
       syncViewportToActiveTab("view");
@@ -5316,6 +5440,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tab.faviconUrl = "";
     tab.unloaded = false;
     tab.isPrivate = !!privateMode;
+    tab.drmEngine = false;
+    tab.drmService = null;
     tab.lastActiveAt = Date.now();
     syncViewportToActiveTab("view");
     focusSearchForNewTab();
@@ -6182,11 +6308,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
               groupId: null,
               faviconUrl: "",
               lastActiveAt: now,
-              unloaded: true
+              unloaded: true,
+              drmEngine: false,
+              drmService: null
             });
           }
           if (tabs.length === 0) {
-            tabs.push({ id: nextTabId++, title: L("New Tab", "Nouvel onglet"), url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: now, unloaded: false });
+            tabs.push({ id: nextTabId++, title: L("New Tab", "Nouvel onglet"), url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: now, unloaded: false, drmEngine: false, drmService: null });
           }
           if (hadOnlyBlank && tabs.length > 0) {
             activeTabId = tabs[0].id;
@@ -6366,7 +6494,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         faviconUrl: (ext.favicon_url && /^https?:\/\//i.test(ext.favicon_url)) ? ext.favicon_url : "",
         lastActiveAt: Date.now(),
         unloaded: false,
-        isPrivate: !!privateMode
+        isPrivate: !!privateMode,
+        drmEngine: !!ext.drm_engine,
+        drmService: (typeof ext.drm_service === "string" && ext.drm_service.trim()) ? ext.drm_service.trim() : null
       });
       normalizeTabGroupContiguity();
       activeTabId = id;
@@ -6450,10 +6580,39 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       return;
     }
 
+    if (msg.drm_fallback === true) {
+      showToast(
+        L(
+          "Windows WebView2 DRM Runtime is not installed — using Chromium CEF Widevine instead",
+          "Le runtime WebView2 DRM Windows n'est pas installé — cet onglet utilise Chromium CEF Widevine"
+        ),
+        null,
+        5600
+      );
+    }
+
     const targetTab = typeof msg.tab_id === "number"
       ? tabs.find(t => t.id === msg.tab_id)
       : getActiveTab();
     if (!targetTab) return;
+
+    let drmMetaUpdated = false;
+    if (typeof msg.drm_engine === "boolean") {
+      targetTab.drmEngine = msg.drm_engine;
+      if (!msg.drm_engine && msg.drm_service === undefined) {
+        targetTab.drmService = null;
+      }
+      drmMetaUpdated = true;
+    } else if (msg.drm_fallback === true) {
+      targetTab.drmEngine = false;
+      drmMetaUpdated = true;
+    }
+    if (msg.drm_service !== undefined) {
+      targetTab.drmService = (typeof msg.drm_service === "string" && msg.drm_service.trim())
+        ? msg.drm_service.trim()
+        : null;
+      drmMetaUpdated = true;
+    }
 
     if (typeof msg.can_go_back === "boolean") {
       targetTab.canGoBack = msg.can_go_back;
@@ -6472,6 +6631,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       targetTab.scrollY = 0;
       targetTab.faviconUrl = "";
       targetTab.unloaded = false;
+      targetTab.drmEngine = false;
+      targetTab.drmService = null;
       if (targetTab.id === activeTabId) {
         document.getElementById("settings-modal").classList.remove("open");
         stopVaultTotpTicker();
@@ -6483,6 +6644,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
         renderTabs(true);
         updateBookmarkStarState();
+        updateDrmBadge(targetTab);
         updateNavArrowsState(targetTab.canGoBack, targetTab.canGoForward);
       } else {
         updateSingleTabPill(targetTab);
@@ -6507,6 +6669,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         if (document.activeElement !== omni) omni.value = msg.url;
         renderTabs(true);
         updateBookmarkStarState();
+        updateDrmBadge(targetTab);
         updateNavArrowsState(targetTab.canGoBack, targetTab.canGoForward);
       } else {
         updateSingleTabPill(targetTab);
@@ -6548,7 +6711,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         const omni = document.getElementById("omnibar-input");
         if (document.activeElement !== omni) omni.value = msg.url;
         updateBookmarkStarState();
+        updateDrmBadge(targetTab);
       }
+    } else if (drmMetaUpdated && targetTab.id === activeTabId) {
+      updateDrmBadge(targetTab);
     }
     let mediaChanged = false;
     if (typeof msg.media_time_sec === "number" && msg.media_time_sec >= 2) {
@@ -6580,6 +6746,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       updateSingleTabPill(targetTab);
     }
   };
+  window.__singularitySync = window.__singularitySyncWeb;
 
   function toggleNativeFullscreen() {
     if (hasNativeIpc()) {
@@ -7314,6 +7481,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       settingsTab.url = targetUrl;
       settingsTab.title = targetTitle;
       settingsTab.unloaded = false;
+      settingsTab.drmEngine = false;
+      settingsTab.drmService = null;
       activeTabId = settingsTab.id;
     } else {
       const cur = getActiveTab();
@@ -7321,6 +7490,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         cur.url = targetUrl;
         cur.title = targetTitle;
         cur.unloaded = false;
+        cur.drmEngine = false;
+        cur.drmService = null;
         activeTabId = cur.id;
       } else {
         if (cur) cur.lastActiveAt = Date.now();
@@ -7335,7 +7506,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           faviconUrl: "",
           lastActiveAt: Date.now(),
           unloaded: false,
-          isPrivate: !!privateMode
+          isPrivate: !!privateMode,
+          drmEngine: false,
+          drmService: null
         });
         activeTabId = id;
       }
@@ -8755,7 +8928,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             lastActiveAt: now,
             unloaded: hadUserTabs ? true : (idx !== savedActiveIdx),
             startPaused: !isDetachedHandoff,
-            isPrivate: false
+            isPrivate: false,
+            drmEngine: false,
+            drmService: null
           }));
           if (hadUserTabs) {
             tabs = tabs.concat(restoredTabs);
@@ -9342,6 +9517,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     onClick("btn-new-tab", () => createNewTab());
 
     onEnter("omnibar-input", (el) => navigateInput(el.value));
+    onClick("btn-drm-mode", () => toggleActiveTabDrmMode());
     onClick("btn-bookmark-star", () => toggleActiveBookmark());
     onClick("btn-reload-page", () => reloadActivePage());
 
@@ -9444,6 +9620,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   renderThemeGalleries();
   renderTabs(false);
+  updateDrmBadge(getActiveTab());
   initBlackHoleRenderer();
   refreshHeaderState();
   setInterval(() => {

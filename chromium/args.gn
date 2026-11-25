@@ -101,11 +101,11 @@ ozone_platform = "wayland"
 ozone_platform_wayland = true
 ozone_platform_x11 = true
 
-# 7. STRIP UNUSED BLOAT (WIDEVINE DRM OFF BY DEFAULT, NO PDF/PRINTING/VR/XR)
-enable_widevine = false
+# 7. STRIP UNUSED BLOAT (WIDEVINE CDM ENABLED FOR DRM STREAMING, NO PDF/PRINTING/VR/XR)
+enable_widevine = true
 bundle_widevine_cdm = false
-enable_cdm_host_verification = false
-enable_cdm_storage_id = false
+enable_cdm_host_verification = true
+enable_cdm_storage_id = true
 enable_pdf = false
 enable_print_preview = false
 enable_printing = false

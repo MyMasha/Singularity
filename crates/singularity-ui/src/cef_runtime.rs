@@ -474,7 +474,7 @@ fn is_local_or_ambiguous_host(host: &str) -> bool {
 
 /// Fail-closed guard preventing untrusted web content from reaching `file://` or the local
 /// Singularity UI/IPC HTTP server on `bind_port` via scheme/encoding/IP obfuscation.
-fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
+pub(crate) fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
     if nav_url.bytes().any(|b| b < 0x20 || b == 0x7F) {
         return true;
     }
@@ -808,6 +808,7 @@ wrap_app! {
         context_initialized: Arc<AtomicBool>,
         on_pump: Option<CefPumpCallback>,
         on_relaunch: Option<CefRelaunchCallback>,
+        enable_widevine_drm: bool,
     }
 
     impl App {
@@ -830,7 +831,6 @@ wrap_app! {
             // - Caps disk cache (64 MiB) & media cache (32 MiB)
             let switches = [
                 "process-per-site",
-                "disable-component-update",
                 "disable-sync",
                 "disable-domain-reliability",
                 "disable-breakpad",
@@ -841,6 +841,9 @@ wrap_app! {
             ];
             for sw in switches {
                 cmd.append_switch(Some(&CefString::from(sw)));
+            }
+            if !self.enable_widevine_drm {
+                cmd.append_switch(Some(&CefString::from("disable-component-update")));
             }
 
             let kv_switches = [
@@ -978,12 +981,16 @@ pub fn maybe_run_cef_subprocess() -> Option<i32> {
     // Required in CEF 133+ before calling `execute_process` or `initialize`.
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
 
+    let enable_widevine_drm = std::env::var("SINGULARITY_DISABLE_WIDEVINE")
+        .map(|v| v.trim() != "1")
+        .unwrap_or(true);
     let args = args::Args::new();
     let mut app = SingularityCefApp::new(
         None,
         Arc::new(AtomicBool::new(false)),
         None,
         None,
+        enable_widevine_drm,
     );
     let disable_sandbox = is_unsafe_no_sandbox_opt_out();
     let sandbox_info = ScopedCefSandboxInfo::new(disable_sandbox);
@@ -1012,11 +1019,20 @@ impl CefRuntimeGuard {
         extensions_dir: &Path,
         cef_log_path: Option<&Path>,
         verbose_logging: bool,
+        enable_widevine_drm: bool,
         on_pump: CefPumpCallback,
         on_relaunch: CefRelaunchCallback,
     ) -> Result<Self, String> {
         let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
         let _ = std::fs::create_dir_all(profile_dir);
+
+        let effective_widevine_drm = enable_widevine_drm
+            && std::env::var("SINGULARITY_DISABLE_WIDEVINE")
+                .map(|v| v.trim() != "1")
+                .unwrap_or(true);
+        if effective_widevine_drm {
+            let _ = crate::drm_webview::ensure_cef_widevine_ready(profile_dir);
+        }
 
         // Create private in-process Win32 anonymous pipes BEFORE `cef::initialize` so
         // `on_before_command_line_processing` attaches `--remote-debugging-io-pipes`.
@@ -1029,6 +1045,7 @@ impl CefRuntimeGuard {
             Arc::clone(&context_initialized),
             Some(on_pump),
             Some(on_relaunch),
+            effective_widevine_drm,
         );
 
         let profile_str = profile_dir.to_string_lossy().into_owned();

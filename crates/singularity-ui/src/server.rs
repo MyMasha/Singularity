@@ -682,6 +682,10 @@ fn run_windows_frameless_browser(
         UnloadTab {
             tab_id: u64,
         },
+        ToggleTabDrm {
+            #[serde(default)]
+            tab_id: u64,
+        },
         SyncTabUrl {
             tab_id: u64,
         },
@@ -897,15 +901,132 @@ fn run_windows_frameless_browser(
         window: Window,
     }
 
+    enum TabBrowser {
+        Cef(CefBrowserHandle),
+        Drm(crate::drm_webview::DrmWebViewHandle),
+    }
+
+    impl TabBrowser {
+        fn is_drm(&self) -> bool {
+            matches!(self, Self::Drm(_))
+        }
+
+        fn cache_hwnd(&self, hwnd: isize) {
+            if let Self::Cef(b) = self {
+                b.cache_hwnd(hwnd);
+            }
+        }
+
+        fn set_bounds(&self, x: i32, y: i32, w: u32, h: u32) -> bool {
+            match self {
+                Self::Cef(b) => b.set_bounds(x, y, w, h),
+                Self::Drm(d) => d.set_bounds(x, y, w, h),
+            }
+        }
+
+        fn set_visible(&self, vis: bool) -> bool {
+            match self {
+                Self::Cef(b) => b.set_visible(vis),
+                Self::Drm(d) => d.set_visible(vis),
+            }
+        }
+
+        fn focus(&self) {
+            match self {
+                Self::Cef(b) => b.focus(),
+                Self::Drm(d) => d.focus(),
+            }
+        }
+
+        fn load_url(&self, url: &str) {
+            match self {
+                Self::Cef(b) => b.load_url(url),
+                Self::Drm(d) => d.load_url(url),
+            }
+        }
+
+        fn url(&self) -> Option<String> {
+            match self {
+                Self::Cef(b) => b.url(),
+                Self::Drm(d) => d.url(),
+            }
+        }
+
+        fn evaluate_script(&self, js: &str) {
+            match self {
+                Self::Cef(b) => b.evaluate_script(js),
+                Self::Drm(d) => d.evaluate_script(js),
+            }
+        }
+
+        fn reload(&self) {
+            match self {
+                Self::Cef(b) => b.reload(),
+                Self::Drm(d) => d.reload(),
+            }
+        }
+
+        fn can_go_back(&self) -> bool {
+            match self {
+                Self::Cef(b) => b.can_go_back(),
+                Self::Drm(d) => d.can_go_back(),
+            }
+        }
+
+        fn can_go_forward(&self) -> bool {
+            match self {
+                Self::Cef(b) => b.can_go_forward(),
+                Self::Drm(d) => d.can_go_forward(),
+            }
+        }
+
+        fn go_back(&self) -> bool {
+            match self {
+                Self::Cef(b) => b.go_back(),
+                Self::Drm(d) => d.go_back(),
+            }
+        }
+
+        fn go_forward(&self) -> bool {
+            match self {
+                Self::Cef(b) => b.go_forward(),
+                Self::Drm(d) => d.go_forward(),
+            }
+        }
+
+        fn zoom_step(&self, delta: f64) -> i32 {
+            match self {
+                Self::Cef(b) => b.zoom_step(delta),
+                Self::Drm(d) => d.zoom_step(delta),
+            }
+        }
+
+        fn zoom_reset(&self) -> i32 {
+            match self {
+                Self::Cef(b) => b.zoom_reset(),
+                Self::Drm(d) => d.zoom_reset(),
+            }
+        }
+
+        fn close_force(&self) {
+            match self {
+                Self::Cef(b) => b.close_force(),
+                Self::Drm(d) => d.close_force(),
+            }
+        }
+    }
+
     struct BrowserWindowState {
         session_id: String,
-        // Drop order matters on Windows: child CEF browsers (`ui_browser`, `tab_browsers`,
+        // Drop order matters on Windows: child browsers (`ui_browser`, `tab_browsers`,
         // `ext_popup`) MUST be closed and released BEFORE the parent `tao::Window` destroys
         // the top-level HWND, preventing use-after-destroy crashes inside Chromium teardown!
         ext_popup: Option<ExtPopupState>,
-        tab_browsers: HashMap<u64, CefBrowserHandle>,
+        tab_browsers: HashMap<u64, TabBrowser>,
         ui_browser: CefBrowserHandle,
         window: Window,
+        tab_drm_pinned: HashSet<u64>,
+        tab_drm_opted_out: HashSet<u64>,
         tab_last_urls: HashMap<u64, String>,
         tab_nav_history: HashMap<u64, TabNavHistory>,
         tab_media_times: HashMap<u64, u64>,
@@ -937,11 +1058,12 @@ fn run_windows_frameless_browser(
         }
 
         /// Hides the top-level window immediately for instant perceived responsiveness, then
-        /// cleanly closes all child CEF browsers before destroying the parent Win32 HWND.
+        /// cleanly closes all child browsers before destroying the parent Win32 HWND.
         fn close_cleanly(mut self) {
             self.close_ext_popup();
             self.window.set_visible(false);
             for (_, b) in self.tab_browsers.drain() {
+                b.close_force();
                 drop(b);
             }
             self.ui_browser.close_force();
@@ -995,7 +1117,7 @@ fn run_windows_frameless_browser(
             fn apply_tab(
                 cache: &mut WebViewLayoutCache,
                 tid: u64,
-                b: &CefBrowserHandle,
+                b: &TabBrowser,
                 vis: bool,
                 rect: Option<(i32, i32, u32, u32)>,
             ) {
@@ -1126,7 +1248,7 @@ fn run_windows_frameless_browser(
         ));
     }
 
-    fn read_live_http_url(b: &CefBrowserHandle) -> Option<String> {
+    fn read_live_http_url(b: &TabBrowser) -> Option<String> {
         let u = b.url()?;
         if u.starts_with("https://") || u.starts_with("http://") {
             Some(u)
@@ -2970,6 +3092,26 @@ fn run_windows_frameless_browser(
         String::new()
     };
 
+    let enable_widevine_drm = {
+        let env_disabled = std::env::var("SINGULARITY_DISABLE_WIDEVINE")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if env_disabled {
+            false
+        } else {
+            shared_shell
+                .lock()
+                .ok()
+                .and_then(|s| {
+                    s.core
+                        .settings
+                        .get("media.drm.widevine_cdm_opt_in")
+                        .and_then(|e| e.current_value.as_bool())
+                })
+                .unwrap_or(true)
+        }
+    };
+
     let pump_proxy = proxy.clone();
     let relaunch_proxy = proxy.clone();
     let cef_guard_res = CefRuntimeGuard::initialize(
@@ -2977,6 +3119,7 @@ fn run_windows_frameless_browser(
         &extensions_dir,
         cef_log_override.as_deref(),
         cef_verbose,
+        enable_widevine_drm,
         Arc::new(move |delay_ms| {
             let _ = pump_proxy.send_event(WinEvent::CefPump(delay_ms));
         }),
@@ -3058,6 +3201,7 @@ fn run_windows_frameless_browser(
     });
 
     let mut incognito_ctx: Option<cef::RequestContext> = None;
+    let mut drm_web_context: Option<crate::drm_webview::DrmWebContext> = None;
 
     #[allow(clippy::too_many_arguments)]
     fn create_browser_window(
@@ -3183,6 +3327,8 @@ fn run_windows_frameless_browser(
             window,
             ui_browser,
             tab_browsers: HashMap::new(),
+            tab_drm_pinned: HashSet::new(),
+            tab_drm_opted_out: HashSet::new(),
             tab_last_urls: HashMap::new(),
             tab_nav_history: HashMap::new(),
             tab_media_times: HashMap::new(),
@@ -3419,15 +3565,32 @@ fn run_windows_frameless_browser(
         flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
     }
 
+    fn should_tab_use_drm(
+        st: &BrowserWindowState,
+        tab_id: u64,
+        url: &str,
+        enable_widevine_drm: bool,
+    ) -> bool {
+        if tab_id == 9999 {
+            return false;
+        }
+        enable_widevine_drm
+            && !st.tab_drm_opted_out.contains(&tab_id)
+            && crate::drm_webview::should_use_drm_engine(url, st.tab_drm_pinned.contains(&tab_id))
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn spawn_content_tab_cef(
+    fn spawn_content_tab(
         win_id: WindowId,
         st: &mut BrowserWindowState,
         tab_id: u64,
         url: &str,
         bind_port: u16,
         is_private: bool,
+        enable_widevine_drm: bool,
+        root_dir: &Path,
         incognito_ctx: &mut Option<cef::RequestContext>,
+        drm_web_context: &mut Option<crate::drm_webview::DrmWebContext>,
         resume_time_sec: Option<u64>,
         resume_scroll_y: Option<u32>,
         start_paused: bool,
@@ -3442,6 +3605,58 @@ fn run_windows_frameless_browser(
             .filter(|&t| t >= 3)
             .map(|t| apply_media_timestamp_to_url(url, t))
             .unwrap_or_else(|| url.to_string());
+
+        let want_drm = should_tab_use_drm(st, tab_id, &effective_url, enable_widevine_drm);
+        let mut drm_fallback = false;
+        if want_drm {
+            let web_ctx = drm_web_context
+                .get_or_insert_with(|| crate::drm_webview::create_drm_web_context(root_dir));
+            let tab_proxy = proxy.clone();
+            let drm_sink: CefEventSink = Arc::new(move |evt| {
+                let _ = tab_proxy.send_event(WinEvent::CefCallback(win_id, evt));
+            });
+            let policy_shell = Arc::clone(shared_shell);
+            let nav_policy: crate::drm_webview::DrmNavigationPolicyFn =
+                Arc::new(move |u: &str| check_navigation_policy(u, &policy_shell).is_ok());
+
+            match crate::drm_webview::DrmWebViewHandle::spawn(
+                &st.window,
+                web_ctx,
+                0,
+                bar_h as i32,
+                phys.width.max(1),
+                phys.height.saturating_sub(bar_h).max(1),
+                &effective_url,
+                tab_id,
+                bind_port,
+                is_private,
+                drm_sink,
+                nav_policy,
+            ) {
+                Ok(handle) => {
+                    st.tab_browsers.insert(tab_id, TabBrowser::Drm(handle));
+                    emit_ui_sync(
+                        &st.ui_browser,
+                        &serde_json::json!({
+                            "tab_id": tab_id,
+                            "drm_engine": true,
+                            "drm_service": crate::drm_webview::drm_service_label(&effective_url)
+                        }),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[singularity-drm] Falling back to Chromium CEF for tab {}: {}",
+                        tab_id, err
+                    );
+                    st.tab_drm_pinned.remove(&tab_id);
+                    st.tab_drm_opted_out.insert(tab_id);
+                    drm_fallback = true;
+                }
+            }
+        }
+
         let resume_script =
             build_resume_init_script(url, resume_time_sec, resume_scroll_y, start_paused);
 
@@ -3477,7 +3692,91 @@ fn run_windows_frameless_browser(
             Arc::clone(shared_shell),
             Arc::clone(download_resolver),
         ) {
-            st.tab_browsers.insert(tab_id, browser_handle);
+            st.tab_browsers.insert(tab_id, TabBrowser::Cef(browser_handle));
+            if tab_id != 9999 {
+                if drm_fallback {
+                    emit_ui_sync(
+                        &st.ui_browser,
+                        &serde_json::json!({
+                            "tab_id": tab_id,
+                            "drm_engine": false,
+                            "drm_fallback": true
+                        }),
+                    );
+                } else {
+                    emit_ui_sync(
+                        &st.ui_browser,
+                        &serde_json::json!({
+                            "tab_id": tab_id,
+                            "drm_engine": false,
+                            "drm_service": serde_json::Value::Null
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_upgrade_tab_to_drm(
+        win_id: WindowId,
+        st: &mut BrowserWindowState,
+        tab_id: u64,
+        url: &str,
+        bind_port: u16,
+        enable_widevine_drm: bool,
+        root_dir: &Path,
+        incognito_ctx: &mut Option<cef::RequestContext>,
+        drm_web_context: &mut Option<crate::drm_webview::DrmWebContext>,
+        proxy: &EventLoopProxy<WinEvent>,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        download_resolver: &CefDownloadResolver,
+    ) {
+        if tab_id == 9999 || !enable_widevine_drm || st.tab_drm_opted_out.contains(&tab_id) {
+            return;
+        }
+        let currently_cef = st
+            .tab_browsers
+            .get(&tab_id)
+            .map(|b| !b.is_drm())
+            .unwrap_or(false);
+        if !currently_cef || !crate::drm_webview::requires_vmp_drm_engine(url) {
+            return;
+        }
+        let Ok(scrubbed_url) = check_navigation_policy(url, shared_shell) else {
+            return;
+        };
+        let is_private = shared_shell
+            .lock()
+            .map(|s| s.private_browsing_active)
+            .unwrap_or(false);
+        if let Some(old) = st.tab_browsers.remove(&tab_id) {
+            drop(old);
+        }
+        st.layout_cache.invalidate_tab(Some(tab_id));
+        spawn_content_tab(
+            win_id,
+            st,
+            tab_id,
+            &scrubbed_url,
+            bind_port,
+            is_private,
+            enable_widevine_drm,
+            root_dir,
+            incognito_ctx,
+            drm_web_context,
+            None,
+            None,
+            false,
+            proxy,
+            shared_shell,
+            download_resolver,
+        );
+        st.sync_layout();
+        if tab_id == st.active_tab_id && st.web_visible && !st.overlay_open {
+            if let Some(b) = st.tab_browsers.get(&tab_id) {
+                b.focus();
+            }
         }
     }
 
@@ -3513,7 +3812,10 @@ fn run_windows_frameless_browser(
         st: &mut BrowserWindowState,
         bind_port: u16,
         is_private: bool,
+        enable_widevine_drm: bool,
+        root_dir: &Path,
         incognito_ctx: &mut Option<cef::RequestContext>,
+        drm_web_context: &mut Option<crate::drm_webview::DrmWebContext>,
         proxy: &EventLoopProxy<WinEvent>,
         shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
         download_resolver: &CefDownloadResolver,
@@ -3575,7 +3877,12 @@ fn run_windows_frameless_browser(
                     }
                 }
                 // Smoothly step back to the New Tab page while preserving forward history!
-                st.tab_browsers.remove(&tid);
+                if let Some(old) = st.tab_browsers.remove(&tid) {
+                    if old.is_drm() {
+                        old.close_force();
+                    }
+                    drop(old);
+                }
                 st.layout_cache.invalidate_tab(Some(tid));
                 st.web_visible = false;
                 st.sync_layout();
@@ -3589,6 +3896,8 @@ fn run_windows_frameless_browser(
                     &serde_json::json!({
                         "tab_id": tid,
                         "nav_to_home": true,
+                        "drm_engine": false,
+                        "drm_service": serde_json::Value::Null,
                         "can_go_back": can_back,
                         "can_go_forward": can_fwd,
                         "ram_active_count": st.tab_browsers.len()
@@ -3618,17 +3927,48 @@ fn run_windows_frameless_browser(
                 }
                 st.web_visible = true;
                 st.tab_last_urls.insert(tid, scrubbed_target.clone());
+                let want_drm =
+                    should_tab_use_drm(st, tid, &scrubbed_target, enable_widevine_drm);
+                let needs_swap = st
+                    .tab_browsers
+                    .get(&tid)
+                    .map(|existing| existing.is_drm() != want_drm)
+                    .unwrap_or(false);
+                if needs_swap {
+                    if let Some(old) = st.tab_browsers.remove(&tid) {
+                        if old.is_drm() {
+                            old.close_force();
+                        }
+                        drop(old);
+                    }
+                    st.layout_cache.invalidate_tab(Some(tid));
+                }
                 if let Some(existing) = st.tab_browsers.get(&tid) {
                     existing.load_url(&scrubbed_target);
+                    emit_ui_sync(
+                        &st.ui_browser,
+                        &serde_json::json!({
+                            "tab_id": tid,
+                            "drm_engine": existing.is_drm(),
+                            "drm_service": if existing.is_drm() {
+                                crate::drm_webview::drm_service_label(&scrubbed_target)
+                            } else {
+                                None
+                            }
+                        }),
+                    );
                 } else {
-                    spawn_content_tab_cef(
+                    spawn_content_tab(
                         win_id,
                         st,
                         tid,
                         &scrubbed_target,
                         bind_port,
                         is_private,
+                        enable_widevine_drm,
+                        root_dir,
                         incognito_ctx,
+                        drm_web_context,
                         None,
                         None,
                         false,
@@ -3638,6 +3978,11 @@ fn run_windows_frameless_browser(
                     );
                 }
                 st.sync_layout();
+                if !st.overlay_open {
+                    if let Some(b) = st.tab_browsers.get(&tid) {
+                        b.focus();
+                    }
+                }
                 emit_ui_sync(
                     &st.ui_browser,
                     &serde_json::json!({
@@ -3666,7 +4011,10 @@ fn run_windows_frameless_browser(
         st: &mut BrowserWindowState,
         bind_port: u16,
         is_private: bool,
+        enable_widevine_drm: bool,
+        root_dir: &Path,
         incognito_ctx: &mut Option<cef::RequestContext>,
+        drm_web_context: &mut Option<crate::drm_webview::DrmWebContext>,
         proxy: &EventLoopProxy<WinEvent>,
         shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
         download_resolver: &CefDownloadResolver,
@@ -3742,17 +4090,48 @@ fn run_windows_frameless_browser(
                 }
                 st.web_visible = true;
                 st.tab_last_urls.insert(tid, scrubbed_target.clone());
+                let want_drm =
+                    should_tab_use_drm(st, tid, &scrubbed_target, enable_widevine_drm);
+                let needs_swap = st
+                    .tab_browsers
+                    .get(&tid)
+                    .map(|existing| existing.is_drm() != want_drm)
+                    .unwrap_or(false);
+                if needs_swap {
+                    if let Some(old) = st.tab_browsers.remove(&tid) {
+                        if old.is_drm() {
+                            old.close_force();
+                        }
+                        drop(old);
+                    }
+                    st.layout_cache.invalidate_tab(Some(tid));
+                }
                 if let Some(existing) = st.tab_browsers.get(&tid) {
                     existing.load_url(&scrubbed_target);
+                    emit_ui_sync(
+                        &st.ui_browser,
+                        &serde_json::json!({
+                            "tab_id": tid,
+                            "drm_engine": existing.is_drm(),
+                            "drm_service": if existing.is_drm() {
+                                crate::drm_webview::drm_service_label(&scrubbed_target)
+                            } else {
+                                None
+                            }
+                        }),
+                    );
                 } else {
-                    spawn_content_tab_cef(
+                    spawn_content_tab(
                         win_id,
                         st,
                         tid,
                         &scrubbed_target,
                         bind_port,
                         is_private,
+                        enable_widevine_drm,
+                        root_dir,
                         incognito_ctx,
+                        drm_web_context,
                         None,
                         None,
                         false,
@@ -3809,7 +4188,10 @@ fn run_windows_frameless_browser(
         cef_private_mode_applied: &mut bool,
         windows: &mut HashMap<WindowId, BrowserWindowState>,
         bind_port: u16,
+        enable_widevine_drm: bool,
+        root_dir: &Path,
         incognito_ctx: &mut Option<cef::RequestContext>,
+        drm_web_context: &mut Option<crate::drm_webview::DrmWebContext>,
         proxy: &EventLoopProxy<WinEvent>,
         shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
         download_resolver: &CefDownloadResolver,
@@ -3837,20 +4219,28 @@ fn run_windows_frameless_browser(
                 let active_sec = st.tab_media_times.get(&st.active_tab_id).copied();
                 let active_sy = st.tab_scroll_ys.get(&st.active_tab_id).copied();
                 let active_tid = st.active_tab_id;
-                st.tab_browsers.clear();
+                for (_, old) in st.tab_browsers.drain() {
+                    if old.is_drm() {
+                        old.close_force();
+                    }
+                    drop(old);
+                }
                 st.layout_cache.invalidate_tab(None);
                 if st.web_visible {
                     if let Some(u) = active_url {
                         match check_navigation_policy(&u, shared_shell) {
                             Ok(scrubbed) => {
-                                spawn_content_tab_cef(
+                                spawn_content_tab(
                                     cur_wid,
                                     st,
                                     active_tid,
                                     &scrubbed,
                                     bind_port,
                                     enabled,
+                                    enable_widevine_drm,
+                                    root_dir,
                                     incognito_ctx,
+                                    drm_web_context,
                                     active_sec,
                                     active_sy,
                                     false,
@@ -3956,7 +4346,10 @@ fn run_windows_frameless_browser(
                                                 st,
                                                 bind_port,
                                                 is_private,
+                                                enable_widevine_drm,
+                                                &root_dir,
                                                 &mut incognito_ctx,
+                                                &mut drm_web_context,
                                                 &proxy,
                                                 &shared_shell,
                                                 &download_resolver,
@@ -3967,7 +4360,10 @@ fn run_windows_frameless_browser(
                                                 st,
                                                 bind_port,
                                                 is_private,
+                                                enable_widevine_drm,
+                                                &root_dir,
                                                 &mut incognito_ctx,
+                                                &mut drm_web_context,
                                                 &proxy,
                                                 &shared_shell,
                                                 &download_resolver,
@@ -4007,7 +4403,10 @@ fn run_windows_frameless_browser(
                                 st,
                                 bind_port,
                                 is_private,
+                                enable_widevine_drm,
+                                &root_dir,
                                 &mut incognito_ctx,
+                                &mut drm_web_context,
                                 &proxy,
                                 &shared_shell,
                                 &download_resolver,
@@ -4018,7 +4417,10 @@ fn run_windows_frameless_browser(
                                 st,
                                 bind_port,
                                 is_private,
+                                enable_widevine_drm,
+                                &root_dir,
                                 &mut incognito_ctx,
+                                &mut drm_web_context,
                                 &proxy,
                                 &shared_shell,
                                 &download_resolver,
@@ -4069,6 +4471,7 @@ fn run_windows_frameless_browser(
                         let _ = cef_runtime::drain_browsers_before_shutdown(
                             Duration::from_millis(1200),
                         );
+                        drop(drm_web_context.take());
                         drop(incognito_ctx.take());
                         drop(cef_guard.take());
                         *control_flow = ControlFlow::Exit;
@@ -4309,7 +4712,10 @@ fn run_windows_frameless_browser(
                         &mut cef_private_mode_applied,
                         &mut windows,
                         bind_port,
+                        enable_widevine_drm,
+                        &root_dir,
                         &mut incognito_ctx,
+                        &mut drm_web_context,
                         &proxy,
                         &shared_shell,
                         &download_resolver,
@@ -4430,14 +4836,17 @@ fn run_windows_frameless_browser(
                         if let Some(st) = windows.get_mut(&wid) {
                             let smoke_tab_url = format!("http://127.0.0.1:{}/api/logo.png", bind_port);
                             sm.log("Phase 2: Spawning real content tab 9999 to verify closing 1 tab keeps parent window alive");
-                            spawn_content_tab_cef(
+                            spawn_content_tab(
                                 wid,
                                 st,
                                 9999,
                                 &smoke_tab_url,
                                 bind_port,
                                 false,
+                                enable_widevine_drm,
+                                &root_dir,
                                 &mut incognito_ctx,
+                                &mut drm_web_context,
                                 None,
                                 None,
                                 false,
@@ -4605,6 +5014,7 @@ fn run_windows_frameless_browser(
                         if exit_code == 0 {
                             crate::crash_guard::mark_clean_shutdown(&sm.opts.profile_dir);
                         }
+                        drop(drm_web_context.take());
                         drop(incognito_ctx.take());
                         drop(cef_guard.take());
                         std::process::exit(exit_code);
@@ -4634,6 +5044,7 @@ fn run_windows_frameless_browser(
                             cef_runtime::pump_cef_message_loop();
                             std::thread::sleep(Duration::from_millis(10));
                         }
+                        drop(drm_web_context.take());
                         drop(incognito_ctx.take());
                         drop(cef_guard.take());
                         std::process::exit(1);
@@ -4908,7 +5319,10 @@ fn run_windows_frameless_browser(
                                         st,
                                         bind_port,
                                         is_private,
+                                        enable_widevine_drm,
+                                        &root_dir,
                                         &mut incognito_ctx,
+                                        &mut drm_web_context,
                                         &proxy,
                                         &shared_shell,
                                         &download_resolver,
@@ -4924,7 +5338,10 @@ fn run_windows_frameless_browser(
                                         st,
                                         bind_port,
                                         is_private,
+                                        enable_widevine_drm,
+                                        &root_dir,
                                         &mut incognito_ctx,
+                                        &mut drm_web_context,
                                         &proxy,
                                         &shared_shell,
                                         &download_resolver,
@@ -4962,13 +5379,36 @@ fn run_windows_frameless_browser(
                                 .entry(tab_id)
                                 .or_insert_with(TabNavHistory::new_with_home)
                                 .record_url(&url);
-                            emit_ui_sync(
-                                &st.ui_browser,
-                                &serde_json::json!({ "tab_id": tab_id, "url": url }),
-                            );
+                            let mut payload = serde_json::json!({ "tab_id": tab_id, "url": url });
+                            if st
+                                .tab_browsers
+                                .get(&tab_id)
+                                .map(|b| b.is_drm())
+                                .unwrap_or(false)
+                            {
+                                if let Some(svc) = crate::drm_webview::drm_service_label(&url) {
+                                    payload["drm_service"] =
+                                        serde_json::Value::String(svc.to_string());
+                                }
+                            }
+                            emit_ui_sync(&st.ui_browser, &payload);
                             if tab_id == st.active_tab_id {
                                 emit_tab_nav_state(st, tab_id);
                             }
+                            maybe_upgrade_tab_to_drm(
+                                wid,
+                                st,
+                                tab_id,
+                                &url,
+                                bind_port,
+                                enable_widevine_drm,
+                                &root_dir,
+                                &mut incognito_ctx,
+                                &mut drm_web_context,
+                                &proxy,
+                                &shared_shell,
+                                &download_resolver,
+                            );
                         }
                     }
                     CefCallbackEvent::AddressChanged { tab_id, url } => {
@@ -4999,14 +5439,38 @@ fn run_windows_frameless_browser(
                                     .entry(tab_id)
                                     .or_insert_with(TabNavHistory::new_with_home)
                                     .record_url(&url);
-                                emit_ui_sync(
-                                    &st.ui_browser,
-                                    &serde_json::json!({ "tab_id": tab_id, "url": url }),
-                                );
+                                let mut payload =
+                                    serde_json::json!({ "tab_id": tab_id, "url": url });
+                                if st
+                                    .tab_browsers
+                                    .get(&tab_id)
+                                    .map(|b| b.is_drm())
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(svc) = crate::drm_webview::drm_service_label(&url) {
+                                        payload["drm_service"] =
+                                            serde_json::Value::String(svc.to_string());
+                                    }
+                                }
+                                emit_ui_sync(&st.ui_browser, &payload);
                                 if tab_id == st.active_tab_id {
                                     emit_tab_nav_state(st, tab_id);
                                 }
                             }
+                            maybe_upgrade_tab_to_drm(
+                                wid,
+                                st,
+                                tab_id,
+                                &url,
+                                bind_port,
+                                enable_widevine_drm,
+                                &root_dir,
+                                &mut incognito_ctx,
+                                &mut drm_web_context,
+                                &proxy,
+                                &shared_shell,
+                                &download_resolver,
+                            );
                         }
                     }
                     CefCallbackEvent::PageFinished {
@@ -5599,6 +6063,7 @@ fn run_windows_frameless_browser(
                                         let _ = cef_runtime::drain_browsers_before_shutdown(
                                             Duration::from_millis(1200),
                                         );
+                                        drop(drm_web_context.take());
                                         drop(incognito_ctx.take());
                                         drop(cef_guard.take());
                                         *control_flow = ControlFlow::Exit;
@@ -5679,17 +6144,52 @@ fn run_windows_frameless_browser(
                                         .or_insert_with(TabNavHistory::new_with_home)
                                         .record_url(&scrubbed_url);
 
+                                    let want_drm = should_tab_use_drm(
+                                        st,
+                                        tid,
+                                        &scrubbed_url,
+                                        enable_widevine_drm,
+                                    );
+                                    let needs_swap = st
+                                        .tab_browsers
+                                        .get(&tid)
+                                        .map(|existing| existing.is_drm() != want_drm)
+                                        .unwrap_or(false);
+                                    if needs_swap {
+                                        if let Some(old) = st.tab_browsers.remove(&tid) {
+                                            if old.is_drm() {
+                                                old.close_force();
+                                            }
+                                            drop(old);
+                                        }
+                                        st.layout_cache.invalidate_tab(Some(tid));
+                                    }
                                     if let Some(existing) = st.tab_browsers.get(&tid) {
                                         existing.load_url(&scrubbed_url);
+                                        emit_ui_sync(
+                                            &st.ui_browser,
+                                            &serde_json::json!({
+                                                "tab_id": tid,
+                                                "drm_engine": existing.is_drm(),
+                                                "drm_service": if existing.is_drm() {
+                                                    crate::drm_webview::drm_service_label(&scrubbed_url)
+                                                } else {
+                                                    None
+                                                }
+                                            }),
+                                        );
                                     } else {
-                                        spawn_content_tab_cef(
+                                        spawn_content_tab(
                                             wid,
                                             st,
                                             tid,
                                             &scrubbed_url,
                                             bind_port,
                                             is_private,
+                                            enable_widevine_drm,
+                                            &root_dir,
                                             &mut incognito_ctx,
+                                            &mut drm_web_context,
                                             None,
                                             None,
                                             false,
@@ -5757,6 +6257,7 @@ fn run_windows_frameless_browser(
 
                                     if st.web_visible {
                                         if let Some(existing) = st.tab_browsers.get(&tab_id) {
+                                            let is_drm = existing.is_drm();
                                             if let Some(live_url) = read_live_http_url(existing) {
                                                 st.tab_last_urls.insert(tab_id, live_url.clone());
                                                 st.tab_nav_history
@@ -5769,6 +6270,32 @@ fn run_windows_frameless_browser(
                                                     &serde_json::json!({
                                                         "tab_id": tab_id,
                                                         "url": live_url,
+                                                        "drm_engine": is_drm,
+                                                        "drm_service": if is_drm {
+                                                            crate::drm_webview::drm_service_label(&live_url)
+                                                        } else {
+                                                            None
+                                                        },
+                                                        "unloaded": false,
+                                                        "ram_active_count": st.tab_browsers.len()
+                                                    }),
+                                                );
+                                            } else {
+                                                let fallback_url = st
+                                                    .tab_last_urls
+                                                    .get(&tab_id)
+                                                    .map(String::as_str)
+                                                    .unwrap_or(url.as_str());
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": tab_id,
+                                                        "drm_engine": is_drm,
+                                                        "drm_service": if is_drm {
+                                                            crate::drm_webview::drm_service_label(fallback_url)
+                                                        } else {
+                                                            None
+                                                        },
                                                         "unloaded": false,
                                                         "ram_active_count": st.tab_browsers.len()
                                                     }),
@@ -5808,14 +6335,17 @@ fn run_windows_frameless_browser(
                                                     if let Some(sy) = target_scroll {
                                                         st.tab_scroll_ys.insert(tab_id, sy);
                                                     }
-                                                    spawn_content_tab_cef(
+                                                    spawn_content_tab(
                                                         wid,
                                                         st,
                                                         tab_id,
                                                         &scrubbed_url,
                                                         bind_port,
                                                         is_private,
+                                                        enable_widevine_drm,
+                                                        &root_dir,
                                                         &mut incognito_ctx,
+                                                        &mut drm_web_context,
                                                         target_sec,
                                                         target_scroll,
                                                         start_paused,
@@ -5880,7 +6410,12 @@ fn run_windows_frameless_browser(
                                             st.apply_fullscreen(true, false);
                                         }
                                     }
-                                    st.tab_browsers.remove(&tab_id);
+                                    if let Some(old) = st.tab_browsers.remove(&tab_id) {
+                                        if old.is_drm() {
+                                            old.close_force();
+                                        }
+                                        drop(old);
+                                    }
                                     st.layout_cache.invalidate_tab(Some(tab_id));
                                     st.tab_last_urls.remove(&tab_id);
                                     st.tab_nav_history.remove(&tab_id);
@@ -5888,6 +6423,8 @@ fn run_windows_frameless_browser(
                                     st.tab_scroll_ys.remove(&tab_id);
                                     st.tab_bg_intents.remove(&tab_id);
                                     st.last_favicon_at.remove(&tab_id);
+                                    st.tab_drm_pinned.remove(&tab_id);
+                                    st.tab_drm_opted_out.remove(&tab_id);
                                     emit_ui_sync(
                                         &st.ui_browser,
                                         &serde_json::json!({ "ram_active_count": st.tab_browsers.len() }),
@@ -5905,7 +6442,10 @@ fn run_windows_frameless_browser(
                                     if let Some(b) = st.tab_browsers.remove(&tab_id) {
                                         let exact_url = read_live_http_url(&b)
                                             .or_else(|| st.tab_last_urls.get(&tab_id).cloned());
-                                        drop(b); // Force-closes CEF browser & reclaims 100% renderer RAM!
+                                        if b.is_drm() {
+                                            b.close_force();
+                                        }
+                                        drop(b); // Force-closes tab browser & reclaims 100% renderer RAM!
                                         st.layout_cache.invalidate_tab(Some(tab_id));
                                         let mut payload = serde_json::json!({
                                             "tab_id": tab_id,
@@ -5921,6 +6461,113 @@ fn run_windows_frameless_browser(
                                         }
                                         emit_ui_sync(&st.ui_browser, &payload);
                                     }
+                                }
+                            }
+                            UiIpcCmd::ToggleTabDrm { tab_id } => {
+                                let is_private = shared_shell
+                                    .lock()
+                                    .map(|s| s.private_browsing_active)
+                                    .unwrap_or(false);
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.close_ext_popup();
+                                    let tid = if tab_id == 0 { st.active_tab_id } else { tab_id };
+                                    if tid == 9999 {
+                                        return;
+                                    }
+                                    let current_url = st
+                                        .tab_browsers
+                                        .get(&tid)
+                                        .and_then(read_live_http_url)
+                                        .or_else(|| st.tab_last_urls.get(&tid).cloned());
+                                    let Some(raw_url) = current_url else {
+                                        return;
+                                    };
+                                    let scrubbed_url =
+                                        match check_navigation_policy(&raw_url, &shared_shell) {
+                                            Ok(u) => u,
+                                            Err(reason) => {
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": tid,
+                                                        "nav_blocked": true,
+                                                        "url": raw_url,
+                                                        "reason": reason
+                                                    }),
+                                                );
+                                                return;
+                                            }
+                                        };
+                                    let is_currently_drm = st
+                                        .tab_browsers
+                                        .get(&tid)
+                                        .map(|b| b.is_drm())
+                                        .unwrap_or(false);
+                                    if is_currently_drm {
+                                        st.tab_drm_pinned.remove(&tid);
+                                        st.tab_drm_opted_out.insert(tid);
+                                    } else {
+                                        st.tab_drm_opted_out.remove(&tid);
+                                        st.tab_drm_pinned.insert(tid);
+                                    }
+                                    if tid == st.active_tab_id && st.html_fullscreen {
+                                        st.html_fullscreen = false;
+                                        if !st.user_f11_fullscreen {
+                                            st.apply_fullscreen(true, false);
+                                        }
+                                    }
+                                    if let Some(old) = st.tab_browsers.remove(&tid) {
+                                        if old.is_drm() {
+                                            old.close_force();
+                                        }
+                                        drop(old);
+                                    }
+                                    st.layout_cache.invalidate_tab(Some(tid));
+                                    st.tab_last_urls.insert(tid, scrubbed_url.clone());
+                                    let resume_sec = st
+                                        .tab_media_times
+                                        .get(&tid)
+                                        .copied()
+                                        .filter(|&t| t >= 3);
+                                    let resume_sy = st
+                                        .tab_scroll_ys
+                                        .get(&tid)
+                                        .copied()
+                                        .filter(|&sy| sy >= 40);
+                                    spawn_content_tab(
+                                        wid,
+                                        st,
+                                        tid,
+                                        &scrubbed_url,
+                                        bind_port,
+                                        is_private,
+                                        enable_widevine_drm,
+                                        &root_dir,
+                                        &mut incognito_ctx,
+                                        &mut drm_web_context,
+                                        resume_sec,
+                                        resume_sy,
+                                        false,
+                                        &proxy,
+                                        &shared_shell,
+                                        &download_resolver,
+                                    );
+                                    st.sync_layout();
+                                    if tid == st.active_tab_id && st.web_visible && !st.overlay_open
+                                    {
+                                        if let Some(b) = st.tab_browsers.get(&tid) {
+                                            b.focus();
+                                        }
+                                    }
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({
+                                            "tab_id": tid,
+                                            "url": scrubbed_url,
+                                            "ram_active_count": st.tab_browsers.len()
+                                        }),
+                                    );
+                                    emit_tab_nav_state(st, tid);
                                 }
                             }
                             UiIpcCmd::SyncTabUrl { tab_id } => {
@@ -6024,6 +6671,7 @@ fn run_windows_frameless_browser(
                                     Duration::from_millis(1200),
                                 );
                                 crate::crash_guard::mark_clean_shutdown(&root_dir);
+                                drop(drm_web_context.take());
                                 drop(incognito_ctx.take());
                                 drop(cef_guard.take());
                                 *control_flow = ControlFlow::Exit;
@@ -6264,7 +6912,10 @@ fn run_windows_frameless_browser(
                                     &mut cef_private_mode_applied,
                                     &mut windows,
                                     bind_port,
+                                    enable_widevine_drm,
+                                    &root_dir,
                                     &mut incognito_ctx,
+                                    &mut drm_web_context,
                                     &proxy,
                                     &shared_shell,
                                     &download_resolver,
@@ -6281,7 +6932,10 @@ fn run_windows_frameless_browser(
                                         st,
                                         bind_port,
                                         is_private,
+                                        enable_widevine_drm,
+                                        &root_dir,
                                         &mut incognito_ctx,
+                                        &mut drm_web_context,
                                         &proxy,
                                         &shared_shell,
                                         &download_resolver,
@@ -6299,7 +6953,10 @@ fn run_windows_frameless_browser(
                                         st,
                                         bind_port,
                                         is_private,
+                                        enable_widevine_drm,
+                                        &root_dir,
                                         &mut incognito_ctx,
+                                        &mut drm_web_context,
                                         &proxy,
                                         &shared_shell,
                                         &download_resolver,
@@ -6375,6 +7032,40 @@ fn run_windows_frameless_browser(
                             UiIpcCmd::ClearBrowsingData { clear_tokens } => {
                                 if clear_tokens {
                                     cef_runtime::clear_all_cookies_cef();
+                                    let mut closed_any_drm = false;
+                                    for st in windows.values_mut() {
+                                        let drm_tids: Vec<u64> = st
+                                            .tab_browsers
+                                            .iter()
+                                            .filter_map(|(&tid, b)| b.is_drm().then_some(tid))
+                                            .collect();
+                                        if !drm_tids.is_empty() {
+                                            closed_any_drm = true;
+                                            for tid in drm_tids {
+                                                if let Some(old) = st.tab_browsers.remove(&tid) {
+                                                    old.close_force();
+                                                    drop(old);
+                                                }
+                                                st.layout_cache.invalidate_tab(Some(tid));
+                                                emit_ui_sync(
+                                                    &st.ui_browser,
+                                                    &serde_json::json!({
+                                                        "tab_id": tid,
+                                                        "unloaded": true,
+                                                        "drm_engine": false,
+                                                        "drm_service": serde_json::Value::Null,
+                                                        "ram_active_count": st.tab_browsers.len()
+                                                    }),
+                                                );
+                                            }
+                                            st.sync_layout();
+                                        }
+                                    }
+                                    drop(drm_web_context.take());
+                                    if closed_any_drm {
+                                        cef_runtime::pump_cef_message_loop();
+                                    }
+                                    crate::drm_webview::clear_drm_webview_storage(&root_dir);
                                     {
                                         let mut shell =
                                             shared_shell.lock().unwrap_or_else(|e| e.into_inner());
@@ -6627,18 +7318,26 @@ fn run_windows_frameless_browser(
                                             let _ = cef_runtime::drain_browsers_before_shutdown(
                                                 Duration::from_millis(1200),
                                             );
+                                            drop(drm_web_context.take());
                                             drop(incognito_ctx.take());
                                             drop(cef_guard.take());
                                             *control_flow = ControlFlow::Exit;
                                         }
                                     } else if let Some(st) = windows.get_mut(&wid) {
-                                        st.tab_browsers.remove(&tab_id);
+                                        if let Some(old) = st.tab_browsers.remove(&tab_id) {
+                                            if old.is_drm() {
+                                                old.close_force();
+                                            }
+                                            drop(old);
+                                        }
                                         st.layout_cache.invalidate_tab(Some(tab_id));
                                         st.tab_last_urls.remove(&tab_id);
                                         st.tab_media_times.remove(&tab_id);
                                         st.tab_scroll_ys.remove(&tab_id);
                                         st.tab_bg_intents.remove(&tab_id);
                                         st.last_favicon_at.remove(&tab_id);
+                                        st.tab_drm_pinned.remove(&tab_id);
+                                        st.tab_drm_opted_out.remove(&tab_id);
                                         emit_ui_sync(
                                             &st.ui_browser,
                                             &serde_json::json!({
@@ -6753,6 +7452,7 @@ fn run_windows_frameless_browser(
                         shell.roaming.unregister_live_window();
                     }
                 }
+                drop(drm_web_context.take());
                 if smoke_tracker.is_none() {
                     if had_open_windows {
                         crate::crash_guard::mark_planned_restart(&root_dir);

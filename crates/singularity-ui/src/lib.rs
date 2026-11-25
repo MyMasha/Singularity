@@ -4,6 +4,7 @@
 pub mod browser_import;
 pub mod crash_guard;
 pub mod cursor;
+pub mod drm_webview;
 pub mod extensions;
 pub mod roaming_store;
 pub mod server;
@@ -1192,10 +1193,11 @@ mod tests {
 
     #[test]
     fn test_v200_pure_chromium_cef_zero_edge_and_ram_optimizations() {
-        // 1. ZERO Microsoft Edge / WebView2 (`wry`) dependencies in Cargo manifest or runtime sources!
+        // 1. Primary browser engine is Pure Chromium CEF; WebView2 (`wry`) is strictly isolated
+        // inside `drm_webview.rs` for on-demand signed VMP/PlayReady DRM tabs only (never in `server.rs`).
         let ui_cargo = include_str!("../Cargo.toml");
         assert!(ui_cargo.contains("cef = "));
-        assert!(!ui_cargo.contains("wry = "));
+        assert!(ui_cargo.contains("wry = "));
 
         let build_rs = include_str!("../build.rs");
         assert!(build_rs.contains("/DELAYLOAD:libcef.dll"));
@@ -1206,6 +1208,17 @@ mod tests {
         assert!(!server_src.contains("WebView2Loader"));
         assert!(!server_src.contains("use wry::"));
         assert!(server_src.contains("CefRuntimeGuard"));
+        assert!(server_src.contains("drm_webview"));
+        assert!(server_src.contains("ToggleTabDrm"));
+
+        // Hybrid DRM invariants: CEF Widevine CDM enabled + args.gn Widevine enabled + UI DRM badge
+        let drm_src = include_str!("drm_webview.rs");
+        assert!(drm_src.contains("requires_vmp_drm_engine"));
+        assert!(drm_src.contains("ensure_cef_widevine_ready"));
+        assert!(drm_src.contains("ContainsFullScreenElementChanged"));
+        assert!(!drm_src.contains("with_ipc_handler"));
+        assert!(SINGULARITY_UI_HTML.contains("btn-drm-mode"));
+        assert!(SINGULARITY_UI_HTML.contains("toggle_tab_drm"));
         assert!(server_src.contains("window_sessions"));
         assert!(server_src.contains("x-singularity-window"));
         assert!(server_src.contains("ensure_win32_clip_children"));
