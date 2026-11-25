@@ -161,8 +161,11 @@ jobs:
       - name: Verify SFX integrity and run real Windows CEF end-to-end smoke tests
         shell: pwsh
         run: |
-          & release-artifacts\Singularity-setup.exe --verify-only
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pVerify = Start-Process -FilePath "release-artifacts\Singularity-setup.exe" -ArgumentList "--verify-only" -Wait -PassThru -NoNewWindow
+          if ($pVerify.ExitCode -ne 0) {
+            Write-Error "Singularity-setup.exe --verify-only failed with exit code $($pVerify.ExitCode)"
+            exit 1
+          }
 
           # Smoke-test real Windows silent SFX extraction of Pure Chromium CEF runtime
           $smokeDir = Join-Path $env:RUNNER_TEMP "singularity-smoke-install"
