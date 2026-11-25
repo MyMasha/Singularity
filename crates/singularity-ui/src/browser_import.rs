@@ -1103,8 +1103,16 @@ fn extract_href_from_anchor_attrs(attrs: &str) -> Option<String> {
     let len = bytes.len();
     let mut i = 0;
     while i < len {
+        let iter_start = i;
         while i < len && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
             i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        if bytes[i] == b'>' {
+            i += 1;
+            continue;
         }
         let name_start = i;
         while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'>' {
@@ -1114,7 +1122,17 @@ fn extract_href_from_anchor_attrs(attrs: &str) -> Option<String> {
         while i < len && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if i >= len || bytes[i] != b'=' {
+        if i >= len {
+            break;
+        }
+        if bytes[i] == b'>' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'=' {
+            if i == iter_start {
+                i += 1;
+            }
             continue;
         }
         i += 1; // skip '='
@@ -1138,12 +1156,13 @@ fn extract_href_from_anchor_attrs(attrs: &str) -> Option<String> {
             while j < len && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
                 j += 1;
             }
-            (vs, j, j)
+            let adv = if j < len && bytes[j] == b'>' { j + 1 } else { j };
+            (vs, j, adv)
         };
         if attr_name.eq_ignore_ascii_case("href") {
             return Some(decode_html_entities(attrs[val_start..val_end].trim()));
         }
-        i = next_i;
+        i = next_i.max(iter_start + 1);
     }
     None
 }
@@ -1163,8 +1182,9 @@ fn strip_html_tags(raw: &str) -> String {
 }
 
 /// Parses standard Netscape Bookmarks HTML files (`bookmarks.html`) exported by Chrome, Edge,
-/// Brave, Opera, Vivaldi, Firefox, Safari, Arc, etc., safely in pure Rust.
+/// Brave, Opera, Vivaldi, Firefox, Safari, Arc, etc., safely in pure Rust in strictly linear `O(N)` time.
 pub fn parse_netscape_bookmarks_html(html: &str) -> Vec<ImportedBookmark> {
+    const MAX_ANCHOR_INNER_BYTES: usize = 4096;
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let bytes = html.as_bytes();
@@ -1199,32 +1219,52 @@ pub fn parse_netscape_bookmarks_html(html: &str) -> Vec<ImportedBookmark> {
             let attrs = &html[attrs_start..j];
             let content_start = j + 1;
 
-            // Locate closing </a> (case-insensitive)
+            // Linear single-pass scan until closing `</a>`, next opening `<a`, or EOF.
+            // Because `i` always advances to at least `k`, each byte is visited at most once (O(N)).
             let mut k = content_start;
-            let mut close_pos = None;
-            while k + 3 < len {
-                if bytes[k] == b'<'
-                    && bytes[k + 1] == b'/'
-                    && (bytes[k + 2] == b'a' || bytes[k + 2] == b'A')
-                    && (bytes[k + 3] == b'>' || bytes[k + 3].is_ascii_whitespace())
-                {
-                    close_pos = Some(k);
-                    break;
+            let mut content_end = len;
+            let mut next_i = len;
+            while k + 2 < len {
+                if bytes[k] == b'<' {
+                    if k + 3 < len
+                        && bytes[k + 1] == b'/'
+                        && (bytes[k + 2] == b'a' || bytes[k + 2] == b'A')
+                        && (bytes[k + 3] == b'>' || bytes[k + 3].is_ascii_whitespace())
+                    {
+                        content_end = k;
+                        let mut end_tag = k + 3;
+                        while end_tag < len && bytes[end_tag] != b'>' {
+                            end_tag += 1;
+                        }
+                        next_i = if end_tag < len { end_tag + 1 } else { len };
+                        break;
+                    }
+                    if (bytes[k + 1] == b'a' || bytes[k + 1] == b'A')
+                        && (bytes[k + 2].is_ascii_whitespace() || bytes[k + 2] == b'>')
+                    {
+                        // Implicitly close unclosed `<a>` before the next `<a ...>` without rescanning
+                        content_end = k;
+                        next_i = k;
+                        break;
+                    }
                 }
                 k += 1;
             }
-            let content_end = close_pos.unwrap_or(content_start);
             if let Some(href) = extract_href_from_anchor_attrs(attrs) {
                 let url = href.trim().to_string();
                 if is_importable_http_url(&url) && seen.insert(url.clone()) {
-                    let raw_inner = &html[content_start..content_end];
+                    let mut bounded_end = content_end.min(content_start.saturating_add(MAX_ANCHOR_INNER_BYTES));
+                    while bounded_end > content_start && !html.is_char_boundary(bounded_end) {
+                        bounded_end -= 1;
+                    }
+                    let raw_inner = &html[content_start..bounded_end];
                     let stripped = strip_html_tags(raw_inner);
                     let decoded_title = decode_html_entities(&stripped);
                     let title = clean_title(&decoded_title, &url);
                     out.push(ImportedBookmark { title, url });
                 }
             }
-            i = close_pos.map(|p| p + 4).unwrap_or(content_start);
+            i = next_i;
         } else {
             i += 1;
         }
@@ -1555,5 +1595,43 @@ mod tests {
         let simple_bms = parse_exported_bookmarks_file("my-bookmarks.json", simple_json);
         assert_eq!(simple_bms.len(), 1);
         assert_eq!(simple_bms[0].url, "https://docs.rs/");
+    }
+
+    #[test]
+    fn test_anchor_attr_parser_no_infinite_loop_on_gt_without_equals() {
+        assert_eq!(extract_href_from_anchor_attrs(">"), None);
+        assert_eq!(extract_href_from_anchor_attrs("foo> bar>"), None);
+        assert_eq!(
+            extract_href_from_anchor_attrs("data-x> href=\"https://example.org/a\""),
+            Some("https://example.org/a".to_string())
+        );
+        assert_eq!(
+            extract_href_from_anchor_attrs("a=> b> href=https://example.org/b"),
+            Some("https://example.org/b".to_string())
+        );
+        assert_eq!(extract_href_from_anchor_attrs("é> >>>"), None);
+    }
+
+    #[test]
+    fn test_netscape_bookmarks_linear_time_on_many_unclosed_anchors() {
+        let mut payload = String::with_capacity(200_000);
+        for idx in 0..5_000 {
+            payload.push_str(&format!("<a href=\"https://example.org/item/{}\">Item {}", idx, idx));
+        }
+        let parsed = parse_netscape_bookmarks_html(&payload);
+        assert_eq!(parsed.len(), MAX_BOOKMARKS_PER_BROWSER);
+        assert_eq!(parsed[0].url, "https://example.org/item/0");
+        assert_eq!(parsed[0].title, "Item 0");
+
+        // Also test many unclosed non-matching anchors followed by one valid anchor
+        let mut non_matching = String::with_capacity(500_000);
+        for _ in 0..20_000 {
+            non_matching.push_str("<a data-x=\"1\">unclosed ");
+        }
+        non_matching.push_str("<a href=\"https://rust-lang.org/\">Rust</a>");
+        let parsed2 = parse_netscape_bookmarks_html(&non_matching);
+        assert_eq!(parsed2.len(), 1);
+        assert_eq!(parsed2[0].url, "https://rust-lang.org/");
+        assert_eq!(parsed2[0].title, "Rust");
     }
 }

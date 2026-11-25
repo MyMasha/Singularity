@@ -126,13 +126,18 @@ pub fn compute_virtualized_viewport<'a>(
         };
     }
 
-    let clamped_scroll = scroll_offset_px.min(total_height_px.saturating_sub(1));
+    let effective_viewport_h = safe_viewport_h.max(1);
+    let max_scroll = total_height_px.saturating_sub(effective_viewport_h);
+    let clamped_scroll = scroll_offset_px.min(max_scroll);
     let raw_first_idx = clamped_scroll / row_h;
+    let visible_end_px = clamped_scroll.saturating_add(effective_viewport_h);
+    let raw_end_idx = visible_end_px.div_ceil(row_h).min(total_matching);
+
     let first_idx = raw_first_idx.saturating_sub(safe_overscan).min(total_matching);
-    let visible_rows = (safe_viewport_h / row_h)
-        .saturating_add(1)
-        .saturating_add(safe_overscan.saturating_mul(2));
-    let end_idx = first_idx.saturating_add(visible_rows).min(total_matching).max(first_idx);
+    let end_idx = raw_end_idx
+        .saturating_add(safe_overscan)
+        .min(total_matching)
+        .max(first_idx);
 
     let top_spacer = first_idx.saturating_mul(row_h);
     let bottom_spacer = total_height_px.saturating_sub(end_idx.saturating_mul(row_h));
@@ -146,5 +151,79 @@ pub fn compute_virtualized_viewport<'a>(
         top_spacer_height_px: top_spacer,
         bottom_spacer_height_px: bottom_spacer,
         visible_slice,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{SettingValue, TargetSubsystem, ValueConstraint};
+
+    fn dummy_entries(count: usize) -> Vec<SettingEntry> {
+        (0..count)
+            .map(|i| SettingEntry {
+                id: i + 1,
+                key: format!("ui.test.item_{:04}", i),
+                category: SettingCategory::ThemesCursorsUiUx,
+                subsystem: TargetSubsystem::OledThemeEngine,
+                title: format!("Item {}", i),
+                description: "Virtualization test item".into(),
+                default_value: SettingValue::Bool(true),
+                current_value: SettingValue::Bool(true),
+                constraint: ValueConstraint::Unconstrained,
+                chromium_switch: None,
+                hot_reloadable: true,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_virtualized_viewport_never_truncates_last_row() {
+        let entries = dummy_entries(10);
+
+        // Partial first row + partial last row (scroll=323, viewport=215, row_h=54 => [323, 538) covers rows 5..=9)
+        let vp = compute_virtualized_viewport(&entries, None, "", 323, 215, 54, 0);
+        assert_eq!(vp.first_visible_index, 5);
+        assert_eq!(vp.visible_slice.len(), 5);
+        assert_eq!(vp.visible_slice.last().unwrap().id, 10);
+        assert_eq!(vp.bottom_spacer_height_px, 0);
+        assert_eq!(
+            vp.top_spacer_height_px + vp.visible_slice.len() * 54 + vp.bottom_spacer_height_px,
+            vp.total_content_height_px
+        );
+
+        // Non-multiple viewport + partial top row: [40, 160) with row_h=50 covers rows 0..=3
+        let vp2 = compute_virtualized_viewport(&entries, None, "", 40, 120, 50, 0);
+        assert_eq!(vp2.first_visible_index, 0);
+        assert_eq!(vp2.visible_slice.len(), 4);
+        assert_eq!(vp2.visible_slice.last().unwrap().id, 4);
+
+        // Exact bottom and overscrolled past bottom must always include the final row (id 10)
+        for scroll in [0usize, 1, 53, 54, 200, 325, 340, 539, 540, 5000] {
+            for overscan in [0usize, 2, 4] {
+                for vh in [54usize, 120, 215, 540, 1000] {
+                    let slice = compute_virtualized_viewport(&entries, None, "", scroll, vh, 54, overscan);
+                    assert_eq!(
+                        slice.top_spacer_height_px
+                            + slice.visible_slice.len() * 54
+                            + slice.bottom_spacer_height_px,
+                        slice.total_content_height_px
+                    );
+                    let max_scroll = slice.total_content_height_px.saturating_sub(vh.max(1));
+                    let eff_scroll = scroll.min(max_scroll);
+                    let eff_end = eff_scroll + vh.max(1);
+                    let expected_first = eff_scroll / 54;
+                    let expected_last_excl = eff_end.div_ceil(54).min(entries.len());
+                    assert!(slice.first_visible_index <= expected_first);
+                    assert!(
+                        slice.first_visible_index + slice.visible_slice.len() >= expected_last_excl,
+                        "Truncated visible rows for scroll={}, vh={}, overscan={}",
+                        scroll,
+                        vh,
+                        overscan
+                    );
+                }
+            }
+        }
     }
 }

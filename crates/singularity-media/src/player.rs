@@ -3,6 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Safe fallback viewport dimensions when physical screen/viewport geometry is not supplied.
+pub const DEFAULT_VIEWPORT_WIDTH_PX: u32 = 1280;
+pub const DEFAULT_VIEWPORT_HEIGHT_PX: u32 = 720;
+pub const DEFAULT_PIP_WIDTH_PX: u32 = 480;
+pub const DEFAULT_PIP_HEIGHT_PX: u32 = 270;
+pub const PIP_EDGE_MARGIN_PX: u32 = 24;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubtitleStyleConfig {
     pub font_family: String,
@@ -29,6 +36,37 @@ pub enum PlayerDockMode {
     InlineOledControlBar,
     FloatingPictureInPicture { x: i32, y: i32, width: u32, height: u32 },
     DockedSidebarMiniPlayer,
+}
+
+/// Computes bounded bottom-right Picture-in-Picture coordinates guaranteed to remain fully
+/// visible inside `viewport_width x viewport_height` (falling back to `1280x720` if zero).
+pub fn compute_bounded_pip_rect(
+    viewport_width: u32,
+    viewport_height: u32,
+    desired_width: u32,
+    desired_height: u32,
+) -> (i32, i32, u32, u32) {
+    let vw = if viewport_width == 0 {
+        DEFAULT_VIEWPORT_WIDTH_PX
+    } else {
+        viewport_width
+    };
+    let vh = if viewport_height == 0 {
+        DEFAULT_VIEWPORT_HEIGHT_PX
+    } else {
+        viewport_height
+    };
+
+    let margin_x = PIP_EDGE_MARGIN_PX.min(vw / 10);
+    let margin_y = PIP_EDGE_MARGIN_PX.min(vh / 10);
+    let max_w = vw.saturating_sub(margin_x.saturating_mul(2)).max(1);
+    let max_h = vh.saturating_sub(margin_y.saturating_mul(2)).max(1);
+
+    let width = desired_width.clamp(1, max_w);
+    let height = desired_height.clamp(1, max_h);
+    let x = vw.saturating_sub(width).saturating_sub(margin_x) as i32;
+    let y = vh.saturating_sub(height).saturating_sub(margin_y) as i32;
+    (x, y, width, height)
 }
 
 /// Runtime state of Singularity's hardware-accelerated media player.
@@ -92,16 +130,120 @@ impl OledMediaPlayer {
         next_time
     }
 
-    /// Toggles borderless OLED Picture-in-Picture (PiP) mode.
+    /// Toggles borderless OLED Picture-in-Picture (PiP) mode using safe bounded coordinates
+    /// inside the default `1280x720` fallback viewport (never off-screen).
     pub fn toggle_picture_in_picture(&mut self) {
+        self.toggle_picture_in_picture_in_viewport(
+            DEFAULT_VIEWPORT_WIDTH_PX,
+            DEFAULT_VIEWPORT_HEIGHT_PX,
+        );
+    }
+
+    /// Toggles borderless OLED Picture-in-Picture (PiP) mode anchored inside `viewport_width x viewport_height`.
+    pub fn toggle_picture_in_picture_in_viewport(
+        &mut self,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) {
         self.dock_mode = match self.dock_mode {
             PlayerDockMode::FloatingPictureInPicture { .. } => PlayerDockMode::InlineOledControlBar,
-            _ => PlayerDockMode::FloatingPictureInPicture {
-                x: 1380,
-                y: 760,
-                width: 480,
-                height: 270,
-            },
+            _ => {
+                let (x, y, width, height) = compute_bounded_pip_rect(
+                    viewport_width,
+                    viewport_height,
+                    DEFAULT_PIP_WIDTH_PX,
+                    DEFAULT_PIP_HEIGHT_PX,
+                );
+                PlayerDockMode::FloatingPictureInPicture {
+                    x,
+                    y,
+                    width,
+                    height,
+                }
+            }
         };
+    }
+
+    /// Clamps custom PiP position and dimensions strictly inside `viewport_width x viewport_height`.
+    pub fn set_picture_in_picture_bounds(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) {
+        let vw = if viewport_width == 0 {
+            DEFAULT_VIEWPORT_WIDTH_PX
+        } else {
+            viewport_width
+        };
+        let vh = if viewport_height == 0 {
+            DEFAULT_VIEWPORT_HEIGHT_PX
+        } else {
+            viewport_height
+        };
+        let clamped_w = width.clamp(1, vw);
+        let clamped_h = height.clamp(1, vh);
+        let max_x = vw.saturating_sub(clamped_w) as i32;
+        let max_y = vh.saturating_sub(clamped_h) as i32;
+        self.dock_mode = PlayerDockMode::FloatingPictureInPicture {
+            x: x.clamp(0, max_x),
+            y: y.clamp(0, max_y),
+            width: clamped_w,
+            height: clamped_h,
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pip_default_coordinates_stay_inside_1280x720_screen() {
+        let mut player = OledMediaPlayer::default();
+        player.toggle_picture_in_picture();
+        match player.dock_mode {
+            PlayerDockMode::FloatingPictureInPicture {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                assert!(x >= 0 && y >= 0);
+                assert!(x as u32 + width <= 1280, "PiP right edge off-screen: {}+{}", x, width);
+                assert!(y as u32 + height <= 720, "PiP bottom edge off-screen: {}+{}", y, height);
+            }
+            other => panic!("Expected FloatingPictureInPicture, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pip_bounded_for_small_and_ultrawide_viewports() {
+        let mut player = OledMediaPlayer::default();
+
+        // Compact 400x300 viewport clamps PiP size & keeps it fully on screen
+        player.toggle_picture_in_picture_in_viewport(400, 300);
+        if let PlayerDockMode::FloatingPictureInPicture { x, y, width, height } = player.dock_mode {
+            assert!(x >= 0 && y >= 0);
+            assert!(x as u32 + width <= 400);
+            assert!(y as u32 + height <= 300);
+        } else {
+            panic!("Expected PiP mode");
+        }
+
+        // Clamping explicit off-screen drag coordinates snaps back inside viewport
+        player.set_picture_in_picture_bounds(5000, -200, 600, 400, 1280, 720);
+        assert_eq!(
+            player.dock_mode,
+            PlayerDockMode::FloatingPictureInPicture {
+                x: 680,
+                y: 0,
+                width: 600,
+                height: 400,
+            }
+        );
     }
 }

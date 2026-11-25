@@ -21,6 +21,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-hover: rgba(255, 255, 255, 0.065);
     --bar-bg-top: rgba(12, 13, 18, 0.88);
     --bar-bg-bot: rgba(8, 9, 14, 0.74);
+    --bg-bar: #0b0c10;
 
     --border-hairline: rgba(255, 255, 255, 0.08);
     --border-strong: rgba(255, 255, 255, 0.16);
@@ -54,6 +55,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(22, 13, 6, 0.88);
     --bar-bg-top: rgba(24, 14, 6, 0.90);
     --bar-bg-bot: rgba(16, 9, 4, 0.78);
+    --bg-bar: #160c05;
     --border-warm: rgba(255, 176, 59, 0.48);
     --gold-bright: #ffe699;
     --gold-core: #ff9f2e;
@@ -72,6 +74,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(7, 15, 25, 0.88);
     --bar-bg-top: rgba(8, 17, 29, 0.90);
     --bar-bg-bot: rgba(5, 11, 20, 0.78);
+    --bg-bar: #07101b;
     --border-warm: rgba(56, 217, 245, 0.44);
     --gold-bright: #a8f3ff;
     --gold-core: #38d9f5;
@@ -90,6 +93,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(16, 10, 26, 0.88);
     --bar-bg-top: rgba(18, 11, 30, 0.90);
     --bar-bg-bot: rgba(11, 7, 20, 0.78);
+    --bg-bar: #110a1c;
     --border-warm: rgba(185, 117, 255, 0.44);
     --gold-bright: #e4c7ff;
     --gold-core: #b975ff;
@@ -108,6 +112,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(22, 8, 11, 0.88);
     --bar-bg-top: rgba(24, 9, 12, 0.90);
     --bar-bg-bot: rgba(15, 6, 8, 0.78);
+    --bg-bar: #16080b;
     --border-warm: rgba(255, 77, 94, 0.46);
     --gold-bright: #ffadb6;
     --gold-core: #ff4d5e;
@@ -126,6 +131,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(7, 19, 15, 0.88);
     --bar-bg-top: rgba(8, 22, 17, 0.90);
     --bar-bg-bot: rgba(5, 14, 11, 0.78);
+    --bg-bar: #07140f;
     --border-warm: rgba(52, 211, 153, 0.44);
     --gold-bright: #a7f3d0;
     --gold-core: #34d399;
@@ -214,7 +220,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   body.bar-only .apple-bar {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
-    background: #0b0c10;
+    background: var(--bg-bar, var(--page-sidebar, #0b0c10));
   }
   .apple-bar.tabs-expanded {
     grid-template-columns: minmax(0, 1fr) clamp(190px, 22vw, 330px) auto;
@@ -262,6 +268,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   #tab-context-menu *,
   #settings-modal,
   #onboarding-overlay,
+  #update-floating-bar,
+  #update-floating-bar *,
   #toast {
     app-region: no-drag;
     -webkit-app-region: no-drag;
@@ -582,7 +590,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     height: 6px;
     border-radius: 50%;
     background: var(--gold-core);
-    border: 1.5px solid #0b0c10;
+    border: 1.5px solid var(--bg-bar, #0b0c10);
     pointer-events: none;
   }
 
@@ -630,7 +638,27 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     width: 84px;
     max-width: 84px;
     min-width: 44px;
-    padding: 0 7px;
+    padding: 0 5px 0 6px;
+    gap: 4px;
+    overflow: hidden;
+  }
+  .tabs-strip.very-compact .tab-pill.active {
+    padding-right: 22px;
+  }
+  .tabs-strip.very-compact .tab-pill .tab-close-btn {
+    position: absolute;
+    right: 3px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: rgba(22, 24, 32, 0.94);
+    box-shadow: -4px 0 6px rgba(14, 16, 22, 0.9);
+  }
+  .tabs-strip.very-compact .tab-pill:not(.active) .tab-close-btn {
+    display: none;
+  }
+  .tabs-strip.very-compact .tab-pill:not(.active):hover .tab-close-btn,
+  .tabs-strip.very-compact .tab-pill.active .tab-close-btn {
+    display: inline-flex;
   }
 
   /* Real-Time Update Download Progress Bar (Settings + Compact Floating Overlay) */
@@ -677,6 +705,55 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     backdrop-filter: blur(14px);
   }
   #update-floating-bar.visible { display: flex; }
+  /* In 46px bar-only webview mode, integrate as a compact 30px inline pill at the right edge
+     while reserving matching right padding on .apple-bar so no buttons are ever covered or clipped. */
+  body.bar-only #update-floating-bar {
+    top: 8px;
+    bottom: auto;
+    right: 12px;
+    left: auto;
+    width: 204px;
+    max-width: 204px;
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 8px;
+    background: var(--glass-panel);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    flex-direction: row;
+    align-items: center;
+    gap: 7px;
+    overflow: hidden;
+  }
+  body.bar-only #update-floating-bar > div:first-child {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  body.bar-only #update-floating-phase {
+    font-size: 11px !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  body.bar-only #update-floating-pct {
+    font-size: 11px !important;
+    flex-shrink: 0;
+  }
+  body.bar-only #update-floating-bar .update-progress-track {
+    width: 44px;
+    height: 5px;
+    flex-shrink: 0;
+  }
+  body.bar-only #update-floating-meta {
+    display: none;
+  }
+  body.bar-only.has-update-bar .apple-bar {
+    padding-right: 226px;
+  }
   #topbar-update-line {
     position: absolute;
     left: 0;
@@ -1825,6 +1902,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     .theme-gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .tuto-feature-grid { grid-template-columns: 1fr; }
     .settings-sidebar { width: 196px; min-width: 180px; }
+    body.bar-only.has-update-bar .apple-bar { padding-right: 10px; }
+    body.bar-only #update-floating-bar { display: none !important; }
   }
   @media (max-width: 640px) {
     .apple-bar, .apple-bar.tabs-expanded {
@@ -1953,14 +2032,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 <body>
 
   <!-- Frameless Window Resize Grips -->
-  <div class="rz rz-n" onmousedown="startResize('North', event)"></div>
-  <div class="rz rz-s" onmousedown="startResize('South', event)"></div>
-  <div class="rz rz-w" onmousedown="startResize('West', event)"></div>
-  <div class="rz rz-e" onmousedown="startResize('East', event)"></div>
-  <div class="rz rz-nw" onmousedown="startResize('NorthWest', event)"></div>
-  <div class="rz rz-ne" onmousedown="startResize('NorthEast', event)"></div>
-  <div class="rz rz-sw" onmousedown="startResize('SouthWest', event)"></div>
-  <div class="rz rz-se" onmousedown="startResize('SouthEast', event)"></div>
+  <div class="rz rz-n" data-resize="North"></div>
+  <div class="rz rz-s" data-resize="South"></div>
+  <div class="rz rz-w" data-resize="West"></div>
+  <div class="rz rz-e" data-resize="East"></div>
+  <div class="rz rz-nw" data-resize="NorthWest"></div>
+  <div class="rz rz-ne" data-resize="NorthEast"></div>
+  <div class="rz rz-sw" data-resize="SouthWest"></div>
+  <div class="rz rz-se" data-resize="SouthEast"></div>
 
   <!-- 3D Schwarzschild Gargantua Black Hole Canvas (Reference Image 1) -->
   <canvas id="singularity-canvas"></canvas>
@@ -1973,17 +2052,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       <div class="toolbar-left">
         <!-- Three Colored Apple Traffic Lights -->
         <div class="traffic-lights" role="group" aria-label="Window controls" data-i18n-aria="win_controls">
-          <button type="button" class="tl-dot tl-close" title="Close" data-i18n-title="win_close" onclick="winAction('close')">
+          <button type="button" class="tl-dot tl-close" title="Close" data-i18n-title="win_close" data-win-action="close">
             <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
               <path d="M2.2 2.2l5.6 5.6M7.8 2.2L2.2 7.8"/>
             </svg>
           </button>
-          <button type="button" class="tl-dot tl-min" title="Minimize" data-i18n-title="win_min" onclick="winAction('minimize')">
+          <button type="button" class="tl-dot tl-min" title="Minimize" data-i18n-title="win_min" data-win-action="minimize">
             <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
               <path d="M1.8 5h6.4"/>
             </svg>
           </button>
-          <button type="button" class="tl-dot tl-max" title="Maximize" data-i18n-title="win_max" onclick="winAction('toggle_maximize')">
+          <button type="button" class="tl-dot tl-max" title="Maximize" data-i18n-title="win_max" data-win-action="toggle_maximize">
             <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2.2 5.8V7.8h2M7.8 4.2V2.2h-2"/>
             </svg>
@@ -1992,15 +2071,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
         <!-- Studio Brand Logo + Safari Navigation Chevrons -->
         <div class="safari-nav-group">
-          <button type="button" class="brand-home-btn" title="Singularity Home" data-i18n-title="nav_home" onclick="openHomeInActiveTab()">
+          <button type="button" class="brand-home-btn" id="btn-brand-home" title="Singularity Home" data-i18n-title="nav_home">
             <img src="/api/logo.png" alt="Singularity" />
           </button>
-          <button type="button" class="icon-btn" id="btn-nav-back" title="Back" data-i18n-title="nav_back" onclick="historyBack()">
+          <button type="button" class="icon-btn" id="btn-nav-back" title="Back" data-i18n-title="nav_back">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="15 18 9 12 15 6"/>
             </svg>
           </button>
-          <button type="button" class="icon-btn" id="btn-nav-fwd" title="Forward" data-i18n-title="nav_forward" onclick="historyForward()">
+          <button type="button" class="icon-btn" id="btn-nav-fwd" title="Forward" data-i18n-title="nav_forward">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"/>
             </svg>
@@ -2009,18 +2088,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
         <!-- Overflow-Proof Multi-Tab Bar -->
         <div class="tabs-bar-wrap">
-          <button type="button" class="tabs-scroll-btn" id="tabs-scroll-left" title="Scroll tabs left" data-i18n-title="tabs_scroll_left" onclick="scrollTabsStrip(-200)">
+          <button type="button" class="tabs-scroll-btn" id="tabs-scroll-left" title="Scroll tabs left" data-i18n-title="tabs_scroll_left">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="15 18 9 12 15 6"/>
             </svg>
           </button>
           <div class="tabs-strip" id="tabs-strip"></div>
-          <button type="button" class="tabs-scroll-btn" id="tabs-scroll-right" title="Scroll tabs right" data-i18n-title="tabs_scroll_right" onclick="scrollTabsStrip(200)">
+          <button type="button" class="tabs-scroll-btn" id="tabs-scroll-right" title="Scroll tabs right" data-i18n-title="tabs_scroll_right">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"/>
             </svg>
           </button>
-          <button type="button" class="icon-btn" title="New tab (Ctrl+T)" data-i18n-title="nav_new_tab" onclick="createNewTab()">
+          <button type="button" class="icon-btn" id="btn-new-tab" title="New tab (Ctrl+T)" data-i18n-title="nav_new_tab">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
               <line x1="12" y1="5" x2="12" y2="19"/>
               <line x1="5" y1="12" x2="19" y2="12"/>
@@ -2040,14 +2119,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </span>
           <input id="omnibar-input" class="omnibar-input" type="text" spellcheck="false"
                  placeholder="Search or enter website address"
-                 data-i18n-placeholder="omnibar_placeholder"
-                 onkeydown="if(event.key==='Enter') navigateInput(this.value)" />
-          <button type="button" class="omnibar-act-btn" id="btn-bookmark-star" title="Bookmark this page (Ctrl+D)" data-i18n-title="nav_bookmark" onclick="toggleActiveBookmark()">
+                 data-i18n-placeholder="omnibar_placeholder" />
+          <button type="button" class="omnibar-act-btn" id="btn-bookmark-star" title="Bookmark this page (Ctrl+D)" data-i18n-title="nav_bookmark">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
             </svg>
           </button>
-          <button type="button" class="omnibar-act-btn" title="Reload (Ctrl+R)" data-i18n-title="nav_reload" onclick="reloadActivePage()">
+          <button type="button" class="omnibar-act-btn" id="btn-reload-page" title="Reload (Ctrl+R)" data-i18n-title="nav_reload">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
               <polyline points="21 3 21 9 15 9"/>
@@ -2061,14 +2139,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <div class="toolbar-right">
           <div class="ext-toolbar-strip" id="ext-toolbar-strip"></div>
 
-          <button type="button" class="icon-btn" id="btn-extensions" title="Chrome Extensions (Web Store & local)" data-i18n-title="nav_extensions" onclick="openSheet('extensions')">
+          <button type="button" class="icon-btn" id="btn-extensions" title="Chrome Extensions (Web Store & local)" data-i18n-title="nav_extensions" data-open-sheet="extensions">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
               <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>
             </svg>
             <span class="mini-badge" id="ext-count-badge">0</span>
           </button>
 
-          <button type="button" class="icon-btn" id="btn-private-mode" title="Private Browsing (ephemeral)" data-i18n-title="nav_private" onclick="togglePrivateMode()">
+          <button type="button" class="icon-btn" id="btn-private-mode" title="Private Browsing (ephemeral)" data-i18n-title="nav_private">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
               <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
               <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
@@ -2076,19 +2154,19 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             </svg>
           </button>
 
-          <button type="button" class="icon-btn" id="btn-roaming-tokens" title="Encrypted Sessions & Tokens (.singularity)" data-i18n-title="nav_tokens" onclick="openSheet('tokens')">
+          <button type="button" class="icon-btn" id="btn-roaming-tokens" title="Encrypted Sessions & Tokens (.singularity)" data-i18n-title="nav_tokens" data-open-sheet="tokens">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
             <span class="mini-badge" id="tokens-count-badge">0</span>
           </button>
 
-          <button type="button" class="status-pill" title="Network Shield & WireGuard" data-i18n-title="nav_shield" onclick="openSheet('mullvad')">
+          <button type="button" class="status-pill" title="Network Shield & WireGuard" data-i18n-title="nav_shield" data-open-sheet="mullvad">
             <span class="status-dot" id="vpn-dot"></span>
             <span id="vpn-label">Shield</span>
           </button>
 
-          <button type="button" class="icon-btn" title="Argon2id Vault & 2FA" data-i18n-title="nav_vault" onclick="openSheet('vault')">
+          <button type="button" class="icon-btn" title="Argon2id Vault & 2FA" data-i18n-title="nav_vault" data-open-sheet="vault">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="7.5" cy="15.5" r="4.5"/>
               <path d="M10.7 12.3 19 4"/>
@@ -2096,7 +2174,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             </svg>
           </button>
 
-          <button type="button" class="icon-btn" title="Control Center & Settings (Ctrl+,)" data-i18n-title="nav_settings" onclick="openSheet('general')">
+          <button type="button" class="icon-btn" title="Control Center & Settings (Ctrl+,)" data-i18n-title="nav_settings" data-open-sheet="general">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
               <line x1="4" y1="21" x2="4" y2="14"/>
               <line x1="4" y1="10" x2="4" y2="3"/>
@@ -2111,7 +2189,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </button>
         </div>
       </div>
-      <div id="topbar-update-line"><div id="topbar-update-fill"></div></div>
+      <div id="topbar-update-line"><div id="topbar-update-fill" class="update-progress-fill"></div></div>
     </header>
 
     <!-- VIEWPORT STAGE -->
@@ -2122,8 +2200,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <nav id="ntp-bookmarks-bar" aria-label="Bookmarks bar" data-i18n-aria="bm_bar_aria">
           <div class="ntp-bm-scroll" id="ntp-bookmarks-strip"></div>
           <div class="ntp-bm-actions">
-            <button type="button" class="ntp-bm-action-btn" id="btn-ntp-bm-import" onclick="openSheet('bookmarks')" data-i18n="bm_bar_import">Import</button>
-            <button type="button" class="ntp-bm-action-btn" id="btn-ntp-bm-add" onclick="openSheet('bookmarks')" title="Add or manage bookmarks" data-i18n-title="bm_bar_add_title">+</button>
+            <button type="button" class="ntp-bm-action-btn" id="btn-ntp-bm-import" data-open-sheet="bookmarks" data-i18n="bm_bar_import">Import</button>
+            <button type="button" class="ntp-bm-action-btn" id="btn-ntp-bm-add" data-open-sheet="bookmarks" title="Add or manage bookmarks" data-i18n-title="bm_bar_add_title">+</button>
           </div>
         </nav>
 
@@ -2142,9 +2220,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
               </svg>
               <input id="ntp-search-input" class="ntp-search-input" type="text" spellcheck="false"
                      placeholder="Search the web or enter a URL..."
-                     data-i18n-placeholder="ntp_placeholder"
-                     onkeydown="if(event.key==='Enter') executeNtpSearch(this.value)" />
-              <select id="search-engine" class="engine-pill-select" aria-label="Search engine" data-i18n-aria="search_engine_aria" onchange="saveDefaultEngine(this.value)">
+                     data-i18n-placeholder="ntp_placeholder" />
+              <select id="search-engine" class="engine-pill-select" aria-label="Search engine" data-i18n-aria="search_engine_aria">
                 <option value="ddg">DuckDuckGo</option>
                 <option value="google">Google</option>
                 <option value="brave">Brave</option>
@@ -2172,7 +2249,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <span class="tuto-dot" data-step="1"></span>
           <span class="tuto-dot" data-step="2"></span>
         </div>
-        <button type="button" class="btn-subtle" id="btn-tuto-skip" style="height:26px;font-size:11px;display:none;" data-i18n="tuto_skip" onclick="skipTutorial()">Skip remaining steps</button>
+        <button type="button" class="btn-subtle" id="btn-tuto-skip" style="height:26px;font-size:11px;display:none;" data-i18n="tuto_skip">Skip remaining steps</button>
       </div>
 
       <!-- STEP 1 (MANDATORY): LANGUAGE & COLOR THEME -->
@@ -2192,7 +2269,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <span class="tuto-required-badge" id="tuto-req-lang" data-i18n="tuto_required">Required</span>
         </div>
         <div class="lang-choice-grid" id="onboard-lang-grid">
-          <button type="button" class="lang-choice-card" data-lang="en" onclick="pickOnboardLanguage('en')">
+          <button type="button" class="lang-choice-card" data-lang="en">
             <div style="display:flex;align-items:center;gap:10px;">
               <span class="lang-code-pill">EN</span>
               <div>
@@ -2202,7 +2279,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <span class="tuto-required-badge" data-lang-check="en"></span>
           </button>
-          <button type="button" class="lang-choice-card" data-lang="fr" onclick="pickOnboardLanguage('fr')">
+          <button type="button" class="lang-choice-card" data-lang="fr">
             <div style="display:flex;align-items:center;gap:10px;">
               <span class="lang-code-pill">FR</span>
               <div>
@@ -2233,7 +2310,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
               Detected browsers on this PC (local read-only scan, zero files modified). Imported tabs start sleeping in RAM so videos never autoplay.
             </div>
           </div>
-          <button type="button" class="btn-subtle" style="height:28px;" data-i18n="btn_refresh" onclick="scanInstalledBrowsersForTutorial()">Refresh</button>
+          <button type="button" class="btn-subtle" id="btn-tuto-refresh-browsers" style="height:28px;" data-i18n="btn_refresh">Refresh</button>
         </div>
         <div class="import-browser-list" id="tuto-browsers-list">
           <div style="font-size:12px;color:var(--text-muted);padding:14px;text-align:center;" data-i18n="tuto1_scanning">Scanning installed browsers on this PC...</div>
@@ -2243,7 +2320,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             <input type="checkbox" id="tuto-import-bookmarks" checked />
             <span data-i18n="tuto1_also_bookmarks">Also import bookmarks from selected browsers</span>
           </label>
-          <button type="button" class="btn-gold" style="height:31px;padding:0 14px;" id="btn-tuto-import-now" data-i18n="tuto1_import_btn" onclick="executeTutorialBrowserImport()">
+          <button type="button" class="btn-gold" style="height:31px;padding:0 14px;" id="btn-tuto-import-now" data-i18n="tuto1_import_btn">
             Import selected tabs
           </button>
         </div>
@@ -2261,27 +2338,27 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </div>
         <div class="card-label" data-i18n="tuto2_engine_label">Default Search Engine</div>
         <div class="engine-grid" id="onboard-engines">
-          <button type="button" class="eng-choice selected" data-eng="ddg" onclick="pickOnboardEngine('ddg', this)">DuckDuckGo</button>
-          <button type="button" class="eng-choice" data-eng="google" onclick="pickOnboardEngine('google', this)">Google</button>
-          <button type="button" class="eng-choice" data-eng="brave" onclick="pickOnboardEngine('brave', this)">Brave</button>
-          <button type="button" class="eng-choice" data-eng="qwant" onclick="pickOnboardEngine('qwant', this)">Qwant</button>
-          <button type="button" class="eng-choice" data-eng="startpage" onclick="pickOnboardEngine('startpage', this)">Startpage</button>
+          <button type="button" class="eng-choice selected" data-eng="ddg">DuckDuckGo</button>
+          <button type="button" class="eng-choice" data-eng="google">Google</button>
+          <button type="button" class="eng-choice" data-eng="brave">Brave</button>
+          <button type="button" class="eng-choice" data-eng="qwant">Qwant</button>
+          <button type="button" class="eng-choice" data-eng="startpage">Startpage</button>
         </div>
         <div class="card-label" style="margin-top:2px;" data-i18n="tuto2_ram_label">Inactive Tab RAM Unloader</div>
         <div class="ram-mode-grid" id="tuto-ram-grid">
-          <button type="button" class="ram-mode-btn" data-ram-mode="low" onclick="selectRamMode('low')">
-            <span class="ram-mode-title">Low</span>
+          <button type="button" class="ram-mode-btn" data-ram-mode="low">
+            <span class="ram-mode-title" data-i18n="ram_low_short_title">Low</span>
             <span class="ram-mode-desc" data-i18n="ram_low_short">Unload after 2h</span>
           </button>
-          <button type="button" class="ram-mode-btn selected" data-ram-mode="medium" onclick="selectRamMode('medium')">
-            <span class="ram-mode-title">Medium</span>
+          <button type="button" class="ram-mode-btn selected" data-ram-mode="medium">
+            <span class="ram-mode-title" data-i18n="ram_med_short_title">Medium</span>
             <span class="ram-mode-desc" data-i18n="ram_med_short">Unload after 15 min</span>
           </button>
-          <button type="button" class="ram-mode-btn" data-ram-mode="hard" onclick="selectRamMode('hard')">
-            <span class="ram-mode-title">Hard</span>
+          <button type="button" class="ram-mode-btn" data-ram-mode="hard">
+            <span class="ram-mode-title" data-i18n="ram_hard_short_title">Hard</span>
             <span class="ram-mode-desc" data-i18n="ram_hard_short">Unload after 3 min</span>
           </button>
-          <button type="button" class="ram-mode-btn" data-ram-mode="custom" onclick="selectRamMode('custom')">
+          <button type="button" class="ram-mode-btn" data-ram-mode="custom">
             <span class="ram-mode-title" data-i18n="ram_custom_title">Custom</span>
             <span class="ram-mode-desc" data-i18n="ram_custom_short">Configure in Settings</span>
           </button>
@@ -2303,10 +2380,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       </div>
 
       <div class="tuto-footer">
-        <button type="button" class="btn-subtle" id="btn-tuto-prev" style="visibility:hidden;" data-i18n="btn_back" onclick="tutorialPrevStep()">Back</button>
+        <button type="button" class="btn-subtle" id="btn-tuto-prev" style="visibility:hidden;" data-i18n="btn_back">Back</button>
         <div style="font-size:11.5px;color:var(--text-muted);" id="tuto-step-label">Step 1 / 3</div>
         <div style="display:flex;gap:8px;">
-          <button type="button" class="btn-gold" id="btn-tuto-next" disabled onclick="tutorialNextStep()">Continue &rarr;</button>
+          <button type="button" class="btn-gold" id="btn-tuto-next" disabled>Continue &rarr;</button>
         </div>
       </div>
     </div>
@@ -2321,35 +2398,35 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <span class="settings-brand-title" data-i18n="settings_brand">Settings</span>
         </div>
         <nav class="sheet-tabs" aria-label="Settings sections" data-i18n-aria="settings_nav_aria">
-          <button type="button" class="sheet-tab-btn active" id="stab-general" onclick="switchSheetTab('general')">
+          <button type="button" class="sheet-tab-btn active" id="stab-general" data-sheet-tab="general">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span data-i18n="stab_general">General &amp; Startup</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-appearance" onclick="switchSheetTab('appearance')">
+          <button type="button" class="sheet-tab-btn" id="stab-appearance" data-sheet-tab="appearance">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
             <span data-i18n="stab_appearance">Appearance &amp; Themes</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-extensions" onclick="switchSheetTab('extensions')">
+          <button type="button" class="sheet-tab-btn" id="stab-extensions" data-sheet-tab="extensions">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568a2.4 2.4 0 0 1 0 3.408l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.5 2.5 0 1 0-3.214 3.214c.446.166.855.497.925.968a.98.98 0 0 1-.276.837l-1.61 1.61a2.4 2.4 0 0 1-3.409 0l-1.568-1.568a1.03 1.03 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.03 1.03 0 0 0-.289-.877L2.704 13.704a2.4 2.4 0 0 1 0-3.408L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525a2.4 2.4 0 0 1 3.408 0l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/></svg>
             <span data-i18n="stab_extensions">Chrome Extensions</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-tokens" onclick="switchSheetTab('tokens')">
+          <button type="button" class="sheet-tab-btn" id="stab-tokens" data-sheet-tab="tokens">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
             <span data-i18n="stab_tokens">Accounts &amp; .singularity</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-bookmarks" onclick="switchSheetTab('bookmarks')">
+          <button type="button" class="sheet-tab-btn" id="stab-bookmarks" data-sheet-tab="bookmarks">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
             <span data-i18n="stab_bookmarks">Bookmarks &amp; History</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-vault" onclick="switchSheetTab('vault')">
+          <button type="button" class="sheet-tab-btn" id="stab-vault" data-sheet-tab="vault">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 19 4"/><path d="M16 7l3 3"/></svg>
             <span data-i18n="stab_vault">Vault &amp; 2FA</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-mullvad" onclick="switchSheetTab('mullvad')">
+          <button type="button" class="sheet-tab-btn" id="stab-mullvad" data-sheet-tab="mullvad">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
             <span data-i18n="stab_mullvad">Shield &amp; WireGuard</span>
           </button>
-          <button type="button" class="sheet-tab-btn" id="stab-settings" onclick="switchSheetTab('settings')">
+          <button type="button" class="sheet-tab-btn" id="stab-settings" data-sheet-tab="settings">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/></svg>
             <span id="stab-settings-label" data-i18n="stab_engine">Engine (2,165+ settings)</span>
           </button>
@@ -2365,8 +2442,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div class="settings-page-heading" id="settings-page-heading">General &amp; Startup</div>
           <input id="settings-search" class="sheet-search" type="search"
                  placeholder="Search 2,165+ browser settings..."
-                 data-i18n-placeholder="settings_search_ph"
-                 oninput="onSettingsGlobalSearch(this.value)" />
+                 data-i18n-placeholder="settings_search_ph" />
         </div>
 
       <!-- TAB 1: GENERAL & STARTUP -->
@@ -2380,8 +2456,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button type="button" class="btn-subtle" data-i18n="btn_check_updates" onclick="checkUpdatesUI()">Check for updates</button>
-            <button type="button" id="btn-trigger-update" class="btn-gold" style="height:30px;padding:0 14px;" data-i18n="btn_update_now" onclick="triggerUpdate()">Update</button>
+            <button type="button" id="btn-check-updates" class="btn-subtle" data-i18n="btn_check_updates">Check for updates</button>
+            <button type="button" id="btn-trigger-update" class="btn-gold" style="height:30px;padding:0 14px;" data-i18n="btn_update_now">Update</button>
           </div>
         </div>
         <div id="update-check-banner" style="display:none;flex-direction:row;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;" class="info-card"></div>
@@ -2403,14 +2479,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div class="card-label" data-i18n="gen_startup_card">Language, Startup &amp; Browser Import</div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <span data-i18n="gen_lang_row">Display language</span>
-            <select id="gen-language-select" class="engine-pill-select" style="height:30px;padding:0 10px;" onchange="selectLanguage(this.value)">
+            <select id="gen-language-select" class="engine-pill-select" style="height:30px;padding:0 10px;">
               <option value="en">English</option>
               <option value="fr">Français</option>
             </select>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <span data-i18n="gen_engine_row">Default search engine</span>
-            <select id="gen-engine-select" class="engine-pill-select" style="height:30px;padding:0 10px;" onchange="saveDefaultEngine(this.value)">
+            <select id="gen-engine-select" class="engine-pill-select" style="height:30px;padding:0 10px;">
               <option value="ddg">DuckDuckGo</option>
               <option value="google">Google</option>
               <option value="brave">Brave Search</option>
@@ -2420,13 +2496,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <span data-i18n="gen_restore_row">Restore tabs &amp; exact video timestamps after restart or power loss</span>
-            <button type="button" class="toggle-pill on" id="btn-restore-session" onclick="toggleRestoreSession()">ON</button>
+            <button type="button" class="toggle-pill on" id="btn-restore-session">ON</button>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:6px;border-top:1px solid rgba(255,255,255,0.06);">
             <span data-i18n="gen_import_row">Import open tabs and bookmarks from another installed browser</span>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
-              <button type="button" class="btn-subtle" data-i18n="btn_import_tabs" onclick="reopenTutorialAtStep(1)">Import tabs...</button>
-              <button type="button" class="btn-subtle" data-i18n="btn_reopen_wizard" onclick="reopenTutorialAtStep(0)">Re-run setup wizard</button>
+              <button type="button" class="btn-subtle" data-i18n="btn_import_tabs" data-reopen-tuto="1">Import tabs...</button>
+              <button type="button" class="btn-subtle" data-i18n="btn_reopen_wizard" data-reopen-tuto="0">Re-run setup wizard</button>
             </div>
           </div>
         </div>
@@ -2440,19 +2516,19 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             Every tab keeps its exact URL, video timestamp, and session. Inactive tabs are released from RAM after your chosen delay and reload right where you left off when clicked.
           </div>
           <div class="ram-mode-grid" id="ram-mode-grid">
-            <button type="button" class="ram-mode-btn" data-ram-mode="low" onclick="selectRamMode('low')">
+            <button type="button" class="ram-mode-btn" data-ram-mode="low">
               <span class="ram-mode-title" data-i18n="ram_low_title">Low (2h)</span>
               <span class="ram-mode-desc" data-i18n="ram_low_desc">Keep more tabs in RAM (unload after 2h).</span>
             </button>
-            <button type="button" class="ram-mode-btn selected" data-ram-mode="medium" onclick="selectRamMode('medium')">
+            <button type="button" class="ram-mode-btn selected" data-ram-mode="medium">
               <span class="ram-mode-title" data-i18n="ram_med_title">Medium (15 min)</span>
               <span class="ram-mode-desc" data-i18n="ram_med_desc">Balanced: unload idle tabs after 15 min (max 6 background).</span>
             </button>
-            <button type="button" class="ram-mode-btn" data-ram-mode="hard" onclick="selectRamMode('hard')">
+            <button type="button" class="ram-mode-btn" data-ram-mode="hard">
               <span class="ram-mode-title" data-i18n="ram_hard_title">Hard (3 min)</span>
               <span class="ram-mode-desc" data-i18n="ram_hard_desc">Ultra-low RAM: unload idle tabs after 3 min (max 3 background).</span>
             </button>
-            <button type="button" class="ram-mode-btn" data-ram-mode="custom" onclick="selectRamMode('custom')">
+            <button type="button" class="ram-mode-btn" data-ram-mode="custom">
               <span class="ram-mode-title" data-i18n="ram_custom_title">Custom</span>
               <span class="ram-mode-desc" data-i18n="ram_custom_desc">Set your exact inactivity delay before unloading.</span>
             </button>
@@ -2464,16 +2540,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
               <option value="minutes" selected data-i18n="unit_minutes">minutes</option>
               <option value="hours" data-i18n="unit_hours">hours</option>
             </select>
-            <button type="button" class="btn-gold" style="height:30px;padding:0 12px;" data-i18n="btn_apply" onclick="saveCustomRamDelay()">Apply</button>
+            <button type="button" id="btn-ram-apply" class="btn-gold" style="height:30px;padding:0 12px;" data-i18n="btn_apply">Apply</button>
             <span style="font-size:11px;color:var(--text-muted);" data-i18n="ram_presets">Presets:</span>
-            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(3)">3 min</button>
-            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(15)">15 min</button>
-            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(60)">1 h</button>
-            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" onclick="applyRamPresetMinutes(120)">2 h</button>
+            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" data-ram-preset="3">3 min</button>
+            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" data-ram-preset="15">15 min</button>
+            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" data-ram-preset="60">1 h</button>
+            <button type="button" class="btn-subtle" style="height:26px;padding:0 8px;" data-ram-preset="120">2 h</button>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:4px;">
             <span style="font-size:11.5px;color:var(--text-muted);" id="ram-effective-label">Active mode: Medium (15 min)</span>
-            <button type="button" class="btn-subtle" data-i18n="btn_unload_now" onclick="unloadInactiveTabsNow()">Unload inactive tabs now</button>
+            <button type="button" id="btn-ram-unload-now" class="btn-subtle" data-i18n="btn_unload_now">Unload inactive tabs now</button>
           </div>
         </div>
 
@@ -2486,8 +2562,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             Surgical cookie cleanup active: only trackers, ad cookies, and malicious cookies are purged automatically. Your auth tokens, Google/YouTube/Discord/GitHub sessions, and functional cookies are preserved.
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
-            <button type="button" class="btn-subtle" data-i18n="btn_purge_trackers" onclick="clearBrowsingDataUI(false)">Purge trackers, ad &amp; malicious cookies (keep sessions)</button>
-            <button type="button" class="btn-subtle btn-danger" data-i18n="btn_full_reset" onclick="clearBrowsingDataUI(true)">Full reset (sign out all accounts)</button>
+            <button type="button" id="btn-purge-trackers" class="btn-subtle" data-i18n="btn_purge_trackers">Purge trackers, ad &amp; malicious cookies (keep sessions)</button>
+            <button type="button" id="btn-full-reset" class="btn-subtle btn-danger" data-i18n="btn_full_reset">Full reset (sign out all accounts)</button>
           </div>
         </div>
       </div>
@@ -2502,7 +2578,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
                 Each theme transforms the entire browser palette and live 3D New Tab scene (Black Hole, Solar Corona, Blood Eclipse, Cyan Pulsar, Amethyst Nebula, Emerald Aurora).
               </div>
             </div>
-            <button type="button" class="btn-subtle" data-i18n="btn_preview_ntp" onclick="createNewTab()">Preview on New Tab</button>
+            <button type="button" id="btn-preview-ntp" class="btn-subtle" data-i18n="btn_preview_ntp">Preview on New Tab</button>
           </div>
           <div class="theme-gallery-grid" id="settings-theme-grid" style="margin-top:4px;"></div>
         </div>
@@ -2525,22 +2601,20 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px;">
             <input id="ext-store-input" class="text-field" style="flex:1;min-width:260px;" type="text"
                    placeholder="Chrome Web Store URL or 32-letter ID (e.g. ddkjiahejlhfcafbddmgiahcphecmpfh)"
-                   data-i18n-placeholder="ext_store_ph"
-                   onkeydown="if(event.key==='Enter') installExtensionFromStoreUI()" />
-            <button type="button" class="btn-gold" style="height:32px;padding:0 16px;" id="btn-ext-install-store" data-i18n="btn_install" onclick="installExtensionFromStoreUI()">Install</button>
+                   data-i18n-placeholder="ext_store_ph" />
+            <button type="button" class="btn-gold" style="height:32px;padding:0 16px;" id="btn-ext-install-store" data-i18n="btn_install">Install</button>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
             <input id="ext-local-input" class="text-field" style="flex:1;min-width:240px;" type="text"
                    placeholder="Or path to manifest.json, unpacked folder, .crx, or .zip"
-                   data-i18n-placeholder="ext_local_ph"
-                   onkeydown="if(event.key==='Enter') installExtensionFromLocalUI()" />
-            <button type="button" class="btn-subtle" style="height:32px;" id="btn-pick-ext-file" data-i18n="btn_pick_ext_file" onclick="pickLocalExtensionUI('file')">Choose manifest.json / .crx / .zip</button>
-            <button type="button" class="btn-subtle" style="height:32px;" id="btn-pick-ext-folder" data-i18n="btn_pick_ext_folder" onclick="pickLocalExtensionUI('folder')">Choose folder</button>
-            <button type="button" class="btn-subtle" style="height:32px;" data-i18n="btn_load_local" onclick="installExtensionFromLocalUI()">Load local</button>
+                   data-i18n-placeholder="ext_local_ph" />
+            <button type="button" class="btn-subtle" style="height:32px;" id="btn-pick-ext-file" data-i18n="btn_pick_ext_file">Choose manifest.json / .crx / .zip</button>
+            <button type="button" class="btn-subtle" style="height:32px;" id="btn-pick-ext-folder" data-i18n="btn_pick_ext_folder">Choose folder</button>
+            <button type="button" class="btn-subtle" style="height:32px;" id="btn-ext-load-local" data-i18n="btn_load_local">Load local</button>
           </div>
           <div id="ext-restart-banner" style="display:none;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px;padding:10px 12px;border-radius:10px;border:1px solid rgba(246,196,83,0.42);background:rgba(246,196,83,0.10);">
             <span style="font-size:12px;color:var(--gold-bright);flex:1;min-width:220px;" data-i18n="ext_restart_banner_text">Extensions updated — restart Singularity to activate them in Chromium (your open tabs and videos will restore automatically).</span>
-            <button type="button" class="btn-gold" style="height:32px;padding:0 14px;white-space:nowrap;" id="btn-ext-restart-now" data-i18n="btn_restart_now" onclick="restartBrowserForExtensions()">Restart Singularity to activate</button>
+            <button type="button" class="btn-gold" style="height:32px;padding:0 14px;white-space:nowrap;" id="btn-ext-restart-now" data-i18n="btn_restart_now">Restart Singularity to activate</button>
           </div>
         </div>
 
@@ -2570,11 +2644,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div class="mono-val" id="tok-file-path">—</div>
           <div style="font-size:11px;color:var(--text-muted);" id="tok-cipher-label"></div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
-            <button type="button" class="btn-subtle" onclick="connectProviderLogin('https://accounts.google.com', 'Google Sign-In')">Google</button>
-            <button type="button" class="btn-subtle" onclick="connectProviderLogin('https://login.live.com', 'Microsoft Sign-In')">Microsoft</button>
-            <button type="button" class="btn-subtle" onclick="connectProviderLogin('https://github.com/login', 'GitHub Sign-In')">GitHub</button>
-            <button type="button" class="btn-subtle" onclick="connectProviderLogin('https://discord.com/login', 'Discord Sign-In')">Discord</button>
-            <button type="button" class="btn-gold" style="height:30px;padding:0 12px;" data-i18n="btn_sync_now" onclick="forceSyncTokens()">Sync now</button>
+            <button type="button" class="btn-subtle" data-provider-url="https://accounts.google.com" data-provider-title="Google Sign-In">Google</button>
+            <button type="button" class="btn-subtle" data-provider-url="https://login.live.com" data-provider-title="Microsoft Sign-In">Microsoft</button>
+            <button type="button" class="btn-subtle" data-provider-url="https://github.com/login" data-provider-title="GitHub Sign-In">GitHub</button>
+            <button type="button" class="btn-subtle" data-provider-url="https://discord.com/login" data-provider-title="Discord Sign-In">Discord</button>
+            <button type="button" id="btn-sync-tokens" class="btn-gold" style="height:30px;padding:0 12px;" data-i18n="btn_sync_now">Sync now</button>
           </div>
         </div>
 
@@ -2596,7 +2670,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             <input id="manual-tok-domain" class="text-field" style="width:170px;" type="text" placeholder="Domain (e.g. google.com)" data-i18n-placeholder="tok_dom_ph" />
             <input id="manual-tok-name" class="text-field" style="width:150px;" type="text" placeholder="Name (e.g. oauth_token)" data-i18n-placeholder="tok_name_ph" />
             <input id="manual-tok-secret" class="text-field" style="flex:1;min-width:180px;" type="password" placeholder="Token value to encrypt..." data-i18n-placeholder="tok_sec_ph" />
-            <button type="button" class="btn-subtle" data-i18n="btn_encrypt_save" onclick="addManualEncryptedToken()">Encrypt &amp; Save</button>
+            <button type="button" id="btn-add-manual-token" class="btn-subtle" data-i18n="btn_encrypt_save">Encrypt &amp; Save</button>
           </div>
         </div>
       </div>
@@ -2609,10 +2683,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             Import bookmarks from another installed browser (Chrome, Edge, Brave, Opera, Firefox, Vivaldi, Arc...) or from an exported bookmarks file (.html / .json). Your bookmarks bar appears exclusively on New Tab pages directly underneath open tabs.
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-            <input id="bm-file-input" type="file" accept=".html,.htm,.json,text/html,application/json" style="display:none;" onchange="handleBookmarksFileSelected(this)" />
-            <button type="button" class="btn-gold" style="height:32px;" data-i18n="bm_btn_import_file" onclick="document.getElementById('bm-file-input').click()">Import file (.html / .json)</button>
-            <button type="button" class="btn-subtle" data-i18n="bm_btn_export_html" onclick="exportBookmarksToHtml()">Export (.html)</button>
-            <button type="button" class="btn-subtle" data-i18n="bm_btn_rescan_browsers" onclick="loadBookmarkImportBrowsers(true)">Scan browsers</button>
+            <input id="bm-file-input" type="file" accept=".html,.htm,.json,text/html,application/json" style="display:none;" />
+            <button type="button" id="btn-bm-import-file" class="btn-gold" style="height:32px;" data-i18n="bm_btn_import_file">Import file (.html / .json)</button>
+            <button type="button" id="btn-bm-export-html" class="btn-subtle" data-i18n="bm_btn_export_html">Export (.html)</button>
+            <button type="button" id="btn-bm-rescan-browsers" class="btn-subtle" data-i18n="bm_btn_rescan_browsers">Scan browsers</button>
           </div>
           <div id="bm-import-browsers-list" style="display:flex;flex-direction:column;gap:6px;margin-top:4px;"></div>
         </div>
@@ -2625,16 +2699,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <input id="bm-new-title" class="text-field" style="width:190px;" type="text" placeholder="Title (e.g. ProtonMail)" data-i18n-placeholder="bm_title_ph" />
             <input id="bm-new-url" class="text-field" style="flex:1;min-width:220px;" type="text" placeholder="URL (e.g. https://mail.proton.me)" data-i18n-placeholder="bm_url_ph" />
-            <button type="button" class="btn-subtle" data-i18n="btn_add" onclick="addBookmarkFromSheet()">Add</button>
+            <button type="button" id="btn-bm-add-sheet" class="btn-subtle" data-i18n="btn_add">Add</button>
           </div>
-          <input id="bm-filter-input" class="text-field" type="text" placeholder="Filter your bookmarks..." data-i18n-placeholder="bm_filter_ph" oninput="renderBookmarksSheetList()" style="margin-top:4px;" />
+          <input id="bm-filter-input" class="text-field" type="text" placeholder="Filter your bookmarks..." data-i18n-placeholder="bm_filter_ph" style="margin-top:4px;" />
           <div id="bm-sheet-list" style="display:flex;flex-direction:column;gap:6px;margin-top:6px;max-height:260px;overflow-y:auto;"></div>
         </div>
 
         <div class="info-card">
           <div style="display:flex;align-items:center;justify-content:space-between;">
             <span class="card-label" data-i18n="hist_title">Recent Browsing History</span>
-            <button type="button" class="btn-subtle btn-danger" style="height:26px;" data-i18n="btn_clear_hist" onclick="clearHistoryOnly()">Clear history</button>
+            <button type="button" id="btn-clear-history" class="btn-subtle btn-danger" style="height:26px;" data-i18n="btn_clear_hist">Clear history</button>
           </div>
           <div id="hist-sheet-list" style="display:flex;flex-direction:column;gap:5px;max-height:240px;overflow-y:auto;"></div>
         </div>
@@ -2648,10 +2722,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
             <input id="vault-master-input" class="text-field" style="flex:1;min-width:220px;" type="password"
                    placeholder="Vault master password..."
-                   data-i18n-placeholder="vault_master_ph"
-                   onkeydown="if(event.key==='Enter') unlockOrCreateVault()" />
-            <button type="button" class="btn-gold" style="height:32px;" id="btn-vault-unlock" onclick="unlockOrCreateVault()">Unlock</button>
-            <button type="button" class="btn-subtle" id="btn-vault-lock" style="display:none;" data-i18n="btn_lock" onclick="lockVaultUI()">Lock</button>
+                   data-i18n-placeholder="vault_master_ph" />
+            <button type="button" class="btn-gold" style="height:32px;" id="btn-vault-unlock">Unlock</button>
+            <button type="button" class="btn-subtle" id="btn-vault-lock" style="display:none;" data-i18n="btn_lock">Lock</button>
           </div>
         </div>
 
@@ -2661,9 +2734,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             <input id="v-origin" class="text-field" style="width:180px;" type="text" placeholder="Site (e.g. https://github.com)" data-i18n-placeholder="v_origin_ph" />
             <input id="v-user" class="text-field" style="width:170px;" type="text" placeholder="Username / Email" data-i18n-placeholder="v_user_ph" />
             <input id="v-pass" class="text-field" style="flex:1;min-width:160px;" type="password" placeholder="Password" data-i18n-placeholder="v_pass_ph" />
-            <button type="button" class="btn-subtle" data-i18n="btn_generate" onclick="generateStrongPassword()">Generate</button>
-            <input id="v-totp" class="text-field" style="width:170px;" type="text" placeholder="Base32 2FA Secret (optional)" data-i18n-placeholder="v_totp_ph" />
-            <button type="button" class="btn-gold" style="height:32px;padding:0 14px;" data-i18n="btn_save" onclick="addVaultEntryUI()">Save</button>
+            <button type="button" id="btn-vault-generate" class="btn-subtle" data-i18n="btn_generate">Generate</button>
+            <input id="v-totp" class="text-field" style="width:170px;" type="password" autocomplete="off" spellcheck="false" placeholder="Base32 2FA Secret (optional)" data-i18n-placeholder="v_totp_ph" />
+            <button type="button" id="btn-vault-save" class="btn-gold" style="height:32px;padding:0 14px;" data-i18n="btn_save">Save</button>
           </div>
           <div id="vault-entries" style="display:flex;flex-direction:column;gap:6px;margin-top:8px;"></div>
         </div>
@@ -2672,7 +2745,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           <div class="card-label" data-i18n="vault_audit_title">Offline Entropy Audit &amp; Breach Filter</div>
           <div style="display:flex;gap:8px;align-items:center;">
             <input id="vault-audit-input" class="text-field" style="flex:1;" type="password" placeholder="Check password strength offline..." data-i18n-placeholder="vault_audit_ph" />
-            <button type="button" class="btn-subtle" data-i18n="btn_analyze" onclick="runVaultAudit()">Analyze</button>
+            <button type="button" id="btn-vault-audit" class="btn-subtle" data-i18n="btn_analyze">Analyze</button>
           </div>
           <div id="vault-audit-result" style="font-size:11.5px;color:var(--text-secondary);"></div>
         </div>
@@ -2683,13 +2756,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <div class="info-card">
           <div class="card-label" data-i18n="mv_title">Mullvad WireGuard + DAITA Engine (Local Cryptographic Simulation)</div>
           <div style="font-size:12px;color:var(--text-secondary);" id="mv-honest-notice" data-i18n="mv_notice">
-            Singularity protects your browsing with its anti-tracking shield and application kill-switch. Note: the embedded WireGuard module currently operates as a local cryptographic simulation (no OS-level TUN interface redirects WebView traffic yet). For full system-wide VPN routing, use the official Mullvad VPN client.
+            Singularity protects your browsing with its anti-tracking shield and application kill-switch. Note: the embedded WireGuard module currently operates as a local cryptographic simulation (no OS-level TUN interface redirects Chromium CEF traffic yet). For full system-wide VPN routing, use the official Mullvad VPN client.
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-            <input id="mv-account-input" class="text-field" style="width:220px;font-family:var(--font-mono);" type="text" placeholder="1234 5678 9012 3456" />
-            <button type="button" class="btn-gold" style="height:32px;" data-i18n="mv_btn_connect" onclick="connectMullvadUI()">Start WireGuard Session</button>
-            <button type="button" class="btn-subtle" data-i18n="mv_btn_disconnect" onclick="disconnectMullvadUI()">Disconnect</button>
-            <button type="button" class="btn-subtle btn-danger" data-i18n="mv_btn_forget" onclick="logoutMullvadUI()">Forget account</button>
+            <input id="mv-account-input" class="text-field" style="width:220px;font-family:var(--font-mono);" type="password" autocomplete="off" spellcheck="false" placeholder="1234 5678 9012 3456" />
+            <button type="button" id="btn-mv-connect" class="btn-gold" style="height:32px;" data-i18n="mv_btn_connect">Start WireGuard Session</button>
+            <button type="button" id="btn-mv-disconnect" class="btn-subtle" data-i18n="mv_btn_disconnect">Disconnect</button>
+            <button type="button" id="btn-mv-forget" class="btn-subtle btn-danger" data-i18n="mv_btn_forget">Forget account</button>
           </div>
         </div>
 
@@ -2702,16 +2775,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             <select id="mv-entry-sel" class="engine-pill-select" style="height:30px;"></select>
             <span style="font-size:11.5px;color:var(--text-muted);" data-i18n="mv_exit">Exit:</span>
             <select id="mv-exit-sel" class="engine-pill-select" style="height:30px;"></select>
-            <button type="button" class="btn-subtle" data-i18n="mv_apply_route" onclick="applyMullvadRelays()">Apply route</button>
+            <button type="button" id="btn-mv-apply-route" class="btn-subtle" data-i18n="mv_apply_route">Apply route</button>
           </div>
         </div>
 
         <div class="info-card">
           <div class="card-label" data-i18n="mv_sec_title">Socket Security &amp; Packet Inspection</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-            <button type="button" class="toggle-pill" id="btn-strict-ks" onclick="toggleStrictKillSwitchUI()">Strict Kill-Switch: OFF</button>
-            <button type="button" class="btn-subtle" data-i18n="mv_emergency" onclick="toggleKillSwitch()">Emergency Lockdown</button>
-            <button type="button" class="btn-subtle" data-i18n="mv_inspect" onclick="testWireGuardPacket()">Inspect DAITA Frame (1360B)</button>
+            <button type="button" class="toggle-pill" id="btn-strict-ks">Strict Kill-Switch: OFF</button>
+            <button type="button" id="btn-mv-emergency" class="btn-subtle" data-i18n="mv_emergency">Emergency Lockdown</button>
+            <button type="button" id="btn-mv-inspect" class="btn-subtle" data-i18n="mv_inspect">Inspect DAITA Frame (1360B)</button>
           </div>
           <pre class="info-card" id="mv-packet-out" style="display:none;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:pre-wrap;"></pre>
         </div>
@@ -2722,8 +2795,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         <div class="cats-sidebar">
           <div id="modal-cats-list" style="display:flex;flex-direction:column;gap:2px;"></div>
           <div style="margin-top:auto;padding-top:12px;display:flex;flex-direction:column;gap:6px;">
-            <button type="button" class="btn-subtle" style="width:100%;justify-content:center;" data-i18n="btn_export_toml" onclick="exportSettingsToml()">Export settings.toml</button>
-            <button type="button" class="btn-subtle btn-danger" id="btn-reset-all-settings" style="width:100%;justify-content:center;" data-i18n="btn_reset_all" onclick="resetAllSettingsUI()">Reset all</button>
+            <button type="button" id="btn-export-toml" class="btn-subtle" style="width:100%;justify-content:center;" data-i18n="btn_export_toml">Export settings.toml</button>
+            <button type="button" class="btn-subtle btn-danger" id="btn-reset-all-settings" style="width:100%;justify-content:center;" data-i18n="btn_reset_all">Reset all</button>
           </div>
         </div>
         <div class="rows-pane" id="modal-rows-list"></div>
@@ -2735,8 +2808,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   <div id="group-editor-bar" role="dialog" aria-label="Edit tab group" data-i18n-aria="grp_edit_aria">
     <input id="group-editor-name" class="grp-ed-input" type="text" maxlength="40" placeholder="Group name..." data-i18n-placeholder="grp_name_ph" />
     <div id="group-editor-colors" class="grp-ed-colors"></div>
-    <button type="button" class="grp-ed-btn primary" onclick="closeGroupEditor()">OK</button>
-    <button type="button" class="grp-ed-btn" data-i18n="btn_ungroup" onclick="ungroupEditingGroup()">Ungroup</button>
+    <button type="button" id="btn-grp-ed-ok" class="grp-ed-btn primary">OK</button>
+    <button type="button" id="btn-grp-ed-ungroup" class="grp-ed-btn" data-i18n="btn_ungroup">Ungroup</button>
   </div>
 
   <div id="tab-context-menu" role="menu"></div>
@@ -2752,8 +2825,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       </div>
       <textarea id="crash-report-text" readonly spellcheck="false"></textarea>
       <div class="crash-actions">
-        <button type="button" class="crash-btn-copy" id="btn-crash-copy" onclick="copyCrashReport()">Copy Error Report</button>
-        <button type="button" class="crash-btn-close" id="btn-crash-close" onclick="closeCrashReportModal()">Close</button>
+        <button type="button" class="crash-btn-copy" id="btn-crash-copy">Copy Error Report</button>
+        <button type="button" class="crash-btn-close" id="btn-crash-close">Close</button>
       </div>
     </div>
   </div>
@@ -2895,8 +2968,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tuto2_sub: "Personnalisez votre moteur par défaut et la mise en veille automatique des onglets inactifs.",
     tuto2_engine_label: "Moteur de recherche par défaut",
     tuto2_ram_label: "Déchargement RAM des onglets inactifs",
+    ram_low_short_title: "Faible",
     ram_low_short: "Décharge après 2h",
+    ram_med_short_title: "Modéré",
     ram_med_short: "Décharge après 15 min",
+    ram_hard_short_title: "Agressif",
     ram_hard_short: "Décharge après 3 min",
     ram_custom_title: "Personnalisé",
     ram_custom_short: "Configurable dans Paramètres",
@@ -2931,11 +3007,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     btn_reopen_wizard: "Relancer l'assistant",
     ram_card_title: "Gestionnaire de RAM & Déchargement automatique des onglets",
     ram_card_desc: "Chaque onglet conserve son URL exacte, le moment de la vidéo et sa session. Les onglets inactifs sont libérés de la RAM après le délai choisi et reprennent exactement où vous étiez.",
-    ram_low_title: "Low (2h)",
+    ram_low_title: "Faible (2h)",
     ram_low_desc: "Garde plus d'onglets en RAM (décharge après 2h).",
-    ram_med_title: "Medium (15 min)",
+    ram_med_title: "Modéré (15 min)",
     ram_med_desc: "Équilibré : décharge après 15 min (max 6 onglets en arrière-plan).",
-    ram_hard_title: "Hard (3 min)",
+    ram_hard_title: "Agressif (3 min)",
     ram_hard_desc: "Ultra-basse RAM : décharge après 3 min (max 3 onglets en arrière-plan).",
     ram_custom_desc: "Choisissez exactement le délai d'inactivité avant déchargement.",
     ram_unload_after: "Décharger après :",
@@ -3005,7 +3081,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     vault_audit_ph: "Vérifier la robustesse d'un mot de passe hors-ligne...",
     btn_analyze: "Analyser",
     mv_title: "Moteur Mullvad WireGuard + DAITA (Simulation Cryptographique Locale)",
-    mv_notice: "Singularity protège votre navigation via son bouclier anti-traqueurs et son kill-switch applicatif. Note : le moteur WireGuard embarqué fonctionne actuellement en simulation cryptographique locale (aucune interface TUN système ne redirige le trafic WebView). Pour un routage VPN système complet, utilisez l'application officielle Mullvad VPN.",
+    mv_notice: "Singularity protège votre navigation via son bouclier anti-traqueurs et son kill-switch applicatif. Note : le moteur WireGuard embarqué fonctionne actuellement en simulation cryptographique locale (aucune interface TUN système ne redirige le trafic Chromium CEF). Pour un routage VPN système complet, utilisez l'application officielle Mullvad VPN.",
     mv_btn_connect: "Activer la session WireGuard",
     mv_btn_disconnect: "Déconnecter",
     mv_btn_forget: "Oublier le compte",
@@ -3088,6 +3164,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (typeof syncRamModeUI === "function") syncRamModeUI();
     if (typeof renderBookmarksStrip === "function") renderBookmarksStrip();
     if (typeof renderTabs === "function") renderTabs(false);
+    if (typeof updateOnboardingSummaryText === "function") updateOnboardingSummaryText();
     if (typeof renderTutorialStep === "function" && anyModalOpen()) {
       renderTutorialStep();
       renderTutorialBrowsersList();
@@ -3216,7 +3293,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     { hex: "#ec4899", nameEn: "Pink", nameFr: "Rose" },
     { hex: "#f97316", nameEn: "Orange", nameFr: "Orange" }
   ];
-  let tabs = [{ id: 1, title: "New Tab", url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: Date.now(), unloaded: false }];
+  let tabs = [{ id: 1, title: "New Tab", url: "", mediaTimeSec: 0, scrollY: 0, groupId: null, faviconUrl: "", lastActiveAt: Date.now(), unloaded: false, isPrivate: false }];
   let tabGroups = [];
   let closedTabsStack = [];
   let editingGroupId = null;
@@ -3239,6 +3316,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   let settingsScrollRaf = 0;
   let settingsQuerySeq = 0;
   let persistTabsTimer = null;
+  let userMutatedTabsBeforeBoot = false;
+  let lastKnownVaultLocked = true;
+  let viewportSyncSeq = 0;
   const SETTINGS_ROW_H = 62;
 
   function escapeHtml(str) {
@@ -3281,7 +3361,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       showToast(label + L(" (auto-clears in 30s)", " (effacement auto dans 30s)"));
       clearTimeout(window.__clipClearTimer);
       window.__clipClearTimer = setTimeout(() => {
-        navigator.clipboard.writeText("").catch(() => {});
+        Promise.resolve()
+          .then(() => navigator.clipboard.writeText(""))
+          .catch(() => {
+            apiFetch("/api/clipboard/clear", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: "{}"
+            }).catch(() => {});
+          });
       }, 30000);
     }).catch(() => {
       showToast(L("Unable to copy to clipboard", "Impossible de copier dans le presse-papiers"));
@@ -3336,7 +3424,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       clearTimeout(persistTabsTimer);
       persistTabsTimer = null;
     }
-    const webTabs = tabs.filter(t => !!t.url && /^https?:\/\//i.test(t.url));
+    const webTabs = tabs.filter(t => !t.isPrivate && !!t.url && /^https?:\/\//i.test(t.url));
     const activeWebIdx = Math.max(0, webTabs.findIndex(t => t.id === activeTabId));
     const usedGroupIds = new Set();
     const clean = webTabs.map(t => {
@@ -3571,6 +3659,31 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
   }
 
+  function normalizeTabGroupContiguity() {
+    if (!tabs.length) return;
+    const validIds = new Set(tabGroups.map(g => g.id));
+    const seenGroups = new Set();
+    const normalized = [];
+    for (let i = 0; i < tabs.length; i++) {
+      const t = tabs[i];
+      const gid = (t.groupId && validIds.has(t.groupId)) ? t.groupId : null;
+      if (!gid) {
+        t.groupId = null;
+        normalized.push(t);
+      } else if (!seenGroups.has(gid)) {
+        seenGroups.add(gid);
+        for (let j = i; j < tabs.length; j++) {
+          if (tabs[j].groupId === gid) {
+            normalized.push(tabs[j]);
+          }
+        }
+      }
+    }
+    if (normalized.length === tabs.length) {
+      tabs = normalized;
+    }
+  }
+
   function nextGroupColor() {
     const used = new Set(tabGroups.map(g => g.color));
     for (const c of TAB_GROUP_COLORS) {
@@ -3591,6 +3704,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tabGroups.push(grp);
     tab.groupId = grp.id;
     pruneEmptyGroups();
+    normalizeTabGroupContiguity();
     renderTabs(false);
     persistOpenTabsIfEnabled(false);
     if (openEditorNow !== false) {
@@ -3616,15 +3730,28 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
     grp.collapsed = false;
     pruneEmptyGroups();
+    normalizeTabGroupContiguity();
     renderTabs(false);
     persistOpenTabsIfEnabled(false);
   }
 
   function removeTabFromGroup(tabId) {
-    const tab = tabs.find(t => t.id === tabId);
-    if (!tab || !tab.groupId) return;
+    const idx = tabs.findIndex(t => t.id === tabId);
+    if (idx === -1 || !tabs[idx].groupId) return;
+    const prevGroupId = tabs[idx].groupId;
+    const [tab] = tabs.splice(idx, 1);
     tab.groupId = null;
+    let lastInPrevGrp = -1;
+    for (let i = 0; i < tabs.length; i++) {
+      if (tabs[i].groupId === prevGroupId) lastInPrevGrp = i;
+    }
+    if (lastInPrevGrp >= 0) {
+      tabs.splice(lastInPrevGrp + 1, 0, tab);
+    } else {
+      tabs.splice(Math.min(idx, tabs.length), 0, tab);
+    }
     pruneEmptyGroups();
+    normalizeTabGroupContiguity();
     renderTabs(false);
     persistOpenTabsIfEnabled(false);
   }
@@ -4000,8 +4127,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         is_only_tab: tabs.length <= 1
       });
     } else if (t.url && /^https?:\/\//i.test(t.url)) {
-      window.open(t.url, "_blank", "noopener");
-      if (tabs.length > 1) removeDetachedTabFromList(t.id);
+      const targetTabId = t.id;
+      const targetUrl = t.url;
+      checkNavigationAllowed(targetUrl).then((verdict) => {
+        if (!verdict.allowed) {
+          showBlockedNavigationState(targetUrl, verdict.reason);
+          return;
+        }
+        window.open(verdict.url, "_blank", "noopener");
+        if (tabs.length > 1) removeDetachedTabFromList(targetTabId);
+      });
     }
   }
 
@@ -4024,14 +4159,31 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
   }
 
+  function openNewBrowserWindow() {
+    if (hasNativeIpc()) {
+      sendNativeIpc({ cmd: "open_new_window" });
+      return;
+    }
+    try {
+      const cleanUrl = new URL(window.location.href);
+      cleanUrl.searchParams.delete("boot");
+      cleanUrl.searchParams.delete("win");
+      window.open(cleanUrl.toString(), "_blank", "noopener");
+    } catch (_) {
+      showToast(L(
+        "Multiple windows are available in native Chromium CEF mode",
+        "Les fenêtres multiples sont disponibles en mode natif Chromium CEF"
+      ));
+    }
+  }
+
   function executeTabContextAction(action, tabId, groupId, targetGroupId, targetWindowId) {
     switch (action) {
       case "new_tab":
         createNewTab();
         break;
       case "new_window":
-        if (hasNativeIpc()) sendNativeIpc({ cmd: "open_new_window" });
-        else window.open(window.location.href, "_blank");
+        openNewBrowserWindow();
         break;
       case "move_tab_new_window":
         if (tabId) detachTabToWindow(tabId, { forceNewWindow: true });
@@ -4175,11 +4327,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     function onMidDown(ev) {
       if (ev.button !== 1) return;
       const pill = ev.target && ev.target.closest ? ev.target.closest(".tab-pill") : null;
+      midDownTabId = pill ? (Number(pill.dataset.tabId || 0) || null) : null;
+      midHandled = false;
       if (!pill) return;
       ev.preventDefault();
       ev.stopPropagation();
-      midDownTabId = Number(pill.dataset.tabId || 0) || null;
-      midHandled = false;
     }
 
     function onMidUpOrAux(ev) {
@@ -4189,19 +4341,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         ev.stopPropagation();
         return;
       }
+      const downId = midDownTabId;
+      midDownTabId = null;
       const pill = ev.target && ev.target.closest ? ev.target.closest(".tab-pill") : null;
       const pillId = pill ? (Number(pill.dataset.tabId || 0) || null) : null;
-      const targetId = pillId || midDownTabId;
-      if (!targetId) return;
-      if (midDownTabId && pillId && midDownTabId !== pillId) {
-        midDownTabId = null;
+      if (!downId || !pillId || downId !== pillId) {
         return;
       }
       midHandled = true;
-      midDownTabId = null;
       ev.preventDefault();
       ev.stopPropagation();
-      closeTab(targetId);
+      closeTab(downId);
     }
 
     strip.addEventListener("pointerdown", onMidDown, true);
@@ -4209,6 +4359,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     strip.addEventListener("pointerup", onMidUpOrAux, true);
     strip.addEventListener("mouseup", onMidUpOrAux, true);
     strip.addEventListener("auxclick", onMidUpOrAux, true);
+    window.addEventListener("mouseup", (ev) => {
+      if (ev.button === 1 && !strip.contains(ev.target)) midDownTabId = null;
+    });
 
     // Delegated left-click handler for tabs, close buttons, and group pills (zero per-tab closures!)
     strip.addEventListener("click", (ev) => {
@@ -4296,6 +4449,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           moved.groupId = targetGroup;
           tabs.splice(insertIdx, 0, moved);
           pruneEmptyGroups();
+          normalizeTabGroupContiguity();
           renderTabs(false);
           persistOpenTabsIfEnabled(false);
         }
@@ -4387,6 +4541,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     });
 
     window.addEventListener("pointerup", (ev) => {
+      if (ev.button === 1 && !strip.contains(ev.target)) midDownTabId = null;
       if (!dragState || ev.pointerId !== dragState.pointerId) return;
       finishTabDrag(false);
     });
@@ -4398,6 +4553,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       if (dragState) finishTabDrag(true);
     });
     window.addEventListener("blur", () => {
+      midDownTabId = null;
       if (dragState) finishTabDrag(true);
     });
     document.addEventListener("visibilitychange", () => {
@@ -4534,6 +4690,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   // Keyed incremental DOM reconciliation: reuses existing `.tab-pill` elements & cached favicons
   // so 38+ open tabs never suffer full DOM destruction/rebuild jank!
   function renderTabs(scrollActiveIntoView) {
+    normalizeTabGroupContiguity();
     const strip = document.getElementById("tabs-strip");
     const existingPills = new Map();
     const existingGroups = new Map();
@@ -4555,6 +4712,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     strip.classList.toggle("very-compact", visibleTabCount >= 12);
 
     const desiredNodes = [];
+    const emittedGroupHeaders = new Set();
     let activePill = null;
     let lastGroupId = null;
 
@@ -4563,7 +4721,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       const grp = findTabGroup(t.groupId);
       const curGroupId = grp ? grp.id : null;
 
-      if (curGroupId && curGroupId !== lastGroupId) {
+      if (curGroupId && curGroupId !== lastGroupId && !emittedGroupHeaders.has(curGroupId)) {
+        emittedGroupHeaders.add(curGroupId);
         let gBtn = existingGroups.get(grp.id);
         if (!gBtn) {
           gBtn = document.createElement("button");
@@ -4672,8 +4831,57 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     return (ob && ob.classList.contains("open")) || (cr && cr.classList.contains("open"));
   }
 
+  async function checkNavigationAllowed(rawUrl) {
+    if (!rawUrl || isInternalSettingsUrl(rawUrl)) {
+      return { allowed: true, url: rawUrl || "" };
+    }
+    try {
+      const res = await apiFetch("/api/navigate_check?url=" + encodeURIComponent(rawUrl));
+      if (!res || !res.ok) {
+        return {
+          allowed: false,
+          reason: L(
+            `Security check failed (HTTP ${res ? res.status : "error"})`,
+            `Échec du contrôle de sécurité (HTTP ${res ? res.status : "erreur"})`
+          )
+        };
+      }
+      const check = await res.json();
+      if (!check || check.allowed !== true) {
+        return {
+          allowed: false,
+          reason: (check && check.reason) || L("Blocked by security policy", "Bloqué par la politique de sécurité")
+        };
+      }
+      return {
+        allowed: true,
+        url: (typeof check.scrubbed_url === "string" && check.scrubbed_url) ? check.scrubbed_url : rawUrl
+      };
+    } catch (_) {
+      return {
+        allowed: false,
+        reason: L(
+          "Navigation check unavailable (fail-closed)",
+          "Vérification de navigation indisponible (blocage de sécurité)"
+        )
+      };
+    }
+  }
+
+  function showBlockedNavigationState(url, reason) {
+    const msg = L("Navigation blocked: ", "Navigation bloquée : ")
+      + (reason || L("Blocked by security policy", "Bloqué par la politique de sécurité"));
+    showToast(msg, null, 5200);
+    const cur = getActiveTab();
+    const omni = document.getElementById("omnibar-input");
+    if (omni && document.activeElement !== omni && cur) {
+      omni.value = cur.url || "";
+    }
+  }
+
   // `actionMode`: "navigate" (new URL in active tab), "activate" (zero-reload tab switch), or "view" (overlay/home)
-  function syncViewportToActiveTab(actionMode) {
+  function syncViewportToActiveTab(actionMode, opts) {
+    const syncSeq = ++viewportSyncSeq;
     const tab = getActiveTab();
     tab.lastActiveAt = Date.now();
     const grp = findTabGroup(tab.groupId);
@@ -4695,6 +4903,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       document.getElementById("web-frame").src = "about:blank";
       settingsPageEl.classList.add("open");
       setBlackHoleSuspended(!tutorialOpen);
+      if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
       sendNativeIpc({
         cmd: "activate_tab",
         tab_id: tab.id,
@@ -4711,6 +4920,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       document.getElementById("web-view").style.display = "none";
       document.getElementById("web-frame").src = "about:blank";
       setBlackHoleSuspended(false);
+      if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
       sendNativeIpc({
         cmd: "activate_tab",
         tab_id: tab.id,
@@ -4719,74 +4929,128 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         overlay_open: tutorialOpen
       });
     } else {
-      settingsPageEl.classList.remove("open");
-      stopVaultTotpTicker();
-      document.getElementById("ntp-view").style.display = "none";
-      if (hasNativeIpc()) {
-        document.body.classList.toggle("bar-only", !tutorialOpen);
-        setBlackHoleSuspended(!tutorialOpen);
-        if (actionMode === "navigate") {
-          tab.unloaded = false;
-          tab.startPaused = false;
-          sendNativeIpc({
-            cmd: "navigate_web",
-            tab_id: tab.id,
-            url: tab.url,
-            overlay_open: tutorialOpen
-          });
+      const commitWebViewport = (targetTab, checkedUrl) => {
+        if (checkedUrl && targetTab.url !== checkedUrl) {
+          targetTab.url = checkedUrl;
+          if (omni && document.activeElement !== omni) omni.value = checkedUrl;
+        }
+        const modalNow = anyModalOpen();
+        settingsPageEl.classList.remove("open");
+        stopVaultTotpTicker();
+        document.getElementById("ntp-view").style.display = "none";
+        if (hasNativeIpc()) {
+          document.body.classList.toggle("bar-only", !modalNow);
+          setBlackHoleSuspended(!modalNow);
+          if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
+          if (actionMode === "navigate") {
+            targetTab.unloaded = false;
+            targetTab.startPaused = false;
+            sendNativeIpc({
+              cmd: "navigate_web",
+              tab_id: targetTab.id,
+              url: targetTab.url,
+              overlay_open: modalNow
+            });
+          } else {
+            const shouldStartPaused = !!targetTab.startPaused;
+            targetTab.unloaded = false;
+            targetTab.startPaused = false;
+            sendNativeIpc({
+              cmd: "activate_tab",
+              tab_id: targetTab.id,
+              url: targetTab.url,
+              web_visible: true,
+              overlay_open: modalNow,
+              resume_time_sec: targetTab.mediaTimeSec >= 3 ? Math.floor(targetTab.mediaTimeSec) : null,
+              resume_scroll_y: targetTab.scrollY >= 40 ? Math.floor(targetTab.scrollY) : null,
+              start_paused: shouldStartPaused
+            });
+          }
+          sweepInactiveTabsForRam();
         } else {
-          const shouldStartPaused = !!tab.startPaused;
-          tab.unloaded = false;
-          tab.startPaused = false;
+          document.body.classList.remove("bar-only");
+          setBlackHoleSuspended(true);
+          if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
+          document.getElementById("web-view").style.display = "block";
+          if (actionMode === "navigate" || actionMode === "activate") {
+            document.getElementById("web-frame").src = "/api/web_proxy?url=" + encodeURIComponent(targetTab.url);
+          }
+        }
+      };
+
+      if (opts && opts.prechecked) {
+        commitWebViewport(tab, tab.url);
+        return;
+      }
+
+      const targetTabId = tab.id;
+      const targetUrl = tab.url;
+      checkNavigationAllowed(targetUrl).then((verdict) => {
+        if (syncSeq !== viewportSyncSeq || activeTabId !== targetTabId) return;
+        const curTab = tabs.find(t => t.id === targetTabId);
+        if (!curTab || curTab.url !== targetUrl) return;
+        if (!verdict.allowed) {
+          curTab.unloaded = true;
+          settingsPageEl.classList.remove("open");
+          stopVaultTotpTicker();
+          document.body.classList.remove("bar-only");
+          document.getElementById("web-view").style.display = "none";
+          document.getElementById("web-frame").src = "about:blank";
+          document.getElementById("ntp-view").style.display = "flex";
+          setBlackHoleSuspended(false);
+          if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
+          renderTabs(false);
           sendNativeIpc({
             cmd: "activate_tab",
-            tab_id: tab.id,
-            url: tab.url,
-            web_visible: true,
-            overlay_open: tutorialOpen,
-            resume_time_sec: tab.mediaTimeSec >= 3 ? Math.floor(tab.mediaTimeSec) : null,
-            resume_scroll_y: tab.scrollY >= 40 ? Math.floor(tab.scrollY) : null,
-            start_paused: shouldStartPaused
+            tab_id: curTab.id,
+            url: "",
+            web_visible: false,
+            overlay_open: anyModalOpen()
           });
+          showBlockedNavigationState(targetUrl, verdict.reason);
+          return;
         }
-        sweepInactiveTabsForRam();
-      } else {
-        document.body.classList.remove("bar-only");
-        setBlackHoleSuspended(true);
-        document.getElementById("web-view").style.display = "block";
-        if (actionMode === "navigate" || actionMode === "activate") {
-          document.getElementById("web-frame").src = "/api/web_proxy?url=" + encodeURIComponent(tab.url);
-        }
-      }
+        commitWebViewport(curTab, verdict.url);
+      });
     }
   }
 
   // Opens a link in a deferred background tab (middle-click / Ctrl+click):
   // stays strictly on the current tab and NEVER loads or autoplays media until clicked!
-  function openBackgroundLazyTab(url, explicitTitle) {
+  async function openBackgroundLazyTab(url, explicitTitle) {
     if (!url || !/^https?:\/\//i.test(url)) return;
+    if (!bootInitialized) userMutatedTabsBeforeBoot = true;
+    const openerId = activeTabId;
+    const verdict = await checkNavigationAllowed(url);
+    if (!verdict.allowed) {
+      showBlockedNavigationState(url, verdict.reason);
+      return;
+    }
+    const finalUrl = verdict.url;
     const id = nextTabId++;
     const title = (explicitTitle && explicitTitle.trim())
       ? explicitTitle.trim()
-      : deriveTitleFromUrl(url);
-    const activeIdx = tabs.findIndex(t => t.id === activeTabId);
+      : deriveTitleFromUrl(finalUrl);
+    const activeIdx = tabs.findIndex(t => t.id === openerId);
     const opener = activeIdx >= 0 ? tabs[activeIdx] : null;
     let insertIdx = activeIdx >= 0 ? activeIdx + 1 : tabs.length;
-    while (insertIdx < tabs.length && tabs[insertIdx].openerTabId === activeTabId) {
+    while (insertIdx < tabs.length && tabs[insertIdx].openerTabId === openerId) {
       insertIdx++;
     }
     tabs.splice(insertIdx, 0, {
       id,
       title,
-      url,
+      url: finalUrl,
       mediaTimeSec: 0,
       scrollY: 0,
       groupId: opener ? (opener.groupId || null) : null,
       faviconUrl: "",
-      openerTabId: activeTabId,
+      openerTabId: openerId,
       lastActiveAt: Date.now(),
-      unloaded: true
+      unloaded: true,
+      isPrivate: !!privateMode
     });
+    normalizeTabGroupContiguity();
     renderTabs(false);
     persistOpenTabsIfEnabled(false);
   }
@@ -4811,35 +5075,54 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   function createNewTab(initialUrl, initialTitle, opts) {
-    const prev = getActiveTab();
-    if (prev) prev.lastActiveAt = Date.now();
-    const id = nextTabId++;
-    const label = (initialTitle && initialTitle.trim())
-      ? initialTitle.trim()
-      : (initialUrl ? deriveTitleFromUrl(initialUrl) : L("New Tab", "Nouvel onglet"));
-    const entry = {
-      id,
-      title: label,
-      url: initialUrl || "",
-      mediaTimeSec: 0,
-      scrollY: 0,
-      groupId: opts && opts.groupId ? opts.groupId : null,
-      faviconUrl: "",
-      lastActiveAt: Date.now(),
-      unloaded: false
+    if (!bootInitialized) userMutatedTabsBeforeBoot = true;
+    const insertTabAndActivate = (finalUrl) => {
+      const prev = getActiveTab();
+      if (prev) prev.lastActiveAt = Date.now();
+      const id = nextTabId++;
+      const label = (initialTitle && initialTitle.trim())
+        ? initialTitle.trim()
+        : (finalUrl ? deriveTitleFromUrl(finalUrl) : L("New Tab", "Nouvel onglet"));
+      const entry = {
+        id,
+        title: label,
+        url: finalUrl || "",
+        mediaTimeSec: 0,
+        scrollY: 0,
+        groupId: opts && opts.groupId ? opts.groupId : null,
+        faviconUrl: "",
+        lastActiveAt: Date.now(),
+        unloaded: false,
+        isPrivate: !!privateMode
+      };
+      if (opts && typeof opts.insertIndex === "number") {
+        const idx = Math.max(0, Math.min(opts.insertIndex, tabs.length));
+        tabs.splice(idx, 0, entry);
+      } else {
+        tabs.push(entry);
+      }
+      normalizeTabGroupContiguity();
+      activeTabId = id;
+      syncViewportToActiveTab(finalUrl ? "navigate" : "activate", { prechecked: true });
+      if (!finalUrl) {
+        focusSearchForNewTab();
+      }
+      return id;
     };
-    if (opts && typeof opts.insertIndex === "number") {
-      const idx = Math.max(0, Math.min(opts.insertIndex, tabs.length));
-      tabs.splice(idx, 0, entry);
-    } else {
-      tabs.push(entry);
+
+    if (!initialUrl || isInternalSettingsUrl(initialUrl)) {
+      return insertTabAndActivate(initialUrl || "");
     }
-    activeTabId = id;
-    syncViewportToActiveTab(initialUrl ? "navigate" : "activate");
-    if (!initialUrl) {
-      focusSearchForNewTab();
-    }
-    return id;
+
+    (async () => {
+      const verdict = await checkNavigationAllowed(initialUrl);
+      if (!verdict.allowed) {
+        showBlockedNavigationState(initialUrl, verdict.reason);
+        return;
+      }
+      insertTabAndActivate(verdict.url);
+    })();
+    return null;
   }
 
   function activateTab(id) {
@@ -4857,7 +5140,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   function pushClosedTab(tab, closedIndex) {
-    if (!tab || !tab.url || !/^https?:\/\//i.test(tab.url)) return;
+    if (privateMode || !tab || tab.isPrivate || !tab.url || !/^https?:\/\//i.test(tab.url)) return;
     closedTabsStack.push({
       title: tab.title || deriveTitleFromUrl(tab.url),
       url: tab.url,
@@ -4865,19 +5148,31 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       scrollY: tab.scrollY || 0,
       groupId: tab.groupId || null,
       faviconUrl: tab.faviconUrl || "",
-      closedIndex: Math.max(0, closedIndex || 0)
+      closedIndex: Math.max(0, closedIndex || 0),
+      isPrivate: false
     });
     if (closedTabsStack.length > 30) {
       closedTabsStack.shift();
     }
   }
 
-  function reopenLastClosedTab() {
+  async function reopenLastClosedTab() {
     if (closedTabsStack.length === 0) {
       showToast(L("No recently closed tabs", "Aucun onglet fermé récemment"));
       return;
     }
+    if (!bootInitialized) userMutatedTabsBeforeBoot = true;
     const item = closedTabsStack.pop();
+    let finalUrl = item.url;
+    if (item.url && !isInternalSettingsUrl(item.url)) {
+      const verdict = await checkNavigationAllowed(item.url);
+      if (!verdict.allowed) {
+        closedTabsStack.push(item);
+        showBlockedNavigationState(item.url, verdict.reason);
+        return;
+      }
+      finalUrl = verdict.url;
+    }
     const grp = findTabGroup(item.groupId);
     if (grp) grp.collapsed = false;
     const id = nextTabId++;
@@ -4885,16 +5180,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tabs.splice(idx, 0, {
       id,
       title: item.title,
-      url: item.url,
+      url: finalUrl,
       mediaTimeSec: item.mediaTimeSec || 0,
       scrollY: item.scrollY || 0,
       groupId: grp ? grp.id : null,
       faviconUrl: item.faviconUrl || "",
       lastActiveAt: Date.now(),
-      unloaded: false
+      unloaded: false,
+      isPrivate: !!privateMode
     });
+    normalizeTabGroupContiguity();
     activeTabId = id;
-    syncViewportToActiveTab("activate");
+    syncViewportToActiveTab("activate", { prechecked: true });
   }
 
   function getVisibleTabsList() {
@@ -4913,8 +5210,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         createNewTab();
         break;
       case "new_window":
-        if (hasNativeIpc()) sendNativeIpc({ cmd: "open_new_window" });
-        else window.open(window.location.href, "_blank");
+        openNewBrowserWindow();
         break;
       case "close_active_tab":
         closeTab(activeTabId);
@@ -4986,6 +5282,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       tabs[0].groupId = null;
       tabs[0].faviconUrl = "";
       tabs[0].unloaded = false;
+      tabs[0].isPrivate = !!privateMode;
       tabs[0].lastActiveAt = Date.now();
       pruneEmptyGroups();
       syncViewportToActiveTab("view");
@@ -5018,6 +5315,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     tab.scrollY = 0;
     tab.faviconUrl = "";
     tab.unloaded = false;
+    tab.isPrivate = !!privateMode;
     tab.lastActiveAt = Date.now();
     syncViewportToActiveTab("view");
     focusSearchForNewTab();
@@ -5025,25 +5323,26 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   async function openUrlInActiveTab(rawUrl, explicitTitle) {
     if (!rawUrl) return;
-    let finalUrl = rawUrl;
-    try {
-      const res = await apiFetch("/api/navigate_check?url=" + encodeURIComponent(rawUrl));
-      const check = await res.json();
-      if (check && check.allowed === false) {
-        showToast(L("Navigation blocked: ", "Navigation bloquée : ") + (check.reason || ""));
-        return;
-      }
-      if (check && check.scrubbed_url) finalUrl = check.scrubbed_url;
-    } catch (_) {}
+    if (!bootInitialized) userMutatedTabsBeforeBoot = true;
+    const activeAtStart = getActiveTab();
+    const targetTabId = activeAtStart ? activeAtStart.id : activeTabId;
 
-    const tab = getActiveTab();
+    const verdict = await checkNavigationAllowed(rawUrl);
+    if (!verdict.allowed) {
+      showBlockedNavigationState(rawUrl, verdict.reason);
+      return;
+    }
+    const finalUrl = verdict.url;
+
+    const tab = tabs.find(t => t.id === targetTabId);
+    if (!tab) return;
     if (normalizeUrlNoTime(tab.url) !== normalizeUrlNoTime(finalUrl)) {
       tab.mediaTimeSec = 0;
       tab.scrollY = 0;
       tab.faviconUrl = "";
     }
     tab.url = finalUrl;
-    tab.unloaded = false;
+    if (privateMode) tab.isPrivate = true;
     tab.lastActiveAt = Date.now();
     if (explicitTitle) {
       tab.title = explicitTitle;
@@ -5054,7 +5353,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         tab.title = finalUrl;
       }
     }
-    syncViewportToActiveTab("navigate");
+    if (tab.id === activeTabId) {
+      tab.unloaded = false;
+      syncViewportToActiveTab("navigate", { prechecked: true });
+    } else {
+      tab.unloaded = true;
+      updateSingleTabPill(tab);
+      persistOpenTabsIfEnabled(false);
+    }
   }
 
   function searchUrlForEngine(query, eng) {
@@ -5129,11 +5435,21 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     sendNativeIpc({ cmd: "web_forward" });
   }
 
-  function reloadActivePage() {
+  async function reloadActivePage() {
     const tab = getActiveTab();
-    if (!tab.url) return;
+    if (!tab || !tab.url || isInternalSettingsUrl(tab.url)) return;
+    const targetTabId = tab.id;
+    const targetUrl = tab.url;
+    const verdict = await checkNavigationAllowed(targetUrl);
+    if (!verdict.allowed) {
+      showBlockedNavigationState(targetUrl, verdict.reason);
+      return;
+    }
+    const cur = getActiveTab();
+    if (!cur || cur.id !== targetTabId) return;
+    cur.url = verdict.url;
     if (!sendNativeIpc({ cmd: "web_reload" })) {
-      document.getElementById("web-frame").src = "/api/web_proxy?url=" + encodeURIComponent(tab.url);
+      document.getElementById("web-frame").src = "/api/web_proxy?url=" + encodeURIComponent(cur.url);
     }
   }
 
@@ -5157,6 +5473,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   async function togglePrivateMode() {
     privateMode = !privateMode;
+    closedTabsStack = closedTabsStack.filter(it => it && !it.isPrivate);
     document.getElementById("btn-private-mode").classList.toggle("active-gold", privateMode);
     await apiPost("/api/profile/update_prefs", { private_browsing: privateMode });
     sendNativeIpc({ cmd: "set_private_mode", enabled: privateMode });
@@ -5229,7 +5546,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     const lbl = document.getElementById("ram-effective-label");
     if (lbl) {
       const names = currentLang === "fr"
-        ? { low: "Low (Faible)", medium: "Medium (Équilibré)", hard: "Hard (Agressif)", custom: "Personnalisé" }
+        ? { low: "Faible", medium: "Modéré (Équilibré)", hard: "Agressif", custom: "Personnalisé" }
         : { low: "Low", medium: "Medium (Balanced)", hard: "Hard (Aggressive)", custom: "Custom" };
       const dur = formatDurationLocalized(tabUnloadEffectiveSeconds);
       lbl.textContent = currentLang === "fr"
@@ -5467,6 +5784,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       onboardThemePicked = true;
     }
     applyCosmicTheme(themeId);
+    updateOnboardingSummaryText();
     const t = getActiveThemeConfig();
     await apiPost("/api/profile/update_prefs", { theme_id: t.id }).catch(() => {});
     if (fromOnboarding) {
@@ -5489,7 +5807,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         btn.type = "button";
         btn.className = "theme-card" + (isSelected ? " selected" : "");
         btn.dataset.themeId = t.id;
-        btn.onclick = () => selectCosmicTheme(t.id, isTutoGrid);
+        btn.addEventListener("click", () => selectCosmicTheme(t.id, isTutoGrid));
 
         const orb = document.createElement("div");
         orb.className = "theme-preview-orb";
@@ -5530,11 +5848,26 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   let tutorialImportedTabsCount = 0;
   let tutorialImportedBookmarksCount = 0;
 
+  function updateOnboardingSummaryText() {
+    const sumEl = document.getElementById("tuto-summary-text");
+    if (!sumEl) return;
+    const themeName = themeDisplayName(getActiveThemeConfig());
+    const langLabel = currentLang === "fr" ? "Français" : "English";
+    const impPart = tutorialImportedTabsCount > 0
+      ? L(` · ${tutorialImportedTabsCount} tab(s) imported`, ` · ${tutorialImportedTabsCount} onglet(s) importé(s)`)
+      : "";
+    sumEl.textContent = L(
+      `Language: ${langLabel} · Theme: ${themeName} · Engine: ${onboardEngine.toUpperCase()}${impPart}`,
+      `Langue : ${langLabel} · Thème : ${themeName} · Moteur : ${onboardEngine.toUpperCase()}${impPart}`
+    );
+  }
+
   function pickOnboardEngine(eng, btn) {
     onboardEngine = eng;
     document.querySelectorAll("#onboard-engines .eng-choice").forEach(b => {
       b.classList.toggle("selected", b.dataset.eng === eng);
     });
+    updateOnboardingSummaryText();
   }
 
   async function pickOnboardLanguage(lang) {
@@ -5619,6 +5952,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     document.getElementById("onboarding-overlay").classList.add("open");
     document.body.classList.remove("bar-only");
     setBlackHoleSuspended(false);
+    if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
     sendNativeIpc({ cmd: "set_overlay", open: true });
     renderThemeGalleries();
     syncRamModeUI();
@@ -5656,20 +5990,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         nextBtn.disabled = false;
       }
     }
-    if (tutorialStep === 2) {
-      const themeName = themeDisplayName(getActiveThemeConfig());
-      const langLabel = currentLang === "fr" ? "Français" : "English";
-      const impPart = tutorialImportedTabsCount > 0
-        ? L(` · ${tutorialImportedTabsCount} tab(s) imported`, ` · ${tutorialImportedTabsCount} onglet(s) importé(s)`)
-        : "";
-      const sumEl = document.getElementById("tuto-summary-text");
-      if (sumEl) {
-        sumEl.textContent = L(
-          `Language: ${langLabel} · Theme: ${themeName} · Engine: ${onboardEngine.toUpperCase()}${impPart}`,
-          `Langue : ${langLabel} · Thème : ${themeName} · Moteur : ${onboardEngine.toUpperCase()}${impPart}`
-        );
-      }
-    }
+    updateOnboardingSummaryText();
     updateMandatoryStep1Gate();
   }
 
@@ -5952,6 +6273,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     modal.classList.add("open");
     document.body.classList.remove("bar-only");
     setBlackHoleSuspended(false);
+    if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
     sendNativeIpc({ cmd: "set_overlay", open: true });
     setTimeout(() => {
       try { ta.focus(); ta.select(); } catch (_) {}
@@ -6029,6 +6351,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       return;
     }
     if (msg.adopt_external_tab) {
+      if (!bootInitialized) userMutatedTabsBeforeBoot = true;
       const ext = msg.adopt_external_tab;
       const rawUrl = typeof ext.url === "string" ? ext.url.trim() : "";
       const safeUrl = (/^https?:\/\//i.test(rawUrl) || isInternalSettingsUrl(rawUrl)) ? rawUrl : "";
@@ -6042,8 +6365,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         groupId: null,
         faviconUrl: (ext.favicon_url && /^https?:\/\//i.test(ext.favicon_url)) ? ext.favicon_url : "",
         lastActiveAt: Date.now(),
-        unloaded: false
+        unloaded: false,
+        isPrivate: !!privateMode
       });
+      normalizeTabGroupContiguity();
       activeTabId = id;
       syncViewportToActiveTab("activate");
       if (!safeUrl) focusSearchForNewTab();
@@ -6155,6 +6480,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById("web-view").style.display = "none";
         document.getElementById("omnibar-input").value = "";
         setBlackHoleSuspended(false);
+        if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
         renderTabs(true);
         updateBookmarkStarState();
         updateNavArrowsState(targetTab.canGoBack, targetTab.canGoForward);
@@ -6176,6 +6502,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById("ntp-view").style.display = "none";
         document.body.classList.toggle("bar-only", !tutorialOpen);
         setBlackHoleSuspended(!tutorialOpen);
+        if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
         const omni = document.getElementById("omnibar-input");
         if (document.activeElement !== omni) omni.value = msg.url;
         renderTabs(true);
@@ -6289,7 +6616,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     } else if (ctrl && !e.shiftKey && (k === "n" || code === "KeyN")) {
       e.preventDefault();
       handleBrowserShortcut("new_window", 0);
-    } else if (ctrl && !e.shiftKey && (k === "w" || code === "KeyW" || code === "F4")) {
+    } else if (ctrl && !e.shiftKey && (k === "w" || code === "F4")) {
       e.preventDefault();
       handleBrowserShortcut("close_active_tab", 0);
     } else if (ctrl && e.shiftKey && (k === "tab" || code === "Tab")) {
@@ -6313,13 +6640,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     } else if (ctrl && !e.shiftKey && (k === "h" || code === "KeyH")) {
       e.preventDefault();
       handleBrowserShortcut("open_history", 0);
-    } else if (ctrl && !e.shiftKey && (k === "," || code === "Comma")) {
+    } else if (ctrl && !e.shiftKey && k === ",") {
       e.preventDefault();
       handleBrowserShortcut("open_settings", 0);
     } else if (ctrl && e.shiftKey && (k === "n" || code === "KeyN")) {
       e.preventDefault();
       handleBrowserShortcut("toggle_private", 0);
-    } else if (ctrl && !e.shiftKey && (k === "+" || k === "=" || code === "Equal" || code === "NumpadAdd")) {
+    } else if (ctrl && (k === "+" || code === "NumpadAdd" || (!e.shiftKey && (k === "=" || code === "Equal")))) {
       e.preventDefault();
       sendNativeIpc({ cmd: "web_zoom", action: "zoom_in" });
     } else if (ctrl && !e.shiftKey && (k === "-" || code === "Minus" || code === "NumpadSubtract")) {
@@ -6355,8 +6682,36 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         sendNativeIpc({ cmd: "focus_active_web", toggle_media_play: true });
       }
     } else if (e.key === "Escape") {
-      closeHtmlTabContextMenu();
-      closeGroupEditor();
+      const ctxMenu = document.getElementById("tab-context-menu");
+      if (ctxMenu && ctxMenu.classList.contains("open")) {
+        e.preventDefault();
+        closeHtmlTabContextMenu();
+        return;
+      }
+      const grpBar = document.getElementById("group-editor-bar");
+      if (grpBar && grpBar.classList.contains("open")) {
+        e.preventDefault();
+        closeGroupEditor();
+        persistOpenTabsIfEnabled(false);
+        return;
+      }
+      const crashModal = document.getElementById("crash-report-modal");
+      if (crashModal && crashModal.classList.contains("open")) {
+        e.preventDefault();
+        closeCrashReportModal();
+        return;
+      }
+      const onboardOverlay = document.getElementById("onboarding-overlay");
+      if (onboardOverlay && onboardOverlay.classList.contains("open")) {
+        e.preventDefault();
+        return;
+      }
+      const ae = document.activeElement;
+      const tag = ae && ae.tagName ? ae.tagName.toUpperCase() : "";
+      if (ae && (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || ae.isContentEditable)) {
+        if (typeof ae.blur === "function") ae.blur();
+        return;
+      }
       closeSheet();
     }
   }, true);
@@ -6500,13 +6855,16 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   let dynamicExtensionsSupported = false;
+  let extensionRestartPending = false;
 
   async function loadExtensionsPanel() {
     try {
       const res = await apiFetch("/api/extensions/list");
       const d = await res.json();
       dynamicExtensionsSupported = !!d.dynamic_supported;
-      if (dynamicExtensionsSupported) {
+      if (extensionRestartPending) {
+        showExtensionRestartBanner();
+      } else if (dynamicExtensionsSupported) {
         hideExtensionRestartBanner();
       }
       const dirEl = document.getElementById("ext-dir-path");
@@ -6709,7 +7067,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             if (out.ok) {
               sendNativeIpc({ cmd: "reload_extensions" });
               if (out.dynamic) {
-                hideExtensionRestartBanner();
+                if (!extensionRestartPending) hideExtensionRestartBanner();
                 showToast(L(`Extension "${ext.name}" imported and active immediately!`, `Extension « ${ext.name} » importée et active immédiatement !`));
               } else {
                 showExtensionRestartBanner();
@@ -6733,11 +7091,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   function showExtensionRestartBanner() {
+    extensionRestartPending = true;
     const banner = document.getElementById("ext-restart-banner");
     if (banner) banner.style.display = "flex";
   }
 
   function hideExtensionRestartBanner() {
+    extensionRestartPending = false;
     const banner = document.getElementById("ext-restart-banner");
     if (banner) banner.style.display = "none";
   }
@@ -6783,7 +7143,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         sendNativeIpc({ cmd: "reload_extensions" });
         const extName = (d.extension && d.extension.name) || label || id;
         if (d.dynamic) {
-          hideExtensionRestartBanner();
+          if (!extensionRestartPending) hideExtensionRestartBanner();
           showToast(L(
             `Extension "${extName}" reloaded live!`,
             `Extension « ${extName} » actualisée à chaud !`
@@ -6815,7 +7175,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       if (d.ok) {
         sendNativeIpc({ cmd: "reload_extensions" });
         if (d.dynamic) {
-          hideExtensionRestartBanner();
+          if (!extensionRestartPending) hideExtensionRestartBanner();
           showToast(L(
             `Extension "${d.extension.name}" installed and active immediately!`,
             `Extension « ${d.extension.name} » installée et active immédiatement !`
@@ -6861,7 +7221,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       inp.value = "";
       sendNativeIpc({ cmd: "reload_extensions" });
       if (d.dynamic) {
-        hideExtensionRestartBanner();
+        if (!extensionRestartPending) hideExtensionRestartBanner();
         showToast(L(
           `Extension "${d.extension.name}" loaded and active immediately!`,
           `Extension « ${d.extension.name} » chargée et active immédiatement !`
@@ -6886,7 +7246,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       renderExtensionsToolbar(d.installed || []);
       sendNativeIpc({ cmd: "reload_extensions" });
       if (d.dynamic) {
-        hideExtensionRestartBanner();
+        if (!extensionRestartPending) hideExtensionRestartBanner();
         showToast(enabled
           ? L("Extension enabled immediately!", "Extension activée immédiatement !")
           : L("Extension disabled immediately!", "Extension désactivée immédiatement !"));
@@ -6917,7 +7277,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (d.ok) {
       renderExtensionsToolbar(d.installed || []);
       if (d.dynamic) {
-        hideExtensionRestartBanner();
+        if (!extensionRestartPending) hideExtensionRestartBanner();
         showToast(L("Extension removed immediately!", "Extension supprimée immédiatement !"));
       } else {
         showExtensionRestartBanner();
@@ -6940,6 +7300,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   async function openSheet(tabName) {
+    if (!bootInitialized) userMutatedTabsBeforeBoot = true;
     const sec = tabName || "general";
     const targetUrl = internalUrlForSection(sec);
     const targetTitle = tabTitleForSection(sec);
@@ -6970,8 +7331,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           url: targetUrl,
           mediaTimeSec: 0,
           scrollY: 0,
+          groupId: null,
+          faviconUrl: "",
           lastActiveAt: Date.now(),
-          unloaded: false
+          unloaded: false,
+          isPrivate: !!privateMode
         });
         activeTabId = id;
       }
@@ -7023,6 +7387,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       if (btn) btn.classList.toggle("active", k === sec);
       if (pane) pane.style.display = k === sec ? "flex" : "none";
     });
+    syncUpdateFloatingBarVisibility();
 
     const headingEl = document.getElementById("settings-page-heading");
     if (headingEl) {
@@ -7056,6 +7421,20 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   /* --- TAB 1: GENERAL & UPDATES (REAL-TIME DOWNLOAD PROGRESS BAR) --- */
   let updateProgressTimer = null;
+  let lastUpdateSnapActive = false;
+
+  function syncUpdateFloatingBarVisibility() {
+    const flBar = document.getElementById("update-floating-bar");
+    const generalVisible = !!(
+      document.getElementById("settings-modal")?.classList.contains("open")
+      && document.getElementById("pane-general")?.style.display === "flex"
+    );
+    const shouldShow = !!lastUpdateSnapActive && !generalVisible;
+    if (flBar) {
+      flBar.classList.toggle("visible", shouldShow);
+    }
+    document.body.classList.toggle("has-update-bar", shouldShow);
+  }
 
   function formatUpdateBytes(bytes) {
     const n = Number(bytes || 0);
@@ -7147,10 +7526,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       btn.disabled = !!snap.active;
     }
 
-    const generalVisible = document.getElementById("settings-modal")?.classList.contains("open")
-      && document.getElementById("pane-general")?.style.display === "flex";
+    lastUpdateSnapActive = !!snap.active;
     if (flBar) {
-      flBar.classList.toggle("visible", !!snap.active && !generalVisible);
       if (flPhase) flPhase.textContent = phaseText;
       if (flPct) flPct.textContent = pctText;
       if (flFill) {
@@ -7161,6 +7538,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         flMeta.textContent = speedText ? `${metaText} · ${speedText}` : (metaText || "—");
       }
     }
+    syncUpdateFloatingBarVisibility();
 
     const topLine = document.getElementById("topbar-update-line");
     const topFill = document.getElementById("topbar-update-fill");
@@ -7700,6 +8078,28 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   /* --- TAB 4: ZERO-KNOWLEDGE VAULT (MASTER KEPT STRICTLY IN ZEROIZED RUST MEMORY) --- */
+  function clearVaultDomSensitiveFields() {
+    const entries = document.getElementById("vault-entries");
+    if (entries) entries.textContent = "";
+    const vPass = document.getElementById("v-pass");
+    if (vPass) {
+      vPass.value = "";
+      vPass.type = "password";
+    }
+    const vUser = document.getElementById("v-user");
+    if (vUser) vUser.value = "";
+    const vTotp = document.getElementById("v-totp");
+    if (vTotp) vTotp.value = "";
+    const vOrigin = document.getElementById("v-origin");
+    if (vOrigin) vOrigin.value = "";
+    const masterInp = document.getElementById("vault-master-input");
+    if (masterInp) masterInp.value = "";
+    const auditInp = document.getElementById("vault-audit-input");
+    if (auditInp) auditInp.value = "";
+    const area = document.getElementById("vault-unlocked-area");
+    if (area) area.style.display = "none";
+  }
+
   async function loadVaultPanel() {
     stopVaultTotpTicker();
     try {
@@ -7711,6 +8111,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       const area = document.getElementById("vault-unlocked-area");
 
       if (!st.has_file) {
+        clearVaultDomSensitiveFields();
+        lastKnownVaultLocked = true;
         desc.textContent = L(
           "No vault on disk yet. Set a master password to create your encrypted vault in .singularity/vault.singularity-vault.",
           "Aucun coffre-fort sur le disque. Définissez un mot de passe maître pour créer votre coffre chiffré dans .singularity/vault.singularity-vault."
@@ -7720,6 +8122,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         btnLock.style.display = "none";
         area.style.display = "none";
       } else if (st.locked) {
+        clearVaultDomSensitiveFields();
+        lastKnownVaultLocked = true;
         desc.textContent = L(
           "Encrypted vault locked (" + st.vault_path + "). Enter your master password.",
           "Coffre-fort chiffré verrouillé (" + st.vault_path + "). Saisissez votre mot de passe maître."
@@ -7729,6 +8133,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         btnLock.style.display = "none";
         area.style.display = "none";
       } else {
+        lastKnownVaultLocked = false;
         desc.textContent = L(
           "Vault unlocked in RAM (" + st.count + " encrypted credential(s)).",
           "Coffre-fort déverrouillé en mémoire vive (" + st.count + " identifiant(s) chiffré(s))."
@@ -7774,11 +8179,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       : L("Vault unlocked", "Coffre-fort déverrouillé"));
   }
 
-  async function lockVaultUI() {
+  async function lockVaultUI(fromAutoLock) {
     stopVaultTotpTicker();
-    await apiPost("/api/vault/lock", {});
+    clearVaultDomSensitiveFields();
+    lastKnownVaultLocked = true;
+    if (!fromAutoLock) {
+      await apiPost("/api/vault/lock", {});
+    }
     await loadVaultPanel();
-    showToast(L("Vault locked and memory wiped", "Coffre-fort verrouillé et mémoire nettoyée"));
+    showToast(fromAutoLock
+      ? L("Vault automatically locked due to inactivity", "Coffre-fort verrouillé automatiquement après inactivité")
+      : L("Vault locked and memory wiped", "Coffre-fort verrouillé et mémoire nettoyée"));
   }
 
   function generateStrongPassword() {
@@ -8214,7 +8625,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   async function refreshHeaderState(forceFull) {
     try {
-      const qs = (bootInitialized && !forceFull && lastStateRev > 0) ? `?rev=${lastStateRev}` : "";
+      const qs = (bootInitialized && !forceFull && lastStateRev > 0 && lastKnownVaultLocked) ? `?rev=${lastStateRev}` : "";
       const res = await apiFetch("/api/state" + qs);
       const st = await res.json();
       if (typeof st.rev === "number") lastStateRev = st.rev;
@@ -8280,6 +8691,17 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       }
       syncRamModeUI();
 
+      if (typeof st.vault_locked === "boolean") {
+        const unlockedArea = document.getElementById("vault-unlocked-area");
+        const uiShowsUnlocked = !!(unlockedArea && unlockedArea.style.display === "flex");
+        if (st.vault_locked && (!lastKnownVaultLocked || uiShowsUnlocked)) {
+          lastKnownVaultLocked = true;
+          lockVaultUI(true);
+        } else {
+          lastKnownVaultLocked = st.vault_locked;
+        }
+      }
+
       if (!bootInitialized) {
         bootInitialized = true;
         currentBookmarks = st.bookmarks || [];
@@ -8301,25 +8723,29 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         let restoredActiveMedia = 0;
         const restoredWins = Math.floor(Number(st.restored_windows_count || 0));
         const isDetachedHandoff = !!st.is_detached_handoff;
+        const preBootManualTabs = tabs.filter(t => !!t.url || t.id !== 1);
+        const hadUserTabs = userMutatedTabsBeforeBoot || preBootManualTabs.length > 0;
         if ((restoreSessionEnabled || isDetachedHandoff) && Array.isArray(st.saved_tabs) && st.saved_tabs.length > 0) {
           const now = Date.now();
+          const existingGroupIds = new Set(tabGroups.map(g => g.id));
           if (Array.isArray(st.saved_tab_groups)) {
-            tabGroups = st.saved_tab_groups
-              .filter(g => g && g.id)
+            const restoredGroups = st.saved_tab_groups
+              .filter(g => g && g.id && !existingGroupIds.has(String(g.id)))
               .map(g => ({
                 id: String(g.id),
                 title: String(g.title || ""),
                 color: /^#[0-9a-fA-F]{6}$/.test(g.color || "") ? g.color : "#f0b254",
                 collapsed: !!g.collapsed
               }));
+            tabGroups = hadUserTabs ? tabGroups.concat(restoredGroups) : restoredGroups;
           }
           const validGroupIds = new Set(tabGroups.map(g => g.id));
           const savedActiveIdx = Math.max(
             0,
             Math.min(Math.floor(Number(st.active_tab_index || 0)), st.saved_tabs.length - 1)
           );
-          tabs = st.saved_tabs.map((t, idx) => ({
-            id: idx + 1,
+          const restoredTabs = st.saved_tabs.map((t, idx) => ({
+            id: nextTabId++,
             title: t.title || deriveTitleFromUrl(t.url),
             url: t.url,
             mediaTimeSec: Math.max(0, Math.floor(Number(t.media_time_sec || 0))),
@@ -8327,21 +8753,35 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             groupId: (t.group_id && validGroupIds.has(t.group_id)) ? t.group_id : null,
             faviconUrl: (t.favicon_url && /^https?:\/\//i.test(t.favicon_url)) ? t.favicon_url : "",
             lastActiveAt: now,
-            unloaded: idx !== savedActiveIdx,
-            startPaused: !isDetachedHandoff
+            unloaded: hadUserTabs ? true : (idx !== savedActiveIdx),
+            startPaused: !isDetachedHandoff,
+            isPrivate: false
           }));
-          pruneEmptyGroups();
-          nextTabId = tabs.length + 1;
-          activeTabId = tabs[savedActiveIdx].id;
-          restoredCount = tabs.length;
-          restoredActiveMedia = tabs[savedActiveIdx].mediaTimeSec;
+          if (hadUserTabs) {
+            tabs = tabs.concat(restoredTabs);
+            pruneEmptyGroups();
+            normalizeTabGroupContiguity();
+            restoredCount = restoredTabs.length;
+            restoredActiveMedia = 0;
+          } else {
+            tabs = restoredTabs;
+            pruneEmptyGroups();
+            normalizeTabGroupContiguity();
+            activeTabId = tabs[savedActiveIdx].id;
+            restoredCount = tabs.length;
+            restoredActiveMedia = tabs[savedActiveIdx].mediaTimeSec;
+          }
         }
 
         if (!st.onboarding_completed || !st.tutorial_v1_completed) {
           renderTabs(false);
           openTutorialWizard(0, true);
         } else if (restoredCount > 0) {
-          syncViewportToActiveTab("activate");
+          if (hadUserTabs) {
+            renderTabs(false);
+          } else {
+            syncViewportToActiveTab("activate");
+          }
           if (!isDetachedHandoff) {
             const mediaNote = restoredActiveMedia >= 3
               ? L(` · video paused at ${formatMediaTimestamp(restoredActiveMedia)}`, ` · vidéo en pause à ${formatMediaTimestamp(restoredActiveMedia)}`)
@@ -8354,7 +8794,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
               `Session restaurée (${winNote}${restoredCount} onglet${restoredCount > 1 ? "s" : ""}${mediaNote})`
             ));
           }
-        } else {
+        } else if (!hadUserTabs) {
           focusSearchForNewTab();
         }
       }
@@ -8876,6 +9316,131 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
+
+  (function wireStaticUiHandlers() {
+    const onId = (id, evt, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener(evt, fn);
+    };
+    const onClick = (id, fn) => onId(id, "click", fn);
+    const onEnter = (id, fn) => onId(id, "keydown", (e) => {
+      if (e.key === "Enter") fn(e.currentTarget, e);
+    });
+
+    document.querySelectorAll(".rz[data-resize]").forEach(el => {
+      el.addEventListener("mousedown", (e) => startResize(el.dataset.resize, e));
+    });
+    document.querySelectorAll(".tl-dot[data-win-action]").forEach(el => {
+      el.addEventListener("click", () => winAction(el.dataset.winAction));
+    });
+
+    onClick("btn-brand-home", () => openHomeInActiveTab());
+    onClick("btn-nav-back", () => historyBack());
+    onClick("btn-nav-fwd", () => historyForward());
+    onClick("tabs-scroll-left", () => scrollTabsStrip(-200));
+    onClick("tabs-scroll-right", () => scrollTabsStrip(200));
+    onClick("btn-new-tab", () => createNewTab());
+
+    onEnter("omnibar-input", (el) => navigateInput(el.value));
+    onClick("btn-bookmark-star", () => toggleActiveBookmark());
+    onClick("btn-reload-page", () => reloadActivePage());
+
+    document.querySelectorAll("[data-open-sheet]").forEach(el => {
+      el.addEventListener("click", () => openSheet(el.dataset.openSheet));
+    });
+    onClick("btn-private-mode", () => togglePrivateMode());
+
+    onEnter("ntp-search-input", (el) => executeNtpSearch(el.value));
+    onId("search-engine", "change", (e) => saveDefaultEngine(e.currentTarget.value));
+
+    onClick("btn-tuto-skip", () => skipTutorial());
+    document.querySelectorAll("#onboard-lang-grid .lang-choice-card[data-lang]").forEach(el => {
+      el.addEventListener("click", () => pickOnboardLanguage(el.dataset.lang));
+    });
+    onClick("btn-tuto-refresh-browsers", () => scanInstalledBrowsersForTutorial());
+    onClick("btn-tuto-import-now", () => executeTutorialBrowserImport());
+    document.querySelectorAll("#onboard-engines .eng-choice[data-eng]").forEach(el => {
+      el.addEventListener("click", () => pickOnboardEngine(el.dataset.eng, el));
+    });
+    document.querySelectorAll(".ram-mode-btn[data-ram-mode]").forEach(el => {
+      el.addEventListener("click", () => selectRamMode(el.dataset.ramMode));
+    });
+    onClick("btn-tuto-prev", () => tutorialPrevStep());
+    onClick("btn-tuto-next", () => tutorialNextStep());
+
+    document.querySelectorAll(".sheet-tab-btn[data-sheet-tab]").forEach(el => {
+      el.addEventListener("click", () => switchSheetTab(el.dataset.sheetTab));
+    });
+    onId("settings-search", "input", (e) => onSettingsGlobalSearch(e.currentTarget.value));
+
+    onClick("btn-check-updates", () => checkUpdatesUI());
+    onClick("btn-trigger-update", () => triggerUpdate());
+    onId("gen-language-select", "change", (e) => selectLanguage(e.currentTarget.value));
+    onId("gen-engine-select", "change", (e) => saveDefaultEngine(e.currentTarget.value));
+    onClick("btn-restore-session", () => toggleRestoreSession());
+    document.querySelectorAll("[data-reopen-tuto]").forEach(el => {
+      el.addEventListener("click", () => reopenTutorialAtStep(Number(el.dataset.reopenTuto)));
+    });
+
+    onClick("btn-ram-apply", () => saveCustomRamDelay());
+    document.querySelectorAll("[data-ram-preset]").forEach(el => {
+      el.addEventListener("click", () => applyRamPresetMinutes(Number(el.dataset.ramPreset)));
+    });
+    onClick("btn-ram-unload-now", () => unloadInactiveTabsNow());
+
+    onClick("btn-purge-trackers", () => clearBrowsingDataUI(false));
+    onClick("btn-full-reset", () => clearBrowsingDataUI(true));
+    onClick("btn-preview-ntp", () => createNewTab());
+
+    onEnter("ext-store-input", () => installExtensionFromStoreUI());
+    onClick("btn-ext-install-store", () => installExtensionFromStoreUI());
+    onEnter("ext-local-input", () => installExtensionFromLocalUI());
+    onClick("btn-pick-ext-file", () => pickLocalExtensionUI("file"));
+    onClick("btn-pick-ext-folder", () => pickLocalExtensionUI("folder"));
+    onClick("btn-ext-load-local", () => installExtensionFromLocalUI());
+    onClick("btn-ext-restart-now", () => restartBrowserForExtensions());
+
+    document.querySelectorAll("[data-provider-url]").forEach(el => {
+      el.addEventListener("click", () => connectProviderLogin(el.dataset.providerUrl, el.dataset.providerTitle));
+    });
+    onClick("btn-sync-tokens", () => forceSyncTokens());
+    onClick("btn-add-manual-token", () => addManualEncryptedToken());
+
+    onId("bm-file-input", "change", (e) => handleBookmarksFileSelected(e.currentTarget));
+    onClick("btn-bm-import-file", () => {
+      const inp = document.getElementById("bm-file-input");
+      if (inp) inp.click();
+    });
+    onClick("btn-bm-export-html", () => exportBookmarksToHtml());
+    onClick("btn-bm-rescan-browsers", () => loadBookmarkImportBrowsers(true));
+    onClick("btn-bm-add-sheet", () => addBookmarkFromSheet());
+    onId("bm-filter-input", "input", () => renderBookmarksSheetList());
+    onClick("btn-clear-history", () => clearHistoryOnly());
+
+    onEnter("vault-master-input", () => unlockOrCreateVault());
+    onClick("btn-vault-unlock", () => unlockOrCreateVault());
+    onClick("btn-vault-lock", () => lockVaultUI(false));
+    onClick("btn-vault-generate", () => generateStrongPassword());
+    onClick("btn-vault-save", () => addVaultEntryUI());
+    onClick("btn-vault-audit", () => runVaultAudit());
+
+    onClick("btn-mv-connect", () => connectMullvadUI());
+    onClick("btn-mv-disconnect", () => disconnectMullvadUI());
+    onClick("btn-mv-forget", () => logoutMullvadUI());
+    onClick("btn-mv-apply-route", () => applyMullvadRelays());
+    onClick("btn-strict-ks", () => toggleStrictKillSwitchUI());
+    onClick("btn-mv-emergency", () => toggleKillSwitch());
+    onClick("btn-mv-inspect", () => testWireGuardPacket());
+
+    onClick("btn-export-toml", () => exportSettingsToml());
+    onClick("btn-reset-all-settings", () => resetAllSettingsUI());
+
+    onClick("btn-grp-ed-ok", () => closeGroupEditor());
+    onClick("btn-grp-ed-ungroup", () => ungroupEditingGroup());
+
+    onClick("btn-crash-copy", () => copyCrashReport());
+    onClick("btn-crash-close", () => closeCrashReportModal());
+  })();
 
   renderThemeGalleries();
   renderTabs(false);

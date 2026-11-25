@@ -2,6 +2,7 @@
 //! Zero email, zero password, zero PII.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -16,9 +17,17 @@ pub enum MullvadAccountError {
 }
 
 /// Validated, zeroize-on-drop 16-digit Mullvad account credential.
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct MullvadAccountToken {
     digits: String,
+}
+
+impl fmt::Debug for MullvadAccountToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MullvadAccountToken")
+            .field("digits", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MullvadAccountToken {
@@ -58,12 +67,23 @@ impl MullvadAccountToken {
 }
 
 /// JSON payload sent to `POST https://api.mullvad.net/app/v1/devices` to register a local WireGuard key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WireGuardDeviceRegistrationRequest {
     pub account_token: String,
     pub pubkey_base64: String,
     pub hijack_dns: bool,
     pub enable_pq_psk: bool,
+}
+
+impl fmt::Debug for WireGuardDeviceRegistrationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireGuardDeviceRegistrationRequest")
+            .field("account_token", &"[REDACTED]")
+            .field("pubkey_base64", &self.pubkey_base64)
+            .field("hijack_dns", &self.hijack_dns)
+            .field("enable_pq_psk", &self.enable_pq_psk)
+            .finish()
+    }
 }
 
 /// Assigned internal tunnel addresses returned by Mullvad after registering the local X25519 public key.
@@ -75,4 +95,28 @@ pub struct MullvadDeviceAssignment {
     pub ipv6_address: String,
     pub in_tunnel_dns_v4: String,
     pub socks5_exit_proxy: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mullvad_secret_debug_redaction() {
+        let token = MullvadAccountToken::parse("1234 5678 9012 3456").expect("valid account");
+        let dbg_token = format!("{:?}", token);
+        assert!(dbg_token.contains("[REDACTED]"));
+        assert!(!dbg_token.contains("1234567890123456"));
+        assert!(!dbg_token.contains("3456"));
+
+        let req = WireGuardDeviceRegistrationRequest {
+            account_token: "1234567890123456".into(),
+            pubkey_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            hijack_dns: true,
+            enable_pq_psk: true,
+        };
+        let dbg_req = format!("{:?}", req);
+        assert!(dbg_req.contains("[REDACTED]"));
+        assert!(!dbg_req.contains("1234567890123456"));
+    }
 }

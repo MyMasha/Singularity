@@ -14,10 +14,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static CRASH_ROAMING_ROOT: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static SEH_CRASH_JSON_PATH_W: OnceLock<Vec<u16>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static SEH_CRASH_TXT_PATH_W: OnceLock<Vec<u16>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+static PANIC_DIALOG_SHOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashReport {
@@ -82,18 +90,29 @@ impl CrashReport {
     }
 }
 
-/// Reads the last `max_lines` lines (capped to 8 KiB) of `%APPDATA%\.singularity\cef.log`.
+/// Reads the last `max_lines` lines from at most the final 64 KiB of `%APPDATA%\.singularity\cef.log`
+/// using `SeekFrom::End` so large log files are never loaded entirely into RAM.
 pub fn read_cef_log_tail(roaming_root: &Path, max_lines: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let max_bytes: usize = 64 * 1024;
     let path = roaming_root.join("cef.log");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(mut file) = std::fs::File::open(&path) else {
         return String::new();
     };
-    let tail_slice = if bytes.len() > 16_384 {
-        &bytes[bytes.len() - 16_384..]
-    } else {
-        &bytes[..]
-    };
-    let text = String::from_utf8_lossy(tail_slice);
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len == 0 {
+        return String::new();
+    }
+    if file_len > max_bytes as u64 {
+        if file.seek(SeekFrom::End(-(max_bytes as i64))).is_err() {
+            return String::new();
+        }
+    }
+    let mut bytes = Vec::with_capacity((file_len.min(max_bytes as u64)) as usize);
+    if file.take(max_bytes as u64).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(max_lines);
     lines[start..].join("\n")
@@ -153,6 +172,22 @@ pub fn record_runtime_error_report(
     rep
 }
 
+#[cfg(target_os = "windows")]
+fn should_show_native_panic_dialog(thread_name: &str) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if std::env::var_os("SINGULARITY_HEADLESS").is_some()
+        || std::env::var_os("SINGULARITY_NO_CRASH_DIALOG").is_some()
+        || std::env::var_os("CI").is_some()
+    {
+        return false;
+    }
+    // Only display a blocking Win32 modal dialog for fatal main-thread panics; non-fatal worker
+    // panics (including those caught via `catch_unwind`) persist to disk without deadlocking UI/tests.
+    thread_name == "main"
+}
+
 /// Installs global panic and (on Windows) native SEH unhandled-exception crash detectors.
 pub fn install_crash_handlers(roaming_root: &Path) {
     let _ = CRASH_ROAMING_ROOT.set(roaming_root.to_path_buf());
@@ -175,19 +210,29 @@ pub fn install_crash_handlers(roaming_root: &Path) {
             .unwrap_or_else(|| "<unknown location>".to_string());
         let bt = std::backtrace::Backtrace::force_capture();
         let summary = format!("Rust panic on thread '{}' at {}: {}", tname, loc, payload);
-        let details = format!("Location: {}\nThread: {}\nMessage: {}\n\nBacktrace:\n{}", loc, tname, payload, bt);
+        let details = format!(
+            "Location: {}\nThread: {}\nMessage: {}\n\nBacktrace:\n{}",
+            loc, tname, payload, bt
+        );
 
         if let Some(root) = CRASH_ROAMING_ROOT.get() {
             let report = build_report(root, "rust_panic", &summary, &details);
             save_crash_report_to_disk(root, &report);
             #[cfg(target_os = "windows")]
-            show_native_crash_dialog("Singularity — Crash Report / Rapport d'erreur", &report.format_copyable_text());
+            if should_show_native_panic_dialog(tname)
+                && !PANIC_DIALOG_SHOWN.swap(true, Ordering::SeqCst)
+            {
+                show_native_crash_dialog(
+                    "Singularity — Crash Report / Rapport d'erreur",
+                    &report.format_copyable_text(),
+                );
+            }
         }
         prev_hook(info);
     }));
 
     #[cfg(target_os = "windows")]
-    install_windows_seh_filter();
+    install_windows_seh_filter(roaming_root);
 }
 
 #[cfg(target_os = "windows")]
@@ -217,10 +262,18 @@ fn is_pid_alive(pid: u32) -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn is_pid_alive(pid: u32) -> bool {
-    if pid == 0 {
+    if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
-    Path::new(&format!("/proc/{}", pid)).exists()
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // POSIX `kill(pid, 0)` works portably across Linux and macOS without relying on `/proc`.
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
 }
 
 /// Checks whether the previous Singularity run crashed (either an unacknowledged `last_crash.json`
@@ -242,6 +295,14 @@ pub fn detect_previous_crash_and_mark_running_with_cef_log(
         if let Ok(mut rep) = serde_json::from_slice::<CrashReport>(&bytes) {
             if !rep.acknowledged {
                 rep.acknowledged = true;
+                if rep.cef_log_tail.trim().is_empty() {
+                    let log_tail = if !prev_cef_log_tail.trim().is_empty() {
+                        prev_cef_log_tail.to_string()
+                    } else {
+                        read_cef_log_tail(roaming_root, 35)
+                    };
+                    rep.cef_log_tail = log_tail;
+                }
                 if let Ok(updated) = serde_json::to_vec_pretty(&rep) {
                     let _ = std::fs::write(&last_json, updated);
                 }
@@ -400,7 +461,26 @@ pub fn copy_text_to_windows_clipboard(_text: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_seh_filter() {
+fn install_windows_seh_filter(roaming_root: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let cdir = crashes_dir(roaming_root);
+    let _ = std::fs::create_dir_all(&cdir);
+    let json_wide: Vec<u16> = cdir
+        .join("last_crash.json")
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let txt_wide: Vec<u16> = cdir
+        .join("last_crash.txt")
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let _ = SEH_CRASH_JSON_PATH_W.set(json_wide);
+    let _ = SEH_CRASH_TXT_PATH_W.set(txt_wide);
+
     #[repr(C)]
     struct ExceptionRecord {
         exception_code: u32,
@@ -415,46 +495,224 @@ fn install_windows_seh_filter() {
         exception_record: *mut ExceptionRecord,
         context_record: *mut core::ffi::c_void,
     }
+    #[repr(C)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
     type ExceptionFilterFn = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+
+    struct StackBuf<const N: usize> {
+        buf: [u8; N],
+        len: usize,
+    }
+
+    impl<const N: usize> StackBuf<N> {
+        const fn new() -> Self {
+            Self {
+                buf: [0u8; N],
+                len: 0,
+            }
+        }
+
+        fn push_bytes(&mut self, bytes: &[u8]) {
+            let mut i = 0;
+            while i < bytes.len() && self.len < N {
+                self.buf[self.len] = bytes[i];
+                self.len += 1;
+                i += 1;
+            }
+        }
+
+        fn push_hex_u32(&mut self, val: u32) {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let mut i = 0;
+            while i < 8 {
+                let shift = (7 - i) * 4;
+                let nib = ((val >> shift) & 0xF) as usize;
+                self.push_bytes(&[HEX[nib]]);
+                i += 1;
+            }
+        }
+
+        fn push_hex_u64(&mut self, val: u64) {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let mut i = 0;
+            while i < 16 {
+                let shift = (15 - i) * 4;
+                let nib = ((val >> shift) & 0xF) as usize;
+                self.push_bytes(&[HEX[nib]]);
+                i += 1;
+            }
+        }
+
+        fn push_dec_u64(&mut self, mut val: u64) {
+            let mut tmp = [0u8; 20];
+            let mut n = 0usize;
+            if val == 0 {
+                self.push_bytes(b"0");
+                return;
+            }
+            while val > 0 && n < tmp.len() {
+                tmp[n] = b'0' + (val % 10) as u8;
+                val /= 10;
+                n += 1;
+            }
+            while n > 0 {
+                n -= 1;
+                self.push_bytes(&[tmp[n]]);
+            }
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
         fn SetUnhandledExceptionFilter(filter: ExceptionFilterFn) -> *mut core::ffi::c_void;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn GetCurrentProcessId() -> u32;
+        fn GetSystemTimeAsFileTime(lp_system_time_as_file_time: *mut FileTime);
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn WriteFile(
+            h_file: *mut core::ffi::c_void,
+            lp_buffer: *const u8,
+            n_number_of_bytes_to_write: u32,
+            lp_number_of_bytes_written: *mut u32,
+            lp_overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+        fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+        fn TerminateProcess(h_process: *mut core::ffi::c_void, u_exit_code: u32) -> i32;
     }
 
+    unsafe fn write_raw_file_w(path_w: *const u16, data: &[u8]) {
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const CREATE_ALWAYS: u32 = 2;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        let invalid_handle = (-1isize) as *mut core::ffi::c_void;
+
+        let handle = CreateFileW(
+            path_w,
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            core::ptr::null_mut(),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        );
+        if handle.is_null() || handle == invalid_handle {
+            return;
+        }
+        let mut written: u32 = 0;
+        let _ = WriteFile(
+            handle,
+            data.as_ptr(),
+            data.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        );
+        let _ = CloseHandle(handle);
+    }
+
+    static SEH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+    // Strictly async/SEH-safe handler: reentrancy-guarded, zero heap allocations, zero `cef.log`
+    // reads, and zero Win32 GUI message loop (`GetMessageW`). Writes minimal crash markers via
+    // fixed stack buffers & raw Win32 file APIs and terminates cleanly; recovery UI displays on
+    // the next Singularity launch.
     unsafe extern "system" fn seh_handler(ptrs: *mut ExceptionPointers) -> i32 {
         const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
         let (code, addr) = if !ptrs.is_null() && !(*ptrs).exception_record.is_null() {
             let rec = &*(*ptrs).exception_record;
-            (rec.exception_code, rec.exception_address as usize)
+            (rec.exception_code, rec.exception_address as usize as u64)
         } else {
-            (0, 0)
+            (0u32, 0u64)
         };
-        let code_name = match code {
-            0xC000_0005 => "EXCEPTION_ACCESS_VIOLATION",
-            0xC000_00FD => "EXCEPTION_STACK_OVERFLOW",
-            0xC000_001D => "EXCEPTION_ILLEGAL_INSTRUCTION",
-            0xC000_0094 => "EXCEPTION_INT_DIVIDE_BY_ZERO",
-            0xC000_0374 => "STATUS_HEAP_CORRUPTION",
-            0xC000_0409 => "STATUS_STACK_BUFFER_OVERRUN",
-            _ => "WINDOWS_SEH_EXCEPTION",
-        };
-        let summary = format!("{} (0x{:08X}) at 0x{:016X}", code_name, code, addr);
-        let details = format!(
-            "Exception Code : 0x{:08X} ({})\nFault Address  : 0x{:016X}\nPID            : {}",
-            code,
-            code_name,
-            addr,
-            std::process::id()
-        );
-        if let Some(root) = CRASH_ROAMING_ROOT.get() {
-            let report = build_report(root, "windows_seh_exception", &summary, &details);
-            save_crash_report_to_disk(root, &report);
-            show_native_crash_dialog(
-                "Singularity — Crash Report / Rapport d'erreur",
-                &report.format_copyable_text(),
-            );
+        let exit_code = if code != 0 { code } else { 1 };
+        if SEH_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            let _ = TerminateProcess(GetCurrentProcess(), exit_code);
+            return EXCEPTION_EXECUTE_HANDLER;
         }
+
+        let code_name: &[u8] = match code {
+            0xC000_0005 => b"EXCEPTION_ACCESS_VIOLATION",
+            0xC000_00FD => b"EXCEPTION_STACK_OVERFLOW",
+            0xC000_001D => b"EXCEPTION_ILLEGAL_INSTRUCTION",
+            0xC000_0094 => b"EXCEPTION_INT_DIVIDE_BY_ZERO",
+            0xC000_0374 => b"STATUS_HEAP_CORRUPTION",
+            0xC000_0409 => b"STATUS_STACK_BUFFER_OVERRUN",
+            _ => b"WINDOWS_SEH_EXCEPTION",
+        };
+        let pid = GetCurrentProcessId();
+        let mut ft = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        GetSystemTimeAsFileTime(&mut ft);
+        let ticks_100ns = ((ft.dw_high_date_time as u64) << 32) | (ft.dw_low_date_time as u64);
+        const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+        let ts_unix = ticks_100ns.saturating_sub(WINDOWS_TO_UNIX_EPOCH_100NS) / 10_000_000;
+
+        if let Some(json_path) = SEH_CRASH_JSON_PATH_W.get() {
+            let mut jbuf = StackBuf::<1024>::new();
+            jbuf.push_bytes(b"{\"id\":\"seh-");
+            jbuf.push_dec_u64(pid as u64);
+            jbuf.push_bytes(b"-");
+            jbuf.push_hex_u32(code);
+            jbuf.push_bytes(b"\",\"timestamp_unix\":");
+            jbuf.push_dec_u64(ts_unix);
+            jbuf.push_bytes(b",\"version\":\"");
+            jbuf.push_bytes(env!("CARGO_PKG_VERSION").as_bytes());
+            jbuf.push_bytes(b"\",\"os_arch\":\"windows-");
+            jbuf.push_bytes(std::env::consts::ARCH.as_bytes());
+            jbuf.push_bytes(b"\",\"kind\":\"windows_seh_exception\",\"summary\":\"");
+            jbuf.push_bytes(code_name);
+            jbuf.push_bytes(b" (0x");
+            jbuf.push_hex_u32(code);
+            jbuf.push_bytes(b") at 0x");
+            jbuf.push_hex_u64(addr);
+            jbuf.push_bytes(b"\",\"details\":\"Exception Code : 0x");
+            jbuf.push_hex_u32(code);
+            jbuf.push_bytes(b" (");
+            jbuf.push_bytes(code_name);
+            jbuf.push_bytes(b")\\nFault Address  : 0x");
+            jbuf.push_hex_u64(addr);
+            jbuf.push_bytes(b"\\nPID            : ");
+            jbuf.push_dec_u64(pid as u64);
+            jbuf.push_bytes(b"\",\"cef_log_tail\":\"\",\"acknowledged\":false}\n");
+            write_raw_file_w(json_path.as_ptr(), jbuf.as_slice());
+        }
+
+        if let Some(txt_path) = SEH_CRASH_TXT_PATH_W.get() {
+            let mut tbuf = StackBuf::<512>::new();
+            tbuf.push_bytes(b"=== SINGULARITY BROWSER CRASH REPORT (SEH) ===\nVersion   : v");
+            tbuf.push_bytes(env!("CARGO_PKG_VERSION").as_bytes());
+            tbuf.push_bytes(b"\nTimestamp : ");
+            tbuf.push_dec_u64(ts_unix);
+            tbuf.push_bytes(b"\nException : 0x");
+            tbuf.push_hex_u32(code);
+            tbuf.push_bytes(b" (");
+            tbuf.push_bytes(code_name);
+            tbuf.push_bytes(b")\nAddress   : 0x");
+            tbuf.push_hex_u64(addr);
+            tbuf.push_bytes(b"\nPID       : ");
+            tbuf.push_dec_u64(pid as u64);
+            tbuf.push_bytes(b"\n==============================================\n");
+            write_raw_file_w(txt_path.as_ptr(), tbuf.as_slice());
+        }
+
+        let _ = TerminateProcess(GetCurrentProcess(), exit_code);
         EXCEPTION_EXECUTE_HANDLER
     }
 
@@ -464,7 +722,7 @@ fn install_windows_seh_filter() {
 }
 
 /// Displays a pure native Win32 modal Crash Report window with a selectable read-only error box
-/// and a 1-click "Copier l'erreur / Copy Error" button. Works even if Chromium/CEF itself crashed!
+/// and a 1-click "Copy Error / Copier l'erreur" button. Works even if Chromium/CEF itself crashed!
 #[cfg(target_os = "windows")]
 pub fn show_native_crash_dialog(title: &str, report_text: &str) {
     use std::cell::RefCell;
@@ -599,7 +857,7 @@ pub fn show_native_crash_dialog(title: &str, report_text: &str) {
                         DIALOG_COPY_BTN.with(|b| {
                             let btn = *b.borrow();
                             if !btn.is_null() {
-                                let label = wide("Copié ! / Copied!");
+                                let label = wide("Copied! / Copié !");
                                 let _ = SetWindowTextW(btn, label.as_ptr());
                             }
                         });
@@ -690,16 +948,18 @@ pub fn show_native_crash_dialog(title: &str, report_text: &str) {
         );
 
         let static_cls = wide("STATIC");
-        let hdr_txt = wide("Singularity a rencontré une erreur. Copiez ce rapport pour l'envoyer :");
+        let hdr_txt = wide(
+            "Singularity encountered an error — copy this report / Erreur détectée — copiez ce rapport :",
+        );
         let hdr = CreateWindowExW(
             0,
             static_cls.as_ptr(),
             hdr_txt.as_ptr(),
             WS_CHILD | WS_VISIBLE,
             16,
-            14,
+            12,
             632,
-            24,
+            28,
             hwnd,
             core::ptr::null_mut(),
             hinst,
@@ -717,9 +977,9 @@ pub fn show_native_crash_dialog(title: &str, report_text: &str) {
             body_w.as_ptr(),
             WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             16,
-            42,
+            44,
             632,
-            360,
+            358,
             hwnd,
             core::ptr::null_mut(),
             hinst,
@@ -733,7 +993,7 @@ pub fn show_native_crash_dialog(title: &str, report_text: &str) {
         }
 
         let btn_cls = wide("BUTTON");
-        let copy_txt = wide("Copier l'erreur / Copy Error");
+        let copy_txt = wide("Copy Error / Copier l'erreur");
         let btn_copy = CreateWindowExW(
             0,
             btn_cls.as_ptr(),
@@ -753,7 +1013,7 @@ pub fn show_native_crash_dialog(title: &str, report_text: &str) {
         }
         DIALOG_COPY_BTN.with(|b| *b.borrow_mut() = btn_copy);
 
-        let close_txt = wide("Fermer / Close");
+        let close_txt = wide("Close / Fermer");
         let btn_close = CreateWindowExW(
             0,
             btn_cls.as_ptr(),

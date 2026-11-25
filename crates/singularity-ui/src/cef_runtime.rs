@@ -27,13 +27,20 @@ use cef::*;
 use singularity_core::{FilterDecision, NetworkResourceType};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const WINDOWS_TO_UNIX_EPOCH_US: i64 = 11_644_473_600_000_000;
 const IPC_MESSAGE_NAME: &str = "sg_ipc";
+const LEGACY_IPC_MESSAGE_NAME: &str = "singularity_ipc";
+
+fn monotonic_millis() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = START.get_or_init(std::time::Instant::now);
+    (epoch.elapsed().as_millis() as u64).saturating_add(1)
+}
 
 #[link(name = "user32")]
 extern "system" {
@@ -190,6 +197,7 @@ pub type CefDownloadResolver = Arc<dyn Fn(&str, &str) -> (PathBuf, String) + Sen
 #[derive(Clone, Default)]
 struct RendererBrowserConfig {
     is_ui: bool,
+    ui_port: u16,
     init_script: String,
     resume_script: String,
 }
@@ -203,65 +211,371 @@ fn cef_str_userfree(s: CefStringUserfree) -> String {
     CefString::from(&s).to_string()
 }
 
-fn parse_http_host_port(url: &str) -> Option<(String, u16)> {
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
+    if starts_with_ignore_ascii_case(haystack, prefix) {
+        Some(&haystack[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Strictly validates that `url` is on the exact local UI shell origin `http://127.0.0.1:<ui_port>`.
+fn is_exact_local_ui_origin(url: &str, ui_port: u16) -> bool {
+    if ui_port == 0 {
+        return false;
+    }
     let trimmed = url.trim();
-    let (default_port, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b < 0x20 || b == 0x7F || b == b'\\') {
+        return false;
+    }
+    let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "http://") else {
+        return false;
+    };
+    let expected_authority = format!("127.0.0.1:{ui_port}");
+    let Some(after_auth) = rest.strip_prefix(&expected_authority) else {
+        return false;
+    };
+    after_auth.is_empty()
+        || after_auth.starts_with('/')
+        || after_auth.starts_with('?')
+        || after_auth.starts_with('#')
+}
+
+fn parse_http_or_ws_host_port(url: &str, allow_ws: bool) -> Option<(String, u16)> {
+    // Reject C0/DEL control bytes anywhere in the URL (prevents browser stripping bypasses like `ht\ttp://`).
+    if url.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return None;
+    }
+    let trimmed = url.trim();
+    let (default_port, rest) = if let Some(r) = strip_prefix_ignore_ascii_case(trimmed, "https://")
+    {
         (443u16, r)
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
+    } else if let Some(r) = strip_prefix_ignore_ascii_case(trimmed, "http://") {
         (80u16, r)
+    } else if allow_ws {
+        if let Some(r) = strip_prefix_ignore_ascii_case(trimmed, "wss://") {
+            (443u16, r)
+        } else if let Some(r) = strip_prefix_ignore_ascii_case(trimmed, "ws://") {
+            (80u16, r)
+        } else {
+            return None;
+        }
     } else {
         return None;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
+
+    // Chromium/WHATWG treats `\` identically to `/` as an authority terminator for special schemes.
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.bytes().any(|b| b.is_ascii_whitespace()) {
         return None;
     }
-    if let Some(after_open) = authority.strip_prefix('[') {
+
+    // Per WHATWG URL spec, if userinfo is present, the effective host:port follows the LAST `@`.
+    let hostport = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    if hostport.is_empty() {
+        return None;
+    }
+
+    if let Some(after_open) = hostport.strip_prefix('[') {
         let (host, tail) = after_open.split_once(']')?;
-        let port = if let Some(p) = tail.strip_prefix(':') {
-            p.parse::<u16>().ok()?
-        } else if tail.is_empty() {
+        if host.is_empty()
+            || host.contains('[')
+            || host.contains(']')
+            || host.contains('%')
+            || host.parse::<Ipv6Addr>().is_err()
+        {
+            return None;
+        }
+        let port = if tail.is_empty() || tail == ":" {
             default_port
+        } else if let Some(p) = tail.strip_prefix(':') {
+            if !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let parsed = p.parse::<u16>().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            parsed
         } else {
             return None;
         };
         return Some((host.to_ascii_lowercase(), port));
     }
-    if let Some((host, p)) = authority.rsplit_once(':') {
-        let port = p.parse::<u16>().ok()?;
-        Some((host.to_ascii_lowercase(), port))
-    } else {
-        Some((authority.to_ascii_lowercase(), default_port))
+
+    if hostport.contains('[') || hostport.contains(']') {
+        return None;
     }
+
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => {
+            if p.contains(':') {
+                // Reject unbracketed IPv6 or double-port ambiguity.
+                return None;
+            }
+            let port = if p.is_empty() {
+                default_port
+            } else {
+                if !p.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let parsed = p.parse::<u16>().ok()?;
+                if parsed == 0 {
+                    return None;
+                }
+                parsed
+            };
+            (h, port)
+        }
+        None => (hostport, default_port),
+    };
+
+    // Reject empty or percent-encoded/ambiguous hostnames (Chromium percent-decodes host labels).
+    if host.is_empty() || host.contains('%') || host.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port))
 }
 
-fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
-    let lower = nav_url.trim().to_ascii_lowercase();
-    if lower.starts_with("file:") {
-        return true;
+fn parse_http_host_port(url: &str) -> Option<(String, u16)> {
+    parse_http_or_ws_host_port(url, false)
+}
+
+fn parse_whatwg_ipv4_part(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
     }
-    if let Some((host, port)) = parse_http_host_port(nav_url) {
-        if port == bind_port {
-            let h = host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .trim_end_matches('.');
-            let is_local = h == "localhost"
-                || h.ends_with(".localhost")
-                || h.starts_with("127.")
-                || h == "::1"
-                || h == "0.0.0.0"
-                || h.starts_with("0x")
-                || h.chars().all(|c| c.is_ascii_digit())
-                || h.parse::<IpAddr>()
-                    .map(|ip| ip.is_loopback() || ip.is_unspecified())
-                    .unwrap_or(false);
-            if is_local {
-                return true;
-            }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        if hex.is_empty() {
+            return Some(0);
+        }
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.starts_with('0') {
+        if !part.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return None;
+        }
+        return u64::from_str_radix(part, 8).ok();
+    }
+    if !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse::<u64>().ok()
+}
+
+/// Parses WHATWG / POSIX `inet_aton` IPv4 representations including 1..4 dot-separated parts
+/// and decimal, octal (`0177.0.0.1`), and hexadecimal (`0x7f000001`, `0x7f.1`) encodings.
+fn parse_whatwg_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let trimmed = host.trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut nums = Vec::with_capacity(parts.len());
+    for part in &parts {
+        nums.push(parse_whatwg_ipv4_part(part)?);
+    }
+    let last_idx = nums.len() - 1;
+    for &n in &nums[..last_idx] {
+        if n > 255 {
+            return None;
         }
     }
+    let last_limit: u64 = 1u64 << (8 * (5 - nums.len()));
+    if nums[last_idx] >= last_limit {
+        return None;
+    }
+    let val: u32 = match nums.len() {
+        1 => nums[0] as u32,
+        2 => ((nums[0] as u32) << 24) | (nums[1] as u32),
+        3 => ((nums[0] as u32) << 24) | ((nums[1] as u32) << 16) | (nums[2] as u32),
+        4 => {
+            ((nums[0] as u32) << 24)
+                | ((nums[1] as u32) << 16)
+                | ((nums[2] as u32) << 8)
+                | (nums[3] as u32)
+        }
+        _ => return None,
+    };
+    Some(Ipv4Addr::from(val))
+}
+
+fn is_local_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || ip.octets()[0] == 0
+}
+
+fn is_local_or_ambiguous_host(host: &str) -> bool {
+    // Normalize IDNA fullwidth dot separators to ASCII `.` so `localhost。` cannot slip past.
+    let normalized = host
+        .replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    if normalized == "localhost" || normalized.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(v6) = normalized.parse::<Ipv6Addr>() {
+        let segs = v6.segments();
+        // Block loopback `::1`, unspecified `::`, entire IPv4-mapped `::ffff:0.0.0.0/96`,
+        // and deprecated IPv4-compatible `::0.0.0.0/96`.
+        let is_ipv4_mapped_prefix = segs[0] == 0
+            && segs[1] == 0
+            && segs[2] == 0
+            && segs[3] == 0
+            && segs[4] == 0
+            && segs[5] == 0xffff;
+        let is_ipv4_compat_prefix =
+            segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0;
+        return v6.is_loopback()
+            || v6.is_unspecified()
+            || is_ipv4_mapped_prefix
+            || is_ipv4_compat_prefix
+            || v6.to_ipv4_mapped().is_some_and(is_local_ipv4)
+            || v6.to_ipv4().is_some_and(is_local_ipv4);
+    }
+    if normalized.contains(':') {
+        // Malformed IPv6 literal: fail closed.
+        return true;
+    }
+    if let Some(v4) = parse_whatwg_ipv4(&normalized) {
+        return is_local_ipv4(v4);
+    }
+    // Fail closed if all labels look numeric/octal/hex (ambiguous IPv4-like literal).
+    let looks_numeric = normalized.split('.').all(|part| {
+        !part.is_empty()
+            && (part.bytes().all(|b| b.is_ascii_digit())
+                || part
+                    .strip_prefix("0x")
+                    .or_else(|| part.strip_prefix("0X"))
+                    .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())))
+    });
+    if looks_numeric {
+        return true;
+    }
     false
+}
+
+/// Fail-closed guard preventing untrusted web content from reaching `file://` or the local
+/// Singularity UI/IPC HTTP server on `bind_port` via scheme/encoding/IP obfuscation.
+fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
+    if nav_url.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return true;
+    }
+    let mut current = nav_url.trim();
+    if current.is_empty() {
+        return true;
+    }
+
+    // Unwrap nested wrapper schemes (`view-source:`, `blob:`, `filesystem:`) with a strict depth bound.
+    for _ in 0..8 {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(current, "view-source:") {
+            current = rest.trim();
+            if current.is_empty() {
+                return true;
+            }
+            continue;
+        }
+        if let Some(rest) = strip_prefix_ignore_ascii_case(current, "blob:") {
+            let trimmed_rest = rest.trim();
+            if trimmed_rest.is_empty() {
+                return true;
+            }
+            // Standard opaque-origin Blob URL (`blob:null/<uuid>`) cannot target local IPC or files.
+            if starts_with_ignore_ascii_case(trimmed_rest, "null/") {
+                return false;
+            }
+            current = trimmed_rest;
+            continue;
+        }
+        if let Some(rest) = strip_prefix_ignore_ascii_case(current, "filesystem:") {
+            current = rest.trim();
+            if current.is_empty() {
+                return true;
+            }
+            continue;
+        }
+        break;
+    }
+
+    // Excessively nested wrapper schemes -> fail closed.
+    if starts_with_ignore_ascii_case(current, "view-source:")
+        || starts_with_ignore_ascii_case(current, "blob:")
+        || starts_with_ignore_ascii_case(current, "filesystem:")
+    {
+        return true;
+    }
+
+    // Always block `file:` (including `FILE:///`, `file:/`, `view-source:file://...`).
+    if starts_with_ignore_ascii_case(current, "file:") {
+        return true;
+    }
+
+    // Scheme-relative URLs (`//127.0.0.1:PORT/...`) -> inspect as HTTP, fail closed if malformed.
+    if current.starts_with("//") {
+        let synthetic = format!("http:{current}");
+        return match parse_http_or_ws_host_port(&synthetic, false) {
+            Some((host, port)) => port == bind_port && is_local_or_ambiguous_host(&host),
+            None => true,
+        };
+    }
+
+    // Validate scheme syntax before first `:`. Missing or invalid scheme -> fail closed.
+    let Some((scheme, after_colon)) = current.split_once(':') else {
+        return true;
+    };
+    let valid_scheme = !scheme.is_empty()
+        && scheme.as_bytes()[0].is_ascii_alphabetic()
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    if !valid_scheme {
+        return true;
+    }
+
+    let scheme_lower = scheme.to_ascii_lowercase();
+    match scheme_lower.as_str() {
+        "http" | "https" | "ws" | "wss" => {
+            // Require strict `://` (reject ambiguous `http:127.0.0.1`, `http:/host`, `http:\\host`).
+            if !after_colon.starts_with("//") {
+                return true;
+            }
+            match parse_http_or_ws_host_port(current, true) {
+                Some((host, port)) => port == bind_port && is_local_or_ambiguous_host(&host),
+                None => true, // Fail closed on any malformed/ambiguous HTTP(S)/WS(S) URL.
+            }
+        }
+        "about" => !(current.eq_ignore_ascii_case("about:blank")
+            || current.eq_ignore_ascii_case("about:srcdoc")),
+        "data" | "javascript" | "chrome-extension" | "mailto" | "tel" => false,
+        _ => {
+            // For other authority-bearing schemes (e.g. `ftp://`), block if targeting local bind_port.
+            if let Some(after_slashes) = after_colon.strip_prefix("//") {
+                let synthetic = format!("http://{after_slashes}");
+                return match parse_http_or_ws_host_port(&synthetic, false) {
+                    Some((host, port)) => port == bind_port && is_local_or_ambiguous_host(&host),
+                    None => true,
+                };
+            }
+            false
+        }
+    }
 }
 
 fn collect_enabled_extension_dirs(extensions_dir: &Path) -> Vec<PathBuf> {
@@ -304,11 +618,34 @@ wrap_v8_handler! {
             if !payload.is_empty() && payload.len() <= 262_144 {
                 if let Some(ctx) = v8_context_get_current_context() {
                     if let Some(frame) = ctx.frame() {
-                        if let Some(mut msg) = process_message_create(Some(&CefString::from(IPC_MESSAGE_NAME))) {
-                            if let Some(args) = msg.argument_list() {
-                                let _ = args.set_string(0, Some(&CefString::from(payload.as_str())));
+                        let is_main = frame.is_main() != 0;
+                        let frame_url = cef_str_userfree(frame.url());
+                        let authorized = is_main
+                            && frame
+                                .browser()
+                                .map(|b| {
+                                    RENDERER_CONFIGS.with(|map| {
+                                        map.borrow()
+                                            .get(&b.identifier())
+                                            .is_some_and(|cfg| {
+                                                cfg.is_ui
+                                                    && is_exact_local_ui_origin(
+                                                        &frame_url,
+                                                        cfg.ui_port,
+                                                    )
+                                            })
+                                    })
+                                })
+                                .unwrap_or(false);
+                        if authorized {
+                            if let Some(mut msg) =
+                                process_message_create(Some(&CefString::from(IPC_MESSAGE_NAME)))
+                            {
+                                if let Some(args) = msg.argument_list() {
+                                    let _ = args.set_string(0, Some(&CefString::from(payload.as_str())));
+                                }
+                                frame.send_process_message(ProcessId::BROWSER, Some(&mut msg));
                             }
-                            frame.send_process_message(ProcessId::BROWSER, Some(&mut msg));
                         }
                     }
                 }
@@ -339,6 +676,13 @@ wrap_render_process_handler! {
                 let k_ui = CefString::from("is_ui");
                 if info.has_key(Some(&k_ui)) != 0 {
                     cfg.is_ui = info.bool(Some(&k_ui)) != 0;
+                }
+                let k_ui_port = CefString::from("ui_port");
+                if info.has_key(Some(&k_ui_port)) != 0 {
+                    let raw_port = info.int(Some(&k_ui_port));
+                    if (1..=u16::MAX as i32).contains(&raw_port) {
+                        cfg.ui_port = raw_port as u16;
+                    }
                 }
                 let k_init = CefString::from("init_script");
                 if info.has_key(Some(&k_init)) != 0 {
@@ -373,6 +717,7 @@ wrap_render_process_handler! {
                 return;
             };
             let is_main = frame.is_main() != 0;
+            let frame_url = cef_str_userfree(frame.url());
             let cfg = RENDERER_CONFIGS.with(|map| {
                 map.borrow()
                     .get(&browser.identifier())
@@ -380,14 +725,17 @@ wrap_render_process_handler! {
                     .unwrap_or_default()
             });
 
-            // Expose `window.ipc.postMessage(payload)` natively via V8 on main frame (and subframes
-            // for content pages so global shortcuts like Ctrl+T / F11 work inside embedded iframes).
-            if is_main || !cfg.is_ui {
+            // SECURITY (N4 #4): Expose `window.ipc.postMessage(payload)` EXCLUSIVELY to the main
+            // frame of the local Singularity UI shell on exact origin `http://127.0.0.1:<ui_port>`.
+            // NEVER expose `window.ipc` to web pages (`!cfg.is_ui`) or any iframe!
+            if cfg.is_ui && is_main && is_exact_local_ui_origin(&frame_url, cfg.ui_port) {
                 if let Some(global) = context.global() {
                     if let Some(mut ipc_obj) = v8_value_create_object(None, None) {
                         let mut handler = SingularityIpcV8Handler::new();
                         let fn_name = CefString::from("postMessage");
-                        if let Some(mut post_fn) = v8_value_create_function(Some(&fn_name), Some(&mut handler)) {
+                        if let Some(mut post_fn) =
+                            v8_value_create_function(Some(&fn_name), Some(&mut handler))
+                        {
                             let _ = ipc_obj.set_value_bykey(
                                 Some(&fn_name),
                                 Some(&mut post_fn),
@@ -487,9 +835,6 @@ wrap_app! {
                 "disable-domain-reliability",
                 "disable-breakpad",
                 "disable-default-apps",
-                "disable-client-side-phishing-detection",
-                "safebrowsing-disable-download-protection",
-                "disable-extensions-file-access-check",
                 "no-first-run",
                 "no-default-browser-check",
                 "force-dark-mode",
@@ -554,6 +899,77 @@ wrap_app! {
     }
 }
 
+#[cfg(singularity_cef_sandbox)]
+extern "C" {
+    fn cef_sandbox_info_create() -> *mut core::ffi::c_void;
+    fn cef_sandbox_info_destroy(sandbox_info: *mut core::ffi::c_void);
+}
+
+fn is_unsafe_no_sandbox_opt_out() -> bool {
+    let env_requested = std::env::var("SINGULARITY_ALLOW_UNSAFE_NO_SANDBOX")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    #[cfg(debug_assertions)]
+    {
+        env_requested
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        if env_requested {
+            eprintln!(
+                "[singularity-cef] SECURITY WARNING: SINGULARITY_ALLOW_UNSAFE_NO_SANDBOX=1 is ignored in release builds."
+            );
+        }
+        false
+    }
+}
+
+/// RAII wrapper for CEF's Windows `SandboxInfo` (`cef_sandbox_info_create`/`cef_sandbox_info_destroy`).
+struct ScopedCefSandboxInfo {
+    ptr: *mut core::ffi::c_void,
+}
+
+impl ScopedCefSandboxInfo {
+    fn new(disable_sandbox: bool) -> Self {
+        if disable_sandbox {
+            return Self {
+                ptr: std::ptr::null_mut(),
+            };
+        }
+        #[cfg(singularity_cef_sandbox)]
+        {
+            let ptr = unsafe { cef_sandbox_info_create() };
+            Self { ptr }
+        }
+        #[cfg(not(singularity_cef_sandbox))]
+        {
+            Self {
+                ptr: std::ptr::null_mut(),
+            }
+        }
+    }
+
+    fn as_cef_ptr(&self) -> *mut u8 {
+        self.ptr.cast::<u8>()
+    }
+
+    fn is_active(&self) -> bool {
+        !self.ptr.is_null()
+    }
+}
+
+impl Drop for ScopedCefSandboxInfo {
+    fn drop(&mut self) {
+        #[cfg(singularity_cef_sandbox)]
+        if !self.ptr.is_null() {
+            unsafe {
+                cef_sandbox_info_destroy(self.ptr);
+            }
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
 /// MUST be called at the very entry of `main()` on Windows when `--type=...` is present.
 /// Executes the Chromium subprocess (`renderer`, `gpu-process`, `utility`, etc.) cleanly via
 /// CEF's native Win32 command-line parser (avoiding `Args::as_cmd_line()`, which loses quoting
@@ -569,7 +985,13 @@ pub fn maybe_run_cef_subprocess() -> Option<i32> {
         None,
         None,
     );
-    let ret = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+    let disable_sandbox = is_unsafe_no_sandbox_opt_out();
+    let sandbox_info = ScopedCefSandboxInfo::new(disable_sandbox);
+    let ret = execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        sandbox_info.as_cef_ptr(),
+    );
     if ret >= 0 {
         Some(ret)
     } else {
@@ -619,8 +1041,24 @@ impl CefRuntimeGuard {
             let _ = std::fs::create_dir_all(parent);
         }
 
+        let disable_sandbox = is_unsafe_no_sandbox_opt_out();
+        let sandbox_info = ScopedCefSandboxInfo::new(disable_sandbox);
+        let no_sandbox_flag: ::std::os::raw::c_int = if disable_sandbox {
+            eprintln!(
+                "[singularity-cef] SECURITY WARNING: Chromium sandbox disabled via SINGULARITY_ALLOW_UNSAFE_NO_SANDBOX=1 (debug build)."
+            );
+            1
+        } else {
+            if !sandbox_info.is_active() {
+                eprintln!(
+                    "[singularity-cef] SECURITY WARNING: cef_sandbox.lib was not linked into this build; CEF 150 falls back to unsandboxed mode without cef_sandbox.lib or bootstrap.exe."
+                );
+            }
+            0
+        };
+
         let mut settings = Settings {
-            no_sandbox: 1,
+            no_sandbox: no_sandbox_flag,
             multi_threaded_message_loop: 0,
             external_message_pump: 1,
             windowless_rendering_enabled: 0,
@@ -653,7 +1091,7 @@ impl CefRuntimeGuard {
             Some(args.as_main_args()),
             Some(&settings),
             Some(&mut app),
-            std::ptr::null_mut(),
+            sandbox_info.as_cef_ptr(),
         );
         if ok == 0 {
             let code = get_exit_code();
@@ -752,17 +1190,63 @@ pub fn create_incognito_request_context() -> Option<RequestContext> {
 struct ClientConfig {
     is_ui: bool,
     is_ext_popup: bool,
+    is_standalone_popup: bool,
     tab_id: u64,
     bind_port: u16,
     sink: CefEventSink,
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
     download_resolver: CefDownloadResolver,
     downloads: Arc<Mutex<HashMap<u32, (String, String)>>>,
+    last_user_gesture_ms: Arc<AtomicU64>,
+    no_gesture_urls: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl ClientConfig {
+    fn record_user_gesture(&self) {
+        self.last_user_gesture_ms
+            .store(monotonic_millis(), Ordering::Release);
+    }
+
+    fn record_non_gesture_nav(&self, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        let now = monotonic_millis();
+        if let Ok(mut map) = self.no_gesture_urls.lock() {
+            if map.len() >= 64 {
+                map.retain(|_, ts| now.saturating_sub(*ts) < 15_000);
+            }
+            if map.len() >= 64 {
+                map.clear();
+            }
+            map.insert(url.to_string(), now);
+        }
+    }
+
+    fn has_verified_user_gesture(&self, url: &str, original_url: &str) -> bool {
+        const USER_GESTURE_WINDOW_MS: u64 = 5_000;
+        let now = monotonic_millis();
+        let last = self.last_user_gesture_ms.load(Ordering::Acquire);
+        if last == 0 || now.saturating_sub(last) > USER_GESTURE_WINDOW_MS {
+            return false;
+        }
+        if let Ok(mut map) = self.no_gesture_urls.lock() {
+            map.retain(|_, ts| now.saturating_sub(*ts) < 15_000);
+            let url_no_gesture = !url.is_empty()
+                && map.get(url).is_some_and(|&ts| ts >= last);
+            let orig_no_gesture = !original_url.is_empty()
+                && map.get(original_url).is_some_and(|&ts| ts >= last);
+            if url_no_gesture || orig_no_gesture {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 wrap_context_menu_handler! {
     struct SingularityContextMenuHandler {
-        disable_default_menu: bool,
+        cfg: ClientConfig,
     }
 
     impl ContextMenuHandler {
@@ -773,7 +1257,10 @@ wrap_context_menu_handler! {
             _params: Option<&mut ContextMenuParams>,
             model: Option<&mut MenuModel>,
         ) {
-            if self.disable_default_menu {
+            if !self.cfg.is_ui {
+                self.cfg.record_user_gesture();
+            }
+            if self.cfg.is_ui {
                 if let Some(m) = model {
                     let _ = m.clear();
                 }
@@ -815,6 +1302,9 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             OPEN_CEF_BROWSERS.fetch_add(1, Ordering::AcqRel);
+            if self.cfg.is_standalone_popup {
+                return;
+            }
             let hwnd = browser
                 .and_then(|b| b.host())
                 .map(|h| h.window_handle().0 as isize)
@@ -849,28 +1339,53 @@ wrap_life_span_handler! {
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
-            _user_gesture: ::std::os::raw::c_int,
+            user_gesture: ::std::os::raw::c_int,
             popup_features: Option<&PopupFeatures>,
             _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
+            client: Option<&mut Option<Client>>,
             _settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
+            if user_gesture != 0 {
+                self.cfg.record_user_gesture();
+            }
             let url = target_url.map(CefString::to_string).unwrap_or_default();
             let is_explicit_popup = popup_features
                 .map(|f| f.is_popup != 0 || f.width_set != 0 || f.height_set != 0)
                 .unwrap_or(false);
             if self.cfg.is_ext_popup {
-                if url.starts_with("chrome-extension://") {
+                if starts_with_ignore_ascii_case(&url, "chrome-extension://") {
                     return 0;
                 }
                 if is_explicit_popup
                     && parse_http_host_port(&url).is_some()
                     && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
                 {
-                    // Allow OAuth/SSO popup dialogs opened from Chrome extension popups so
-                    // `window.opener` handoffs complete cleanly without logging extensions out.
+                    // SECURITY (N3 #27): Allow OAuth/SSO popup dialogs opened from Chrome extension
+                    // popups so `window.opener` handoffs complete cleanly, BUT attach a fresh client
+                    // with `is_ext_popup: false` so `ResourceRequestHandler` (adblocker + local IPC
+                    // guard) stays fully enforced on the external web popup!
+                    if let Some(client_slot) = client {
+                        let popup_cfg = ClientConfig {
+                            is_ui: false,
+                            is_ext_popup: false,
+                            is_standalone_popup: true,
+                            tab_id: 0,
+                            bind_port: self.cfg.bind_port,
+                            sink: Arc::clone(&self.cfg.sink),
+                            shared_shell: Arc::clone(&self.cfg.shared_shell),
+                            download_resolver: Arc::clone(&self.cfg.download_resolver),
+                            downloads: Arc::new(Mutex::new(HashMap::new())),
+                            last_user_gesture_ms: Arc::new(AtomicU64::new(if user_gesture != 0 {
+                                monotonic_millis()
+                            } else {
+                                0
+                            })),
+                            no_gesture_urls: Arc::new(Mutex::new(HashMap::new())),
+                        };
+                        *client_slot = Some(SingularityCefClient::new(popup_cfg));
+                    }
                     return 0;
                 }
             }
@@ -886,8 +1401,8 @@ wrap_life_span_handler! {
         }
 
         fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
-            if self.cfg.is_ext_popup {
-                return 0; // Closing an extension popup SHOULD close its own tiny popup window.
+            if self.cfg.is_ext_popup || self.cfg.is_standalone_popup {
+                return 0; // Closing an extension/OAuth popup SHOULD close its own popup window.
             }
             // CRITICAL: On Windows, returning 0 from `do_close()` for an embedded WS_CHILD browser
             // causes CEF to post `WM_CLOSE` to the top-level parent `tao` window, closing the ENTIRE
@@ -924,7 +1439,9 @@ wrap_display_handler! {
                 return;
             }
             let u = url.map(CefString::to_string).unwrap_or_default();
-            if u.starts_with("https://") || u.starts_with("http://") {
+            if starts_with_ignore_ascii_case(&u, "https://")
+                || starts_with_ignore_ascii_case(&u, "http://")
+            {
                 (self.cfg.sink)(CefCallbackEvent::AddressChanged {
                     tab_id: self.cfg.tab_id,
                     url: u,
@@ -963,15 +1480,27 @@ wrap_display_handler! {
             }
             let count = unsafe { sys::cef_string_list_size(raw_ptr) };
             for i in 0..count.min(8) {
-                let mut val = unsafe { std::mem::zeroed() };
+                let mut val: sys::cef_string_t = unsafe { std::mem::zeroed() };
                 if unsafe { sys::cef_string_list_value(raw_ptr, i, &mut val) } > 0 {
                     let href = CefString::from(std::ptr::from_ref(&val)).to_string();
-                    if href.len() <= 512 && parse_http_host_port(&href).is_some() {
+                    // SECURITY/MEM (N3 #36): `cef_string_list_value` allocates a UTF-16 copy
+                    // with a destructor; always clear it immediately after extracting to `String`.
+                    unsafe {
+                        sys::cef_string_utf16_clear(&mut val);
+                    }
+                    if href.len() <= 512
+                        && parse_http_host_port(&href).is_some()
+                        && !is_blocked_local_ipc_url(&href, self.cfg.bind_port)
+                    {
                         (self.cfg.sink)(CefCallbackEvent::FaviconChanged {
                             tab_id: self.cfg.tab_id,
                             favicon_url: href,
                         });
                         break;
+                    }
+                } else {
+                    unsafe {
+                        sys::cef_string_utf16_clear(&mut val);
                     }
                 }
             }
@@ -1217,7 +1746,7 @@ wrap_resource_request_handler! {
                 return ReturnValue::CONTINUE;
             };
             let url = cef_str_userfree(req.url());
-            if url.starts_with("chrome-extension://") {
+            if starts_with_ignore_ascii_case(&url, "chrome-extension://") {
                 return ReturnValue::CONTINUE;
             }
             if is_blocked_local_ipc_url(&url, self.cfg.bind_port) {
@@ -1231,7 +1760,7 @@ wrap_resource_request_handler! {
                 return ReturnValue::CONTINUE;
             };
             let first_party_url = cef_str_userfree(req.first_party_for_cookies());
-            if first_party_url.starts_with("chrome-extension://") {
+            if starts_with_ignore_ascii_case(&first_party_url, "chrome-extension://") {
                 return ReturnValue::CONTINUE;
             }
             let mut doc_host = parse_http_host_port(&first_party_url)
@@ -1242,7 +1771,7 @@ wrap_resource_request_handler! {
                     .and_then(|b| b.main_frame())
                     .map(|f| cef_str_userfree(f.url()))
                 {
-                    if main_url.starts_with("chrome-extension://") {
+                    if starts_with_ignore_ascii_case(&main_url, "chrome-extension://") {
                         return ReturnValue::CONTINUE;
                     }
                     if let Some((mh, _)) = parse_http_host_port(&main_url) {
@@ -1285,8 +1814,8 @@ wrap_request_handler! {
             _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             request: Option<&mut Request>,
-            _user_gesture: ::std::os::raw::c_int,
-            _is_redirect: ::std::os::raw::c_int,
+            user_gesture: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             if self.cfg.is_ui {
                 return 0;
@@ -1295,6 +1824,11 @@ wrap_request_handler! {
                 let url = cef_str_userfree(req.url());
                 if is_blocked_local_ipc_url(&url, self.cfg.bind_port) {
                     return 1; // Cancel navigation to local IPC port or file://
+                }
+                if user_gesture != 0 {
+                    self.cfg.record_user_gesture();
+                } else if is_redirect == 0 {
+                    self.cfg.record_non_gesture_nav(&url);
                 }
             }
             0
@@ -1306,8 +1840,11 @@ wrap_request_handler! {
             _frame: Option<&mut Frame>,
             target_url: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
-            _user_gesture: ::std::os::raw::c_int,
+            user_gesture: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
+            if user_gesture != 0 && !self.cfg.is_ui {
+                self.cfg.record_user_gesture();
+            }
             if self.cfg.is_ui || target_disposition == WindowOpenDisposition::CURRENT_TAB {
                 return 0;
             }
@@ -1358,6 +1895,83 @@ wrap_request_handler! {
     }
 }
 
+fn percent_decode_ascii_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(a), Some(b)) = (h1, h2) {
+                out.push(((a << 4) | b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_dangerous_download_name(name: &str) -> bool {
+    const DANGEROUS_EXTS: &[&str] = &[
+        ".exe", ".msi", ".msp", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
+        ".hta", ".scr", ".com", ".pif", ".lnk", ".dll", ".cpl", ".reg", ".jar", ".sh", ".appimage",
+    ];
+    let cleaned = name
+        .trim()
+        .trim_end_matches(|c: char| c == '.' || c.is_ascii_whitespace())
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+    DANGEROUS_EXTS.iter().any(|ext| cleaned.ends_with(ext))
+}
+
+fn is_dangerous_download_url(url: &str) -> bool {
+    let without_frag = url.split(['?', '#']).next().unwrap_or("");
+    let segment = without_frag
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("");
+    if segment.is_empty() {
+        return false;
+    }
+    is_dangerous_download_name(segment)
+        || is_dangerous_download_name(&percent_decode_ascii_lossy(segment))
+}
+
+fn is_dangerous_download_mime(mime: &str) -> bool {
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        m.as_str(),
+        "application/x-msdownload"
+            | "application/x-msdos-program"
+            | "application/x-dosexec"
+            | "application/x-msi"
+            | "application/x-sh"
+            | "application/x-shellscript"
+            | "application/x-bat"
+            | "application/x-csh"
+            | "application/java-archive"
+            | "application/hta"
+            | "application/x-powershell"
+            | "application/javascript"
+            | "application/x-javascript"
+            | "text/javascript"
+            | "application/x-vbscript"
+            | "text/vbscript"
+            | "application/x-ms-shortcut"
+    )
+}
+
 wrap_download_handler! {
     struct SingularityDownloadHandler {
         cfg: ClientConfig,
@@ -1367,10 +1981,15 @@ wrap_download_handler! {
         fn can_download(
             &self,
             _browser: Option<&mut Browser>,
-            _url: Option<&CefString>,
+            url: Option<&CefString>,
             _request_method: Option<&CefString>,
         ) -> ::std::os::raw::c_int {
-            1 // Always permit user downloads (.exe, .zip, .msi, etc.) without SmartScreen blocks
+            if let Some(u) = url.map(CefString::to_string) {
+                if !u.is_empty() && is_blocked_local_ipc_url(&u, self.cfg.bind_port) {
+                    return 0;
+                }
+            }
+            1
         }
 
         fn on_before_download(
@@ -1385,16 +2004,35 @@ wrap_download_handler! {
             };
             let dl_id = item.id();
             let uri = cef_str_userfree(item.url());
+            let orig_uri = cef_str_userfree(item.original_url());
+            let mime = cef_str_userfree(item.mime_type());
             let suggested = suggested_name
                 .map(CefString::to_string)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| cef_str_userfree(item.suggested_file_name()));
             let (dest_path, filename) = (self.cfg.download_resolver)(&suggested, &uri);
             let dest_str = dest_path.to_string_lossy().into_owned();
+            let dest_basename = dest_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            // SECURITY (N4 #6): Never silently drop potentially executable/dangerous payloads or
+            // drive-by downloads lacking a verified user gesture — force an explicit OS Save dialog.
+            let is_dangerous = is_dangerous_download_name(&suggested)
+                || is_dangerous_download_name(&filename)
+                || is_dangerous_download_name(dest_basename)
+                || is_dangerous_download_url(&uri)
+                || is_dangerous_download_url(&orig_uri)
+                || is_dangerous_download_mime(&mime);
+            let has_user_gesture = self.cfg.has_verified_user_gesture(&uri, &orig_uri);
+            let show_dialog: ::std::os::raw::c_int =
+                if is_dangerous || !has_user_gesture { 1 } else { 0 };
+
             if let Ok(mut map) = self.cfg.downloads.lock() {
                 map.insert(dl_id, (filename.clone(), dest_str.clone()));
             }
-            cb.cont(Some(&CefString::from(dest_str.as_str())), 0);
+            cb.cont(Some(&CefString::from(dest_str.as_str())), show_dialog);
             (self.cfg.sink)(CefCallbackEvent::DownloadStarted {
                 download_id: dl_id,
                 filename,
@@ -1457,54 +2095,161 @@ wrap_keyboard_handler! {
             _os_event: Option<&mut sys::MSG>,
             _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
-            if self.cfg.is_ext_popup {
-                return 0;
-            }
             let Some(ev) = event else {
                 return 0;
             };
             if ev.type_ != KeyEventType::RAWKEYDOWN {
                 return 0;
             }
+            if !self.cfg.is_ui {
+                self.cfg.record_user_gesture();
+            }
+
+            const EVENTFLAG_SHIFT_DOWN: u32 = 1 << 1;
             const EVENTFLAG_CONTROL_DOWN: u32 = 1 << 2;
             const EVENTFLAG_ALT_DOWN: u32 = 1 << 3;
-            const VK_BROWSER_BACK: i32 = 0xA6;
-            const VK_BROWSER_FORWARD: i32 = 0xA7;
+            const EVENTFLAG_COMMAND_DOWN: u32 = 1 << 7;
+            const EVENTFLAG_ALTGR_DOWN: u32 = 1 << 12;
+
+            // Logical layout-mapped Windows Virtual Key codes (AZERTY-safe: `VK_W` is strictly the
+            // logical `W` key and NEVER matches `Ctrl+Z` / `VK_Z` on French AZERTY keyboards!).
+            const VK_TAB: i32 = 0x09;
+            const VK_ESCAPE: i32 = 0x1B;
+            const VK_PRIOR: i32 = 0x21; // PageUp
+            const VK_NEXT: i32 = 0x22; // PageDown
             const VK_LEFT: i32 = 0x25;
             const VK_RIGHT: i32 = 0x27;
-            const VK_OEM_PLUS: i32 = 0xBB;
-            const VK_OEM_MINUS: i32 = 0xBD;
+            const VK_0: i32 = 0x30;
+            const VK_1: i32 = 0x31;
+            const VK_9: i32 = 0x39;
+            const VK_D: i32 = 0x44;
+            const VK_H: i32 = 0x48;
+            const VK_L: i32 = 0x4C;
+            const VK_N: i32 = 0x4E;
+            const VK_R: i32 = 0x52;
+            const VK_T: i32 = 0x54;
+            const VK_W: i32 = 0x57;
+            const VK_NUMPAD0: i32 = 0x60;
+            const VK_NUMPAD1: i32 = 0x61;
+            const VK_NUMPAD9: i32 = 0x69;
             const VK_ADD: i32 = 0x6B;
             const VK_SUBTRACT: i32 = 0x6D;
-            const VK_0: i32 = 0x30;
-            const VK_NUMPAD0: i32 = 0x60;
+            const VK_F4: i32 = 0x73;
+            const VK_F5: i32 = 0x74;
+            const VK_F6: i32 = 0x75;
+            const VK_F11: i32 = 0x7A;
+            const VK_BROWSER_BACK: i32 = 0xA6;
+            const VK_BROWSER_FORWARD: i32 = 0xA7;
+            const VK_OEM_PLUS: i32 = 0xBB;
+            const VK_OEM_COMMA: i32 = 0xBC;
+            const VK_OEM_MINUS: i32 = 0xBD;
 
+            let shift = (ev.modifiers & EVENTFLAG_SHIFT_DOWN) != 0;
             let ctrl = (ev.modifiers & EVENTFLAG_CONTROL_DOWN) != 0;
             let alt = (ev.modifiers & EVENTFLAG_ALT_DOWN) != 0;
+            let meta = (ev.modifiers & EVENTFLAG_COMMAND_DOWN) != 0;
+            let altgr = (ev.modifiers & EVENTFLAG_ALTGR_DOWN) != 0;
+            // Exclude AltGr (Ctrl+Alt on Windows AZERTY/ISO layouts) from Ctrl shortcuts!
+            let ctrl_only = ctrl && !alt && !altgr && !meta;
+            let alt_only = alt && !ctrl && !altgr && !meta;
+            let no_mods = !ctrl && !alt && !altgr && !meta && !shift;
             let vk = ev.windows_key_code;
 
-            let action: Option<&'static str> = if vk == VK_BROWSER_BACK
-                || (alt && !ctrl && vk == VK_LEFT)
+            // Extension popups close natively on Escape without needing any `window.ipc` exposure.
+            if self.cfg.is_ext_popup {
+                if no_mods && vk == VK_ESCAPE {
+                    (self.cfg.sink)(CefCallbackEvent::CloseExtensionPopup);
+                    return 1;
+                }
+                return 0;
+            }
+            if self.cfg.is_standalone_popup {
+                return 0;
+            }
+
+            // Native navigation & zoom shortcuts (dispatched via `NativeShortcut`).
+            let native_action: Option<&'static str> = if vk == VK_BROWSER_BACK
+                || (alt_only && !shift && vk == VK_LEFT)
             {
                 Some("web_back")
-            } else if vk == VK_BROWSER_FORWARD || (alt && !ctrl && vk == VK_RIGHT) {
+            } else if vk == VK_BROWSER_FORWARD || (alt_only && !shift && vk == VK_RIGHT) {
                 Some("web_forward")
-            } else if !self.cfg.is_ui && ctrl && !alt && (vk == VK_OEM_PLUS || vk == VK_ADD) {
+            } else if !self.cfg.is_ui && ctrl_only && !shift && (vk == VK_OEM_PLUS || vk == VK_ADD)
+            {
                 Some("zoom_in")
-            } else if !self.cfg.is_ui && ctrl && !alt && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) {
+            } else if !self.cfg.is_ui
+                && ctrl_only
+                && !shift
+                && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT)
+            {
                 Some("zoom_out")
-            } else if !self.cfg.is_ui && ctrl && !alt && (vk == VK_0 || vk == VK_NUMPAD0) {
+            } else if !self.cfg.is_ui && ctrl_only && !shift && (vk == VK_0 || vk == VK_NUMPAD0) {
                 Some("zoom_reset")
             } else {
                 None
             };
 
-            if let Some(act) = action {
+            if let Some(act) = native_action {
                 (self.cfg.sink)(CefCallbackEvent::NativeShortcut {
                     tab_id: self.cfg.tab_id,
                     action: act,
                 });
                 return 1;
+            }
+
+            // SECURITY (N4 #4): Handle browser shortcuts for web pages natively in the trusted
+            // browser process (works inside cross-origin iframes and cannot be forged by page JS).
+            if !self.cfg.is_ui && self.cfg.tab_id != 0 {
+                let web_shortcut: Option<(&'static str, Option<u8>)> = if no_mods && vk == VK_F11 {
+                    Some(("toggle_fullscreen", None))
+                } else if ctrl_only && shift && vk == VK_T {
+                    Some(("reopen_closed_tab", None))
+                } else if ctrl_only && !shift && vk == VK_T {
+                    Some(("new_tab", None))
+                } else if ctrl_only && !shift && vk == VK_N {
+                    Some(("new_window", None))
+                } else if ctrl_only && !shift && (vk == VK_W || vk == VK_F4) {
+                    Some(("close_active_tab", None))
+                } else if ctrl_only && shift && vk == VK_TAB {
+                    Some(("prev_tab", None))
+                } else if ctrl_only && !shift && (vk == VK_TAB || vk == VK_NEXT) {
+                    Some(("next_tab", None))
+                } else if ctrl_only && !shift && vk == VK_PRIOR {
+                    Some(("prev_tab", None))
+                } else if (ctrl_only && !shift && vk == VK_L)
+                    || (alt_only && !shift && vk == VK_D)
+                    || (no_mods && vk == VK_F6)
+                {
+                    Some(("focus_omnibar", None))
+                } else if (ctrl_only && vk == VK_R)
+                    || ((no_mods || (ctrl_only && !shift)) && vk == VK_F5)
+                {
+                    Some(("reload_tab", None))
+                } else if ctrl_only && !shift && vk == VK_D {
+                    Some(("toggle_bookmark", None))
+                } else if ctrl_only && !shift && vk == VK_H {
+                    Some(("open_history", None))
+                } else if ctrl_only && !shift && vk == VK_OEM_COMMA {
+                    Some(("open_settings", None))
+                } else if ctrl_only && !shift && (VK_1..=VK_9).contains(&vk) {
+                    Some(("jump_tab", Some((vk - VK_0) as u8)))
+                } else if ctrl_only && !shift && (VK_NUMPAD1..=VK_NUMPAD9).contains(&vk) {
+                    Some(("jump_tab", Some((vk - VK_NUMPAD0) as u8)))
+                } else {
+                    None
+                };
+
+                if let Some((act, idx)) = web_shortcut {
+                    let body = match idx {
+                        Some(n) => format!(r#"{{"k":"shortcut","a":"{}","n":{}}}"#, act, n),
+                        None => format!(r#"{{"k":"shortcut","a":"{}"}}"#, act),
+                    };
+                    (self.cfg.sink)(CefCallbackEvent::ContentIpc {
+                        tab_id: self.cfg.tab_id,
+                        body,
+                    });
+                    return 1;
+                }
             }
             0
         }
@@ -1518,7 +2263,7 @@ wrap_client! {
 
     impl Client {
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
-            Some(SingularityContextMenuHandler::new(self.cfg.is_ui))
+            Some(SingularityContextMenuHandler::new(self.cfg.clone()))
         }
 
         fn display_handler(&self) -> Option<DisplayHandler> {
@@ -1552,36 +2297,48 @@ wrap_client! {
         fn on_process_message_received(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
-            _source_process: ProcessId,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
             message: Option<&mut ProcessMessage>,
         ) -> ::std::os::raw::c_int {
             let Some(msg) = message else {
                 return 0;
             };
-            if cef_str_userfree(msg.name()) != IPC_MESSAGE_NAME {
+            let msg_name = cef_str_userfree(msg.name());
+            if msg_name != IPC_MESSAGE_NAME && msg_name != LEGACY_IPC_MESSAGE_NAME {
                 return 0;
             }
+            // SECURITY (N4 #4): Only the local Singularity UI shell main frame on exact origin
+            // `http://127.0.0.1:<bind_port>` may send renderer IPC (`UiIpc`). Reject ALL IPC
+            // from web browsers, extension popups, subframes, or non-local origins.
+            if msg_name != IPC_MESSAGE_NAME
+                || !self.cfg.is_ui
+                || self.cfg.is_ext_popup
+                || self.cfg.is_standalone_popup
+                || source_process != ProcessId::RENDERER
+            {
+                return 1;
+            }
+            let Some(frame) = frame else {
+                return 1;
+            };
+            if frame.is_main() == 0 {
+                return 1;
+            }
+            let frame_url = cef_str_userfree(frame.url());
+            if !is_exact_local_ui_origin(&frame_url, self.cfg.bind_port) {
+                return 1;
+            }
+
             let body = msg
                 .argument_list()
                 .filter(|a| a.size() > 0)
                 .map(|a| cef_str_userfree(a.string(0)))
                 .unwrap_or_default();
-            if body.is_empty() {
+            if body.is_empty() || body.len() > 262_144 {
                 return 1;
             }
-            if self.cfg.is_ui {
-                (self.cfg.sink)(CefCallbackEvent::UiIpc(body));
-            } else if self.cfg.is_ext_popup {
-                if body.contains("close_ext_popup") {
-                    (self.cfg.sink)(CefCallbackEvent::CloseExtensionPopup);
-                }
-            } else {
-                (self.cfg.sink)(CefCallbackEvent::ContentIpc {
-                    tab_id: self.cfg.tab_id,
-                    body,
-                });
-            }
+            (self.cfg.sink)(CefCallbackEvent::UiIpc(body));
             1
         }
     }
@@ -1808,18 +2565,22 @@ pub fn spawn_cef_child_browser(
     let cfg = ClientConfig {
         is_ui,
         is_ext_popup,
+        is_standalone_popup: false,
         tab_id,
         bind_port,
         sink,
         shared_shell,
         download_resolver,
         downloads: Arc::new(Mutex::new(HashMap::new())),
+        last_user_gesture_ms: Arc::new(AtomicU64::new(0)),
+        no_gesture_urls: Arc::new(Mutex::new(HashMap::new())),
     };
     let mut client = SingularityCefClient::new(cfg);
 
     let mut extra = dictionary_value_create();
     if let Some(ref mut dict) = extra {
         let _ = dict.set_bool(Some(&CefString::from("is_ui")), if is_ui { 1 } else { 0 });
+        let _ = dict.set_int(Some(&CefString::from("ui_port")), bind_port as i32);
         if let Some(script) = init_script {
             let _ = dict.set_string(
                 Some(&CefString::from("init_script")),
@@ -1980,25 +2741,52 @@ wrap_cookie_visitor! {
 
                 if !deleted && self.fin.save_tokens && !value.is_empty() && !domain.is_empty() {
                     if let Some(provider) = classify_auth_cookie(&domain, &name) {
-                        let exp_unix = if c.has_expires != 0 && c.expires.val > WINDOWS_TO_UNIX_EPOCH_US {
-                            Some((c.expires.val - WINDOWS_TO_UNIX_EPOCH_US) / 1_000_000)
+                        let now_unix_u64 = unix_now();
+                        let now_unix = now_unix_u64 as i64;
+                        let (is_expired, exp_unix) = if c.has_expires != 0 {
+                            if c.expires.val > WINDOWS_TO_UNIX_EPOCH_US {
+                                let unix_sec =
+                                    (c.expires.val - WINDOWS_TO_UNIX_EPOCH_US) / 1_000_000;
+                                (unix_sec <= now_unix, Some(unix_sec))
+                            } else {
+                                (true, None)
+                            }
                         } else {
-                            None
+                            (false, None)
                         };
-                        if let Ok(mut cap) = self.fin.captured.lock() {
-                            cap.push(EncryptedAuthTokenRecord {
-                                id: format!("{}::{}::{}", provider, domain, name),
-                                provider: provider.to_string(),
-                                domain,
-                                path: if path.is_empty() { "/".to_string() } else { path },
-                                token_name: name,
-                                secret_value: value,
-                                http_only: c.httponly != 0,
-                                secure: c.secure != 0,
-                                expires_unix: exp_unix,
-                                updated_unix: unix_now(),
-                                kind: "cookie_session".to_string(),
-                            });
+                        if !is_expired {
+                            let is_host_prefix = name.to_ascii_lowercase().starts_with("__host-");
+                            let host_only = is_host_prefix || !domain.starts_with('.');
+                            let same_site = if c.same_site == CookieSameSite::STRICT_MODE {
+                                Some("strict".to_string())
+                            } else if c.same_site == CookieSameSite::LAX_MODE {
+                                Some("lax".to_string())
+                            } else if c.same_site == CookieSameSite::NO_RESTRICTION {
+                                Some("none".to_string())
+                            } else {
+                                None
+                            };
+                            if let Ok(mut cap) = self.fin.captured.lock() {
+                                cap.push(EncryptedAuthTokenRecord {
+                                    id: format!("{}::{}::{}", provider, domain, name),
+                                    provider: provider.to_string(),
+                                    domain,
+                                    path: if is_host_prefix || path.is_empty() {
+                                        "/".to_string()
+                                    } else {
+                                        path
+                                    },
+                                    token_name: name,
+                                    secret_value: value,
+                                    http_only: c.httponly != 0,
+                                    secure: c.secure != 0 || is_host_prefix,
+                                    same_site,
+                                    host_only,
+                                    expires_unix: exp_unix,
+                                    updated_unix: now_unix_u64,
+                                    kind: "cookie_session".to_string(),
+                                });
+                            }
                         }
                     }
                 }
@@ -2055,6 +2843,7 @@ impl Drop for HydrateFinalize {
             .map(|s| s.roaming.tokens.sessions.clone())
             .unwrap_or_default();
         let seen = self.existing.lock().ok().map(|g| g.clone()).unwrap_or_default();
+        let now_unix = unix_now() as i64;
         for rec in sessions {
             if rec.kind != "cookie_session"
                 || rec.domain.is_empty()
@@ -2062,38 +2851,74 @@ impl Drop for HydrateFinalize {
             {
                 continue;
             }
+            // SECURITY (N3 #26): Skip already-expired auth cookies.
+            if let Some(exp) = rec.expires_unix {
+                if exp <= now_unix {
+                    continue;
+                }
+            }
             let lower_name = rec.token_name.to_ascii_lowercase();
-            if lower_name.starts_with("__host-") {
+            let is_host_prefix = lower_name.starts_with("__host-");
+            let clean_dom = rec.domain.trim_start_matches('.').to_ascii_lowercase();
+            if clean_dom.is_empty() {
                 continue;
             }
-            let clean_dom = rec.domain.trim_start_matches('.').to_ascii_lowercase();
             if seen.contains(&(clean_dom.clone(), lower_name.clone())) {
                 continue;
             }
             let cookie_url = format!("https://{}/", clean_dom);
-            let is_domain_cookie = rec.domain.starts_with('.');
+            let is_host_only = is_host_prefix || rec.host_only || !rec.domain.starts_with('.');
             let is_3p_cookie = lower_name.starts_with("__secure-3p");
-            let secure_flag = if rec.secure || lower_name.starts_with("__secure-") || is_3p_cookie {
+            let secure_flag = if is_host_prefix
+                || rec.secure
+                || lower_name.starts_with("__secure-")
+                || is_3p_cookie
+            {
                 1
             } else {
                 0
             };
+            // SECURITY (N3 #26): Preserve exact SameSite mode (never downgrade `Strict` to `Lax`).
+            let same_site = match rec
+                .same_site
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("strict") => CookieSameSite::STRICT_MODE,
+                Some("lax") => CookieSameSite::LAX_MODE,
+                Some("none") | Some("no_restriction") => {
+                    if secure_flag != 0 {
+                        CookieSameSite::NO_RESTRICTION
+                    } else {
+                        CookieSameSite::LAX_MODE
+                    }
+                }
+                _ => {
+                    if is_3p_cookie && secure_flag != 0 {
+                        CookieSameSite::NO_RESTRICTION
+                    } else {
+                        CookieSameSite::LAX_MODE
+                    }
+                }
+            };
             let mut cef_cookie = Cookie {
                 name: CefString::from(rec.token_name.as_str()),
                 value: CefString::from(rec.secret_value.as_str()),
-                domain: if is_domain_cookie {
-                    CefString::from(rec.domain.as_str())
-                } else {
+                domain: if is_host_only {
+                    // Empty domain creates a host-only cookie (required by RFC 6265bis for `__Host-*`).
                     CefString::default()
+                } else {
+                    CefString::from(rec.domain.as_str())
                 },
-                path: CefString::from(if rec.path.is_empty() { "/" } else { rec.path.as_str() }),
+                path: CefString::from(if is_host_prefix || rec.path.is_empty() {
+                    "/"
+                } else {
+                    rec.path.as_str()
+                }),
                 secure: secure_flag,
                 httponly: if rec.http_only { 1 } else { 0 },
-                same_site: if is_3p_cookie {
-                    CookieSameSite::NO_RESTRICTION
-                } else {
-                    CookieSameSite::LAX_MODE
-                },
+                same_site,
                 ..Default::default()
             };
             if let Some(exp) = rec.expires_unix {
@@ -2321,8 +3146,82 @@ pub fn clear_all_cookies_cef() {
 type CdpPendingMap =
     HashMap<u64, std::sync::mpsc::Sender<Result<serde_json::Value, String>>>;
 
+const MAX_CDP_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const CDP_WRITE_QUEUE_CAPACITY: usize = 64;
+
+/// RAII wrapper for a Win32 `HANDLE` that always invokes `CloseHandle` on `Drop`.
+struct OwnedHandle {
+    raw: usize,
+}
+
+impl OwnedHandle {
+    fn from_raw(ptr: *mut core::ffi::c_void) -> Option<Self> {
+        let raw = ptr as usize;
+        // Reject NULL and Win32 INVALID_HANDLE_VALUE ((HANDLE)-1 == usize::MAX).
+        if raw == 0 || raw == usize::MAX {
+            None
+        } else {
+            Some(Self { raw })
+        }
+    }
+
+    fn as_ptr(&self) -> *mut core::ffi::c_void {
+        self.raw as *mut core::ffi::c_void
+    }
+
+    fn raw_usize(&self) -> usize {
+        self.raw
+    }
+
+    /// Transfers ownership of the raw handle to Chromium (`--remote-debugging-io-pipes`) without closing.
+    fn into_raw(self) -> usize {
+        let raw = self.raw;
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if self.raw != 0 && self.raw != usize::MAX {
+            unsafe {
+                let _ = CloseHandle(self.raw as *mut core::ffi::c_void);
+            }
+            self.raw = 0;
+        }
+    }
+}
+
+fn dispatch_cdp_frame(body: &[u8], pending: &Arc<Mutex<CdpPendingMap>>) {
+    if body.is_empty() {
+        return;
+    }
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(id) = val.get("id").and_then(|v| v.as_u64()) {
+            let reply = if let Some(err) = val.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("CDP command error")
+                    .to_string();
+                Err(msg)
+            } else {
+                Ok(val
+                    .get("result")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})))
+            };
+            if let Ok(mut map) = pending.lock() {
+                if let Some(tx) = map.remove(&id) {
+                    let _ = tx.send(reply);
+                }
+            }
+        }
+    }
+}
+
 struct CdpPipeBridge {
-    rust_write: Mutex<usize>,
+    write_tx: std::sync::mpsc::SyncSender<(u64, Vec<u8>)>,
     chrome_io_arg: String,
     pending: Arc<Mutex<CdpPendingMap>>,
     next_id: AtomicU64,
@@ -2334,86 +3233,156 @@ static DYNAMIC_EXTENSIONS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn init_cdp_pipe_bridge() -> Option<&'static CdpPipeBridge> {
     CDP_PIPE_BRIDGE
-        .get_or_init(|| unsafe {
-            let mut chrome_read: *mut core::ffi::c_void = std::ptr::null_mut();
-            let mut rust_write: *mut core::ffi::c_void = std::ptr::null_mut();
-            if CreatePipe(&mut chrome_read, &mut rust_write, std::ptr::null(), 65536) == 0 {
-                return None;
-            }
-            let mut rust_read: *mut core::ffi::c_void = std::ptr::null_mut();
-            let mut chrome_write: *mut core::ffi::c_void = std::ptr::null_mut();
-            if CreatePipe(&mut rust_read, &mut chrome_write, std::ptr::null(), 65536) == 0 {
-                let _ = CloseHandle(chrome_read);
-                let _ = CloseHandle(rust_write);
-                return None;
-            }
-            let cr_val = chrome_read as usize;
-            let cw_val = chrome_write as usize;
-            if cr_val == 0 || cw_val == 0 || cr_val > u32::MAX as usize || cw_val > u32::MAX as usize
+        .get_or_init(|| {
+            let mut raw_chrome_read: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut raw_rust_write: *mut core::ffi::c_void = std::ptr::null_mut();
+            if unsafe {
+                CreatePipe(
+                    &mut raw_chrome_read,
+                    &mut raw_rust_write,
+                    std::ptr::null(),
+                    65536,
+                )
+            } == 0
             {
-                let _ = CloseHandle(chrome_read);
-                let _ = CloseHandle(rust_write);
-                let _ = CloseHandle(rust_read);
-                let _ = CloseHandle(chrome_write);
+                return None;
+            }
+            let chrome_read = OwnedHandle::from_raw(raw_chrome_read)?;
+            let rust_write = OwnedHandle::from_raw(raw_rust_write)?;
+
+            let mut raw_rust_read: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut raw_chrome_write: *mut core::ffi::c_void = std::ptr::null_mut();
+            if unsafe {
+                CreatePipe(
+                    &mut raw_rust_read,
+                    &mut raw_chrome_write,
+                    std::ptr::null(),
+                    65536,
+                )
+            } == 0
+            {
+                return None;
+            }
+            let rust_read = OwnedHandle::from_raw(raw_rust_read)?;
+            let chrome_write = OwnedHandle::from_raw(raw_chrome_write)?;
+
+            let cr_val = chrome_read.raw_usize();
+            let cw_val = chrome_write.raw_usize();
+            if cr_val > u32::MAX as usize || cw_val > u32::MAX as usize {
+                // All 4 OwnedHandles close automatically on Drop.
                 return None;
             }
 
             let pending: Arc<Mutex<CdpPendingMap>> = Arc::new(Mutex::new(HashMap::new()));
             let alive = Arc::new(AtomicBool::new(true));
+            let (write_tx, write_rx) =
+                std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(CDP_WRITE_QUEUE_CAPACITY);
+
+            // Dedicated bounded writer thread so blocking Win32 `WriteFile` NEVER stalls the UI thread.
+            let writer_pending = Arc::clone(&pending);
+            let writer_alive = Arc::clone(&alive);
+            if std::thread::Builder::new()
+                .name("singularity-cdp-writer".into())
+                .spawn(move || {
+                    let write_handle = rust_write;
+                    let h = write_handle.as_ptr();
+                    while let Ok((req_id, bytes)) = write_rx.recv() {
+                        let mut offset = 0usize;
+                        let mut failed = false;
+                        while offset < bytes.len() {
+                            let mut written: u32 = 0;
+                            let remaining = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+                            let ok = unsafe {
+                                WriteFile(
+                                    h,
+                                    bytes.as_ptr().add(offset),
+                                    remaining,
+                                    &mut written,
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            if ok == 0 || written == 0 {
+                                failed = true;
+                                break;
+                            }
+                            offset += written as usize;
+                        }
+                        if failed {
+                            writer_alive.store(false, Ordering::Release);
+                            if let Ok(mut map) = writer_pending.lock() {
+                                if let Some(tx) = map.remove(&req_id) {
+                                    let _ = tx
+                                        .send(Err("Failed writing CDP frame to Chromium pipe".into()));
+                                }
+                                for (_, tx) in map.drain() {
+                                    let _ = tx.send(Err("CDP pipe write failed".into()));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    // `write_handle` drops here and calls `CloseHandle`.
+                })
+                .is_err()
+            {
+                return None;
+            }
+
             let reader_pending = Arc::clone(&pending);
             let reader_alive = Arc::clone(&alive);
-            let reader_handle = rust_read as usize;
-
-            let _ = std::thread::Builder::new()
+            if std::thread::Builder::new()
                 .name("singularity-cdp-reader".into())
                 .spawn(move || {
-                    let h = reader_handle as *mut core::ffi::c_void;
+                    let read_handle = rust_read;
+                    let h = read_handle.as_ptr();
                     let mut chunk = [0u8; 4096];
                     let mut acc: Vec<u8> = Vec::with_capacity(8192);
+                    let mut discarding_oversized = false;
                     loop {
                         let mut nread: u32 = 0;
-                        let ok = ReadFile(
-                            h,
-                            chunk.as_mut_ptr(),
-                            chunk.len() as u32,
-                            &mut nread,
-                            std::ptr::null_mut(),
-                        );
+                        let ok = unsafe {
+                            ReadFile(
+                                h,
+                                chunk.as_mut_ptr(),
+                                chunk.len() as u32,
+                                &mut nread,
+                                std::ptr::null_mut(),
+                            )
+                        };
                         if ok == 0 || nread == 0 {
                             break;
                         }
-                        acc.extend_from_slice(&chunk[..nread as usize]);
-                        while let Some(pos) = acc.iter().position(|&b| b == 0) {
-                            let frame: Vec<u8> = acc.drain(..=pos).collect();
-                            let body = &frame[..frame.len().saturating_sub(1)];
-                            if body.is_empty() {
+                        let mut slice = &chunk[..nread as usize];
+                        while !slice.is_empty() {
+                            if discarding_oversized {
+                                // Drain oversized frame bytes up to the terminating `\0` so all
+                                // subsequent CDP frames stay strictly synchronized.
+                                if let Some(nul_pos) = slice.iter().position(|&b| b == 0) {
+                                    discarding_oversized = false;
+                                    slice = &slice[nul_pos + 1..];
+                                } else {
+                                    slice = &[];
+                                }
                                 continue;
                             }
-                            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
-                                if let Some(id) = val.get("id").and_then(|v| v.as_u64()) {
-                                    let reply = if let Some(err) = val.get("error") {
-                                        let msg = err
-                                            .get("message")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("CDP command error")
-                                            .to_string();
-                                        Err(msg)
-                                    } else {
-                                        Ok(val
-                                            .get("result")
-                                            .cloned()
-                                            .unwrap_or_else(|| serde_json::json!({})))
-                                    };
-                                    if let Ok(mut map) = reader_pending.lock() {
-                                        if let Some(tx) = map.remove(&id) {
-                                            let _ = tx.send(reply);
-                                        }
-                                    }
+                            if let Some(nul_pos) = slice.iter().position(|&b| b == 0) {
+                                let part = &slice[..nul_pos];
+                                if acc.len().saturating_add(part.len()) <= MAX_CDP_FRAME_BYTES {
+                                    acc.extend_from_slice(part);
+                                    dispatch_cdp_frame(&acc, &reader_pending);
                                 }
+                                acc.clear();
+                                slice = &slice[nul_pos + 1..];
+                            } else {
+                                if acc.len().saturating_add(slice.len()) > MAX_CDP_FRAME_BYTES {
+                                    acc.clear();
+                                    acc.shrink_to(8192);
+                                    discarding_oversized = true;
+                                } else {
+                                    acc.extend_from_slice(slice);
+                                }
+                                slice = &[];
                             }
-                        }
-                        if acc.len() > 4 * 1024 * 1024 {
-                            acc.clear();
                         }
                     }
                     reader_alive.store(false, Ordering::Release);
@@ -2422,12 +3391,23 @@ fn init_cdp_pipe_bridge() -> Option<&'static CdpPipeBridge> {
                             let _ = tx.send(Err("CDP pipe closed".into()));
                         }
                     }
-                    let _ = CloseHandle(h);
-                });
+                    // `read_handle` drops here and calls `CloseHandle`.
+                })
+                .is_err()
+            {
+                // Dropping `write_tx` signals the writer thread to exit and close `rust_write`;
+                // `chrome_read` and `chrome_write` drop and close automatically.
+                return None;
+            }
+
+            // Ownership of Chromium's pipe ends transfers to Chromium's in-process DevTools pipe
+            // handler via `--remote-debugging-io-pipes`.
+            let cr_owned = chrome_read.into_raw();
+            let cw_owned = chrome_write.into_raw();
 
             Some(CdpPipeBridge {
-                rust_write: Mutex::new(rust_write as usize),
-                chrome_io_arg: format!("{},{}", cr_val as u32, cw_val as u32),
+                write_tx,
+                chrome_io_arg: format!("{},{}", cr_owned as u32, cw_owned as u32),
                 pending,
                 next_id: AtomicU64::new(1),
                 alive,
@@ -2472,36 +3452,30 @@ fn cdp_call(
         "method": method,
         "params": params,
     });
-    let mut bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    let mut bytes = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            if let Ok(mut map) = bridge.pending.lock() {
+                map.remove(&id);
+            }
+            return Err(e.to_string());
+        }
+    };
     bytes.push(0u8);
 
-    {
-        let write_guard = bridge
-            .rust_write
-            .lock()
-            .map_err(|_| "CDP write lock poisoned".to_string())?;
-        let h = (*write_guard) as *mut core::ffi::c_void;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let mut written: u32 = 0;
-            let remaining = (bytes.len() - offset).min(u32::MAX as usize) as u32;
-            let ok = unsafe {
-                WriteFile(
-                    h,
-                    bytes.as_ptr().add(offset),
-                    remaining,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 || written == 0 {
-                if let Ok(mut map) = bridge.pending.lock() {
-                    map.remove(&id);
-                }
-                return Err("Failed writing CDP frame to Chromium pipe".into());
-            }
-            offset += written as usize;
+    // Non-blocking enqueue to the dedicated bounded CDP writer thread (never blocks the UI thread).
+    if let Err(err) = bridge.write_tx.try_send((id, bytes)) {
+        if let Ok(mut map) = bridge.pending.lock() {
+            map.remove(&id);
         }
+        return Err(match err {
+            std::sync::mpsc::TrySendError::Full(_) => {
+                "CDP writer queue full (pipe backpressure)".into()
+            }
+            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                "CDP pipe writer disconnected".into()
+            }
+        });
     }
 
     if pump_ui {

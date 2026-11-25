@@ -1683,7 +1683,7 @@ fn populate_mullvad_wireguard(entries: &mut Vec<SettingEntry>) {
                 hot_reload: true,
             },
             {
-                key: "mullvad.Check.am_i_mullvad_startup_verify",
+                key: "mullvad.check.am_i_mullvad_startup_verify",
                 title: "Verify Exit IP Against `https://am.i.mullvad.net/json` Before First Navigation",
                 description: "Holds initial tab requests until exit node verification confirms active Mullvad IP and zero DNS leaks.",
                 default: SettingValue::Bool(true),
@@ -1761,7 +1761,7 @@ fn populate_mullvad_wireguard(entries: &mut Vec<SettingEntry>) {
         "daita_machine_timer_exponential", "pq_mceliece_460896_kem", "pq_mlkem_1024_kem",
         "killswitch_drop_arp_ndp_leaks", "killswitch_block_webrtc_stun", "killswitch_drop_icmp_unreachable",
         "split_tunnel_isolate_cookies", "split_tunnel_per_container_key", "wireguard_gso_gro_batching",
-        "wireguard_ring_buffer_slots", "mullvad_api_tls_pin_check", "mullvad_ voucher_redeem_guard",
+        "wireguard_ring_buffer_slots", "mullvad_api_tls_pin_check", "mullvad_voucher_redeem_guard",
         "mullvad_device_slot_auto_prune",
     ];
     for &sub in WG_SUBSYSTEMS {
@@ -1851,7 +1851,7 @@ fn populate_rendering_gpu_performance(entries: &mut Vec<SettingEntry>) {
                 hot_reload: false,
             },
             {
-                key: "rendering.raster.zero_copy_izer",
+                key: "rendering.raster.zero_copy_rasterizer",
                 title: "Zero-Copy GPU Memory Buffer Tile Rasterizer",
                 description: "Writes decoded raster tiles directly into GPU-mapped DMA buffers without staging copies.",
                 default: SettingValue::Bool(true),
@@ -2174,7 +2174,7 @@ fn populate_rendering_gpu_performance(entries: &mut Vec<SettingEntry>) {
         "bfcache_max_pages_per_tab", "subframe_process_reuse_threshold", "spare_renderer_warm_process",
         "gpu_shader_binary_lru", "wayland_dmabuf_surface_pool", "cursor_animated_frame_cache",
         "pdf_disabled_zero_footprint", "webrtc_jitter_buffer_pool", "websocket_frame_reassembly",
-        "fetch_stream_backpressure_window", "console_log_ring_buffer", "devtools_protocol_ detached",
+        "fetch_stream_backpressure_window", "console_log_ring_buffer", "devtools_protocol_detached",
         "crashpad_disabled_zero_overhead", "uma_disabled_zero_overhead", "rlz_disabled_zero_overhead",
         "variations_disabled_zero_overhead", "safebrowsing_disabled_zero_overhead",
         "widevine_unloaded_zero_overhead", "extensions_disabled_zero_overhead",
@@ -2449,7 +2449,7 @@ fn populate_password_manager_crypto(entries: &mut Vec<SettingEntry>) {
         "min_pin_length_ext", "cred_blob_extension", "appid_u2f_backcompat",
         "attestation_none_anonymize", "attestation_packed_self", "conditional_mediation_ui",
         "cross_origin_iframe_create_block", "rp_id_psl_validation", "sign_counter_zero_privacy",
-        "sign_counter_monotonic_increment", "usb_hid_passthrough_yubikey", "hybrid_qr_caBLE_block",
+        "sign_counter_monotonic_increment", "usb_hid_passthrough_yubikey", "hybrid_qr_cable_block",
     ];
     for &cap in WEBAUTHN_CAPABILITIES {
         define_parameter_matrix!(
@@ -2494,7 +2494,7 @@ fn populate_password_manager_crypto(entries: &mut Vec<SettingEntry>) {
 
     // 32 Vault Security & Anti-Phishing Guards x 2 controls = 64 settings
     const VAULT_GUARDS: &[&str] = &[
-        "mlock_prevent_swap_to_disk", "prctl_set_dumpable_zero", "zeroize_on_drop_ buffers",
+        "mlock_prevent_swap_to_disk", "prctl_set_dumpable_zero", "zeroize_on_drop_buffers",
         "constant_time_mac_verify", "header_associated_data_bind", "key_rotation_reencrypt",
         "export_require_fresh_argon2", "import_schema_version_check", "hibp_bloom_false_positive_guard",
         "password_reuse_cross_domain_warn", "totp_clock_skew_window_steps", "totp_next_code_preview",
@@ -3365,5 +3365,80 @@ fn populate_themes_cursors_ui_ux(entries: &mut Vec<SettingEntry>) {
                 }
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_catalog_keys_strict_format_uniqueness_and_valid_defaults() {
+        let entries = build_full_settings_catalog();
+        assert!(entries.len() >= 2000);
+
+        let mut seen = HashSet::with_capacity(entries.len());
+        for entry in &entries {
+            let k = &entry.key;
+            assert!(!k.is_empty(), "Empty setting key encountered");
+            assert!(
+                !k.chars().any(char::is_whitespace),
+                "Catalog key contains whitespace: {:?}",
+                k
+            );
+            assert!(
+                !k.chars().any(char::is_uppercase),
+                "Catalog key contains unexpected uppercase character: {:?}",
+                k
+            );
+            assert!(
+                k.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.'),
+                "Catalog key contains invalid character: {:?}",
+                k
+            );
+            assert!(
+                !k.starts_with('.') && !k.ends_with('.') && !k.contains(".."),
+                "Catalog key has malformed dot segments: {:?}",
+                k
+            );
+            assert!(
+                seen.insert(k.as_str()),
+                "Duplicate catalog key detected: {:?}",
+                k
+            );
+            assert!(
+                entry.validate_value(&entry.default_value),
+                "Catalog default value failed validate_value for key {:?}",
+                k
+            );
+        }
+
+        // Verify corrected keys are present and malformed variants are gone.
+        for expected in [
+            "mullvad.check.am_i_mullvad_startup_verify",
+            "rendering.raster.zero_copy_rasterizer",
+            "mullvad.tuning.mullvad_voucher_redeem_guard.enabled",
+            "rendering.memory.devtools_protocol_detached.soft_limit_mb",
+            "vault.guard.zeroize_on_drop_buffers.enabled",
+            "vault.webauthn.hybrid_qr_cable_block.enabled",
+        ] {
+            assert!(seen.contains(expected), "Missing corrected key: {}", expected);
+        }
+        for obsolete in [
+            "mullvad.Check.am_i_mullvad_startup_verify",
+            "rendering.raster.zero_copy_izer",
+            "mullvad.tuning.mullvad_ voucher_redeem_guard.enabled",
+            "rendering.memory.devtools_protocol_ detached.soft_limit_mb",
+            "vault.guard.zeroize_on_drop_ buffers.enabled",
+            "vault.webauthn.hybrid_qr_caBLE_block.enabled",
+        ] {
+            assert!(
+                !seen.contains(obsolete),
+                "Malformed legacy key still present: {}",
+                obsolete
+            );
+        }
     }
 }

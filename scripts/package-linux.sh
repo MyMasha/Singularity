@@ -8,6 +8,11 @@ RAW_VER="${2:?Missing version (e.g. 1.0.0)}"
 OUT_DIR="${3:?Missing output directory}"
 
 VERSION="${RAW_VER#v}"
+if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?$ ]]; then
+  echo "[ERROR] Invalid version '${RAW_VER}' (expected X.Y.Z or X.Y.Z-prerelease)." >&2
+  exit 1
+fi
+RPM_VERSION="${VERSION//-/\~}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ICON_SRC="${REPO_ROOT}/assets/logo.png"
@@ -21,9 +26,9 @@ if [ ! -f "${ICON_SRC}" ]; then
   exit 1
 fi
 
-mkdir -p "${OUT_DIR}"
+mkdir -p -- "${OUT_DIR}"
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "${WORK_DIR}"' EXIT
+trap 'rm -rf -- "${WORK_DIR}"' EXIT
 
 DESKTOP_ENTRY="[Desktop Entry]
 Type=Application
@@ -84,8 +89,8 @@ build_rpm() {
   local rpm_top="${WORK_DIR}/rpmbuild"
   mkdir -p "${rpm_top}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-  cp "${BIN_PATH}" "${rpm_top}/SOURCES/singularity"
-  cp "${ICON_SRC}" "${rpm_top}/SOURCES/singularity.png"
+  cp -- "${BIN_PATH}" "${rpm_top}/SOURCES/singularity"
+  cp -- "${ICON_SRC}" "${rpm_top}/SOURCES/singularity.png"
   printf '%s' "${DESKTOP_ENTRY}" > "${rpm_top}/SOURCES/singularity.desktop"
 
   cat > "${rpm_top}/SPECS/singularity-browser.spec" <<EOF
@@ -93,7 +98,7 @@ build_rpm() {
 %global _build_id_links none
 
 Name:           singularity-browser
-Version:        ${VERSION}
+Version:        ${RPM_VERSION}
 Release:        1
 Summary:        Privacy-first desktop browser written in Rust (Bazzite / Fedora Atomic)
 License:        MPL-2.0

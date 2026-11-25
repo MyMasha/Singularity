@@ -19,6 +19,8 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "windows"))]
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -27,7 +29,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const TOKENS_ENVELOPE_MAGIC: &str = "SINGULARITY-ROAMING-TOKENS-V3-XCHACHA20-POLY1305";
 #[cfg(not(target_os = "windows"))]
-const UNIX_SEALED_KEY_MAGIC: &str = "SINGULARITY-UNIX-MASTER-V2";
+const UNIX_SEALED_KEY_MAGIC: &str = "SINGULARITY-UNIX-MASTER-V3";
 
 /// Resolves `%APPDATA%\.singularity` on Windows (`C:\Users\<User>\AppData\Roaming\.singularity`)
 /// or `~/.singularity` on Linux/macOS.
@@ -91,7 +93,7 @@ pub fn ensure_roaming_dir_initialized() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptedAuthTokenRecord {
     pub id: String,
     pub provider: String,
@@ -101,11 +103,37 @@ pub struct EncryptedAuthTokenRecord {
     pub secret_value: String,
     pub http_only: bool,
     pub secure: bool,
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub same_site: Option<String>,
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub host_only: bool,
     #[zeroize(skip)]
     pub expires_unix: Option<i64>,
     #[zeroize(skip)]
     pub updated_unix: u64,
     pub kind: String,
+}
+
+impl fmt::Debug for EncryptedAuthTokenRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedAuthTokenRecord")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("token_name", &self.token_name)
+            .field("secret_value", &"[REDACTED]")
+            .field("http_only", &self.http_only)
+            .field("secure", &self.secure)
+            .field("same_site", &self.same_site)
+            .field("host_only", &self.host_only)
+            .field("expires_unix", &self.expires_unix)
+            .field("updated_unix", &self.updated_unix)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 impl EncryptedAuthTokenRecord {
@@ -129,10 +157,22 @@ impl EncryptedAuthTokenRecord {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct RoamingTokensPlaintext {
     pub sessions: Vec<EncryptedAuthTokenRecord>,
     pub saved_mullvad_account: Option<String>,
+}
+
+impl fmt::Debug for RoamingTokensPlaintext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RoamingTokensPlaintext")
+            .field("sessions", &self.sessions)
+            .field(
+                "saved_mullvad_account",
+                &self.saved_mullvad_account.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Drop for RoamingTokensPlaintext {
@@ -143,11 +183,21 @@ impl Drop for RoamingTokensPlaintext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct EncryptedTokensEnvelope {
     magic: String,
     xnonce_base64: String,
     ciphertext_base64: String,
+}
+
+impl fmt::Debug for EncryptedTokensEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedTokensEnvelope")
+            .field("magic", &self.magic)
+            .field("xnonce_base64", &"[REDACTED]")
+            .field("ciphertext_base64", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,7 +288,7 @@ pub struct WindowRestorePayload {
 
 /// Authenticated peer descriptor published by each live Singularity window in
 /// `%APPDATA%\.singularity\windows\<window_id>.json` for instant cross-window tab transfers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LiveWindowDescriptor {
     pub window_id: String,
     pub pid: u32,
@@ -246,6 +296,19 @@ pub struct LiveWindowDescriptor {
     pub hwnd: isize,
     pub transfer_token: String,
     pub updated_unix: u64,
+}
+
+impl fmt::Debug for LiveWindowDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveWindowDescriptor")
+            .field("window_id", &self.window_id)
+            .field("pid", &self.pid)
+            .field("port", &self.port)
+            .field("hwnd", &self.hwnd)
+            .field("transfer_token", &"[REDACTED]")
+            .field("updated_unix", &self.updated_unix)
+            .finish()
+    }
 }
 
 /// Single-use tab detach handoff payload written under `%APPDATA%\.singularity\handoff\<id>.json`
@@ -266,6 +329,18 @@ pub struct TabHandoffPayload {
     pub pos_x: Option<i32>,
     #[serde(default)]
     pub pos_y: Option<i32>,
+}
+
+/// Validates a safe window session identifier (`1..=64` bytes, strictly `[A-Za-z0-9_-]`;
+/// rejects `.`, `..`, `/`, `\`, `:`, NUL, and any path traversal sequence).
+pub fn is_valid_window_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 pub fn is_valid_handoff_id(id: &str) -> bool {
@@ -530,10 +605,18 @@ fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
+    if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
-    Path::new(&format!("/proc/{}", pid)).exists()
+    const EPERM: i32 = 1;
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let ret = unsafe { kill(pid as i32, 0) };
+    if ret == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
 }
 
 fn generate_window_id() -> String {
@@ -571,6 +654,18 @@ pub struct RoamingSingularityStore {
     master_key: [u8; 32],
     pub profile: UserProfile,
     pub tokens: RoamingTokensPlaintext,
+}
+
+impl fmt::Debug for RoamingSingularityStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RoamingSingularityStore")
+            .field("root_dir", &self.root_dir)
+            .field("window_id", &self.window_id)
+            .field("is_secondary_live_window", &self.is_secondary_live_window)
+            .field("master_key", &"[REDACTED]")
+            .field("tokens", &self.tokens)
+            .finish()
+    }
 }
 
 impl Drop for RoamingSingularityStore {
@@ -855,7 +950,11 @@ impl RoamingSingularityStore {
         };
 
         if !store.tokens_file_path().exists() {
-            let _ = store.save_tokens();
+            if let Ok(_lock) = InterProcessFileLock::acquire(&store.root_dir.join(".tokens.lock")) {
+                if !store.tokens_file_path().exists() {
+                    let _ = store.write_tokens_unlocked();
+                }
+            }
         }
         if !claimed_dead_paths.is_empty() {
             let _ = store.save_window_session();
@@ -901,25 +1000,39 @@ impl RoamingSingularityStore {
         self.root_dir.join("handoff")
     }
 
+    fn window_session_path_checked(sessions_dir: &Path, window_id: &str) -> Result<PathBuf, String> {
+        if !is_valid_window_id(window_id) {
+            return Err("Invalid window_id".into());
+        }
+        Ok(sessions_dir.join(format!("{}.json", window_id)))
+    }
+
     pub fn window_session_file_path(&self) -> PathBuf {
-        self.sessions_dir().join(format!("{}.json", self.window_id))
+        Self::window_session_path_checked(&self.sessions_dir(), &self.window_id)
+            .unwrap_or_else(|_| self.sessions_dir().join("invalid.json"))
     }
 
     /// Deletes this window's persisted session files (called when exiting empty or after moving
     /// this window's only tab into another window so it never reopens as a duplicate ghost window).
     pub fn delete_window_session(&self) {
-        let p = self.window_session_file_path();
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(p.with_extension("json.bak"));
+        self.delete_window_session_for(&self.window_id);
     }
 
     pub fn live_window_file_path(&self) -> PathBuf {
-        self.windows_dir().join(format!("{}.json", self.window_id))
+        let safe_id = if is_valid_window_id(&self.window_id) {
+            self.window_id.as_str()
+        } else {
+            "invalid"
+        };
+        self.windows_dir().join(format!("{}.json", safe_id))
     }
 
     /// Publishes this window's authenticated loopback transfer descriptor so other Singularity
     /// windows can drop dragged tabs directly into this window.
     pub fn register_live_window(&self, port: u16, hwnd: isize, transfer_token: &str) {
+        if !is_valid_window_id(&self.window_id) {
+            return;
+        }
         let _ = std::fs::create_dir_all(self.windows_dir());
         let desc = LiveWindowDescriptor {
             window_id: self.window_id.clone(),
@@ -936,6 +1049,9 @@ impl RoamingSingularityStore {
 
     /// Removes this window's live peer descriptor on clean shutdown.
     pub fn unregister_live_window(&self) {
+        if !is_valid_window_id(&self.window_id) {
+            return;
+        }
         let _ = std::fs::remove_file(self.live_window_file_path());
     }
 
@@ -1065,6 +1181,7 @@ impl RoamingSingularityStore {
         write_backup: bool,
     ) -> Result<(), String> {
         let sessions_dir = self.sessions_dir();
+        let path = Self::window_session_path_checked(&sessions_dir, window_id)?;
         let _ = std::fs::create_dir_all(&sessions_dir);
         let sess = WindowSessionFile {
             window_id: window_id.to_string(),
@@ -1078,7 +1195,6 @@ impl RoamingSingularityStore {
         };
         let bytes = serde_json::to_vec(&sess)
             .map_err(|e| format!("Window session serialization error: {}", e))?;
-        let path = sessions_dir.join(format!("{}.json", window_id));
         atomic_write(&path, &bytes)?;
         if write_backup && !sess.tabs.is_empty() {
             let _ = atomic_write(&path.with_extension("json.bak"), &bytes);
@@ -1089,14 +1205,9 @@ impl RoamingSingularityStore {
     /// Deletes a specific in-process window's persisted session files when closed empty or
     /// after its only tab was transferred to another window.
     pub fn delete_window_session_for(&self, window_id: &str) {
-        if window_id.is_empty()
-            || !window_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
+        let Ok(p) = Self::window_session_path_checked(&self.sessions_dir(), window_id) else {
             return;
-        }
-        let p = self.sessions_dir().join(format!("{}.json", window_id));
+        };
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("json.bak"));
     }
@@ -1124,11 +1235,9 @@ impl RoamingSingularityStore {
     }
 
     /// Allocates an isolated, reusable per-live-window WebView2 user-data directory
-    /// (`browser-ui-slots/slot-<N>`) so concurrent Singularity windows never collide on a shared
-    /// `browser-ui` WebView2 host process (`0x8007139F` environment mismatch, startup stall, or
-    /// cross-window black screen).
+    /// (`browser-ui-slots/slot-<N>`) using an inter-process lock and atomic `.owner.pid` writes
+    /// (temp + fsync + rename — never leaving a 0-byte file observable during creation).
     pub fn allocate_ui_webview_slot(&mut self) -> PathBuf {
-        use std::io::Write as _;
         if let Some(ref existing_lock) = self.ui_slot_lock_path {
             if let Some(parent) = existing_lock.parent() {
                 return parent.to_path_buf();
@@ -1136,6 +1245,7 @@ impl RoamingSingularityStore {
         }
         let slots_root = self.root_dir.join("browser-ui-slots");
         let _ = std::fs::create_dir_all(&slots_root);
+        let _slot_guard = InterProcessFileLock::acquire(&slots_root.join(".slots.lock"));
         let current_pid = std::process::id();
         let owner_payload = format!("{}\n{}\n", current_pid, self.window_id);
 
@@ -1157,27 +1267,29 @@ impl RoamingSingularityStore {
                 {
                     continue;
                 }
-                let _ = std::fs::remove_file(&lock_path);
             }
 
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                let _ = f.write_all(owner_payload.as_bytes());
+            // Atomic temp+fsync+rename guarantees no concurrent process ever sees a 0-byte `.owner.pid`.
+            if atomic_write(&lock_path, owner_payload.as_bytes()).is_ok() {
                 self.ui_slot_lock_path = Some(lock_path);
                 return slot_dir;
             }
         }
 
-        let fallback = slots_root.join(format!("ephemeral-{}", self.window_id));
+        let safe_id = if is_valid_window_id(&self.window_id) {
+            self.window_id.as_str()
+        } else {
+            "fallback"
+        };
+        let fallback = slots_root.join(format!("ephemeral-{}", safe_id));
         let _ = std::fs::create_dir_all(&fallback);
         fallback
     }
 
     pub fn release_ui_webview_slot(&mut self) {
         if let Some(lock_path) = self.ui_slot_lock_path.take() {
+            let slots_root = self.root_dir.join("browser-ui-slots");
+            let _slot_guard = InterProcessFileLock::acquire(&slots_root.join(".slots.lock"));
             let _ = std::fs::remove_file(lock_path);
         }
     }
@@ -1257,6 +1369,7 @@ impl RoamingSingularityStore {
         write_backup: bool,
     ) -> Result<(), String> {
         let sessions_dir = root_dir.join("sessions");
+        let path = Self::window_session_path_checked(&sessions_dir, window_id)?;
         let _ = std::fs::create_dir_all(&sessions_dir);
         let sess = WindowSessionFile {
             window_id: window_id.to_string(),
@@ -1270,7 +1383,6 @@ impl RoamingSingularityStore {
         };
         let bytes = serde_json::to_vec(&sess)
             .map_err(|e| format!("Window session serialization error: {}", e))?;
-        let path = sessions_dir.join(format!("{}.json", window_id));
         atomic_write(&path, &bytes)?;
         if write_backup && !sess.tabs.is_empty() {
             let _ = atomic_write(&path.with_extension("json.bak"), &bytes);
@@ -1285,6 +1397,9 @@ impl RoamingSingularityStore {
         geometry: WindowGeometry,
         write_backup: bool,
     ) -> Result<(), String> {
+        if !is_valid_window_id(window_id) {
+            return Err("Invalid window_id".into());
+        }
         let _ = Self::write_window_session_snapshot(
             root_dir,
             window_id,
@@ -1293,9 +1408,11 @@ impl RoamingSingularityStore {
             false,
             write_backup,
         );
+        // Serialize read-modify-write on profile.json across concurrent processes/threads.
+        let _profile_lock = InterProcessFileLock::acquire(&root_dir.join(".profile.lock"))?;
         let mut to_write = profile.clone();
         if Self::has_other_live_windows_at(root_dir, window_id) {
-            let existing_disk = load_profile(root_dir);
+            let existing_disk = load_profile_unlocked(root_dir);
             if !existing_disk.saved_tabs.is_empty() {
                 to_write.saved_tabs = existing_disk.saved_tabs;
                 to_write.saved_tab_groups = existing_disk.saved_tab_groups;
@@ -1405,8 +1522,7 @@ impl RoamingSingularityStore {
         std::fs::read_to_string(self.settings_file_path()).ok()
     }
 
-    /// Encrypts `self.tokens` with XChaCha20-Poly1305 AEAD and writes atomically to `tokens.enc`.
-    pub fn save_tokens(&self) -> Result<(), String> {
+    fn write_tokens_unlocked(&self) -> Result<(), String> {
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.master_key));
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
@@ -1434,17 +1550,41 @@ impl RoamingSingularityStore {
         atomic_write(&self.tokens_file_path(), &encoded)
     }
 
-    /// Inserts or updates a session/OAuth token and persists `tokens.enc` encrypted on disk.
+    /// Encrypts `self.tokens` with XChaCha20-Poly1305 AEAD and writes atomically to `tokens.enc`
+    /// under an inter-process exclusive file lock.
+    pub fn save_tokens(&self) -> Result<(), String> {
+        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+        self.write_tokens_unlocked()
+    }
+
+    /// Inserts or updates a session/OAuth token and persists `tokens.enc` encrypted on disk
+    /// under an inter-process exclusive lock (merging concurrent disk updates cleanly).
     pub fn upsert_token(&mut self, record: EncryptedAuthTokenRecord) -> Result<(), String> {
+        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+        if let Ok(mut disk_tokens) =
+            load_encrypted_tokens_unlocked(&self.root_dir, &self.master_key)
+        {
+            for disk_rec in std::mem::take(&mut disk_tokens.sessions) {
+                if disk_rec.id != record.id
+                    && !self.tokens.sessions.iter().any(|r| r.id == disk_rec.id)
+                {
+                    self.tokens.sessions.push(disk_rec);
+                }
+            }
+            if self.tokens.saved_mullvad_account.is_none() {
+                self.tokens.saved_mullvad_account = disk_tokens.saved_mullvad_account.clone();
+            }
+        }
         if let Some(existing) = self.tokens.sessions.iter_mut().find(|r| r.id == record.id) {
             *existing = record;
         } else {
             self.tokens.sessions.push(record);
         }
-        self.save_tokens()
+        self.write_tokens_unlocked()
     }
 
-    /// Batch-upserts multiple captured browser cookies/tokens and writes `tokens.enc` once if changed.
+    /// Batch-upserts multiple captured browser cookies/tokens and writes `tokens.enc` once if changed,
+    /// serialized across processes with an exclusive `.tokens.lock`.
     pub fn upsert_tokens_batch(
         &mut self,
         incoming: Vec<EncryptedAuthTokenRecord>,
@@ -1452,11 +1592,28 @@ impl RoamingSingularityStore {
         if incoming.is_empty() {
             return Ok(0);
         }
+        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+        if let Ok(mut disk_tokens) =
+            load_encrypted_tokens_unlocked(&self.root_dir, &self.master_key)
+        {
+            for disk_rec in std::mem::take(&mut disk_tokens.sessions) {
+                if !self.tokens.sessions.iter().any(|r| r.id == disk_rec.id) {
+                    self.tokens.sessions.push(disk_rec);
+                }
+            }
+            if self.tokens.saved_mullvad_account.is_none() {
+                self.tokens.saved_mullvad_account = disk_tokens.saved_mullvad_account.clone();
+            }
+        }
         let mut changed = 0usize;
         for rec in incoming {
             if let Some(existing) = self.tokens.sessions.iter_mut().find(|r| r.id == rec.id) {
                 if existing.secret_value != rec.secret_value
                     || existing.expires_unix != rec.expires_unix
+                    || existing.same_site != rec.same_site
+                    || existing.host_only != rec.host_only
+                    || existing.http_only != rec.http_only
+                    || existing.secure != rec.secure
                 {
                     *existing = rec;
                     changed += 1;
@@ -1467,14 +1624,24 @@ impl RoamingSingularityStore {
             }
         }
         if changed > 0 {
-            self.save_tokens()?;
+            self.write_tokens_unlocked()?;
         }
         Ok(changed)
     }
 
     /// Removes all encrypted tokens matching a specific provider (e.g. `"Google"`, `"Microsoft"`),
-    /// token ID, or `"ALL"` wildcard.
+    /// token ID, or `"ALL"` wildcard under `.tokens.lock`.
     pub fn remove_tokens_by_provider_or_id(&mut self, target: &str) -> Result<usize, String> {
+        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+        if let Ok(mut disk_tokens) =
+            load_encrypted_tokens_unlocked(&self.root_dir, &self.master_key)
+        {
+            for disk_rec in std::mem::take(&mut disk_tokens.sessions) {
+                if !self.tokens.sessions.iter().any(|r| r.id == disk_rec.id) {
+                    self.tokens.sessions.push(disk_rec);
+                }
+            }
+        }
         let before = self.tokens.sessions.len();
         if target.eq_ignore_ascii_case("ALL") {
             self.tokens.sessions.clear();
@@ -1485,14 +1652,15 @@ impl RoamingSingularityStore {
         }
         let removed = before.saturating_sub(self.tokens.sessions.len());
         if removed > 0 {
-            self.save_tokens()?;
+            self.write_tokens_unlocked()?;
         }
         Ok(removed)
     }
 
     pub fn clear_all_tokens(&mut self) -> Result<(), String> {
+        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
         self.tokens.sessions.clear();
-        self.save_tokens()
+        self.write_tokens_unlocked()
     }
 
     /// Records a history item in RAM without forcing an immediate disk `fsync`.
@@ -1929,12 +2097,9 @@ pub fn classify_tracker_or_malicious_cookie(
         return Some(CookieThreatKind::Malicious);
     }
 
-    // 2. Hard protection for all auth tokens, sessions, consent, security & functional cookies.
-    if is_protected_session_or_functional_cookie(&d, &n) {
-        return None;
-    }
-
-    // 3. Dedicated advertising network domains (never host user login accounts).
+    // 2. Dedicated advertising network domains (never host user login accounts; checked BEFORE
+    //    cookie-name protection so ad-network cookies named `*sess*`, `*token*`, or `__Secure-*`
+    //    are still scrubbed).
     const AD_DOMAINS: &[&str] = &[
         "doubleclick.net",
         "googlesyndication.com",
@@ -1995,7 +2160,8 @@ pub fn classify_tracker_or_malicious_cookie(
         return Some(CookieThreatKind::Advertising);
     }
 
-    // 4. Dedicated analytics, behavioral tracking & data-broker domains.
+    // 3. Dedicated analytics, behavioral tracking & data-broker domains (checked BEFORE
+    //    cookie-name protection so tracker domains cannot evade scrubbing with `*sess*`/`*token*`).
     const TRACKER_DOMAINS: &[&str] = &[
         "google-analytics.com",
         "googletagmanager.com",
@@ -2049,6 +2215,11 @@ pub fn classify_tracker_or_malicious_cookie(
         .any(|t| matches_domain_or_sub(&d, t))
     {
         return Some(CookieThreatKind::Tracker);
+    }
+
+    // 4. Hard protection for all first-party auth tokens, sessions, consent, security & functional cookies.
+    if is_protected_session_or_functional_cookie(&d, &n) {
+        return None;
     }
 
     // 5. Unambiguous first-party-injected advertising cookies (Meta Pixel, Google Ads, Criteo, Prebid, etc.).
@@ -2170,7 +2341,152 @@ pub fn unix_now() -> u64 {
         .unwrap_or(1_763_500_000)
 }
 
-fn load_profile(root_dir: &Path) -> UserProfile {
+/// Cross-platform exclusive inter-process file lock protecting read-modify-write operations on
+/// `profile.json`, `tokens.enc`, `.slots.lock`, and `.keyring.lock`.
+/// - On Unix (Linux/macOS): uses kernel advisory `flock(LOCK_EX)` on an open file descriptor
+///   (per-open-file-description semantics serialize both threads and processes cleanly, and the
+///   lock file is never unlinked while in use to avoid inode races).
+/// - On Windows/other non-Unix: uses atomic exclusive lock-file creation (`atomic_write_create_new`)
+///   carrying `PID\ntimestamp\n` with automatic stale-lock recovery for dead PIDs or expired locks.
+#[cfg(unix)]
+struct InterProcessFileLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl InterProcessFileLock {
+    fn acquire(lock_path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(lock_path)
+            .map_err(|e| format!("Failed opening lock {}: {}", lock_path.display(), e))?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if ret == 0 {
+                return Ok(Self { file });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timed out acquiring exclusive lock {}",
+                        lock_path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            return Err(format!("flock failed on {}: {}", lock_path.display(), err));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterProcessFileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        const LOCK_UN: i32 = 8;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        unsafe {
+            let _ = flock(self.file.as_raw_fd(), LOCK_UN);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct InterProcessFileLock {
+    path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl InterProcessFileLock {
+    fn acquire(lock_path: &Path) -> Result<Self, String> {
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let payload = format!("{}\n{}\n", std::process::id(), unix_now());
+            if atomic_write_create_new(lock_path, payload.as_bytes())? {
+                return Ok(Self {
+                    path: lock_path.to_path_buf(),
+                });
+            }
+
+            // Detect stale locks owned by dead PIDs or expired (>30s) crash leftovers.
+            let mut is_stale = false;
+            if let Ok(raw) = std::fs::read_to_string(lock_path) {
+                let mut lines = raw.lines();
+                let owner_pid = lines
+                    .next()
+                    .and_then(|l| l.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                let created_unix = lines
+                    .next()
+                    .and_then(|l| l.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                if (owner_pid != 0 && !is_process_alive(owner_pid))
+                    || (created_unix != 0 && unix_now().saturating_sub(created_unix) > 30)
+                {
+                    is_stale = true;
+                }
+            } else if let Ok(meta) = std::fs::metadata(lock_path) {
+                if let Ok(modified) = meta.modified() {
+                    if modified
+                        .elapsed()
+                        .map(|d| d > Duration::from_secs(30))
+                        .unwrap_or(false)
+                    {
+                        is_stale = true;
+                    }
+                }
+            }
+
+            if is_stale {
+                let _ = std::fs::remove_file(lock_path);
+                continue;
+            }
+
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Timed out acquiring exclusive lock {}",
+                    lock_path.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for InterProcessFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn load_profile_unlocked(root_dir: &Path) -> UserProfile {
     for candidate in ["profile.json", "profile.json.bak"] {
         let path = root_dir.join(candidate);
         if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -2182,7 +2498,12 @@ fn load_profile(root_dir: &Path) -> UserProfile {
     UserProfile::default()
 }
 
-fn load_encrypted_tokens(
+fn load_profile(root_dir: &Path) -> UserProfile {
+    let _lock = InterProcessFileLock::acquire(&root_dir.join(".profile.lock"));
+    load_profile_unlocked(root_dir)
+}
+
+fn load_encrypted_tokens_unlocked(
     root_dir: &Path,
     master_key: &[u8; 32],
 ) -> Result<RoamingTokensPlaintext, String> {
@@ -2222,6 +2543,14 @@ fn load_encrypted_tokens(
         .map_err(|_| "Malformed decrypted token payload".to_string());
     plaintext.zeroize();
     decoded
+}
+
+fn load_encrypted_tokens(
+    root_dir: &Path,
+    master_key: &[u8; 32],
+) -> Result<RoamingTokensPlaintext, String> {
+    let _lock = InterProcessFileLock::acquire(&root_dir.join(".tokens.lock"))?;
+    load_encrypted_tokens_unlocked(root_dir, master_key)
 }
 
 /// Atomically writes `bytes` to `target` using an exclusive random temporary file created with
@@ -2358,7 +2687,7 @@ fn atomic_write_create_new(target: &Path, bytes: &[u8]) -> Result<bool, String> 
 }
 
 #[cfg(not(target_os = "windows"))]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct UnixSealedMasterKey {
     magic: String,
     salt_b64: String,
@@ -2367,24 +2696,130 @@ struct UnixSealedMasterKey {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn derive_unix_machine_kek(salt: &[u8; 32], root_dir: &Path) -> Zeroizing<[u8; 32]> {
-    let machine_id = std::fs::read_to_string("/etc/machine-id")
-        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
-        .unwrap_or_default();
-    let user = std::env::var("USER").unwrap_or_default();
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(b"Singularity-Unix-MasterKey-KEK-v2:");
-    hasher.update(salt);
-    hasher.update(b":");
-    hasher.update(machine_id.trim().as_bytes());
-    hasher.update(b":");
-    hasher.update(user.as_bytes());
-    hasher.update(b":");
-    hasher.update(home.as_bytes());
-    hasher.update(b":");
-    hasher.update(root_dir.to_string_lossy().as_bytes());
-    Zeroizing::new(hasher.finalize().into())
+impl fmt::Debug for UnixSealedMasterKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnixSealedMasterKey")
+            .field("magic", &self.magic)
+            .field("salt_b64", &"[REDACTED]")
+            .field("xnonce_b64", &"[REDACTED]")
+            .field("ciphertext_b64", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
+    const BLOCK_LEN: usize = 64;
+    let mut key_block = Zeroizing::new([0u8; BLOCK_LEN]);
+    if key.len() > BLOCK_LEN {
+        let digest = Sha256::digest(key);
+        key_block[..32].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = Zeroizing::new([0x36u8; BLOCK_LEN]);
+    let mut opad = Zeroizing::new([0x5cu8; BLOCK_LEN]);
+    for i in 0..BLOCK_LEN {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad.as_ref());
+    inner.update(data);
+    let inner_arr: [u8; 32] = inner.finalize().into();
+    let inner_hash = Zeroizing::new(inner_arr);
+
+    let mut outer = Sha256::new();
+    outer.update(opad.as_ref());
+    outer.update(inner_hash.as_ref());
+    let out: [u8; 32] = outer.finalize().into();
+    Zeroizing::new(out)
+}
+
+/// RFC 5869 HKDF-SHA256 (Extract + 32-byte Expand).
+#[cfg(not(target_os = "windows"))]
+fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
+    let prk = hmac_sha256(salt, ikm);
+    let mut expand_in = Zeroizing::new(Vec::with_capacity(info.len() + 1));
+    expand_in.extend_from_slice(info);
+    expand_in.push(1u8);
+    hmac_sha256(prk.as_ref(), &expand_in)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_unix_kek_seed_file(seed_path: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
+    let meta = std::fs::symlink_metadata(seed_path)
+        .map_err(|e| format!("Failed inspecting {}: {}", seed_path.display(), e))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(format!("Refusing non-regular kek.seed at {}", seed_path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o077) != 0 {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(seed_path, perms)
+                .map_err(|e| format!("Failed tightening permissions on {}: {}", seed_path.display(), e))?;
+        }
+    }
+    let bytes = Zeroizing::new(
+        std::fs::read(seed_path)
+            .map_err(|e| format!("Failed reading {}: {}", seed_path.display(), e))?,
+    );
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Corrupted kek.seed length (expected 32 bytes)".to_string())?;
+    Ok(Zeroizing::new(arr))
+}
+
+/// Loads (or atomically creates with `0o600` permissions when `create_if_missing` is `true`) the
+/// random 256-bit local KEK seed persisted at `<root_dir>/kek.seed`.
+#[cfg(not(target_os = "windows"))]
+fn load_or_create_unix_kek_seed(
+    root_dir: &Path,
+    create_if_missing: bool,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let seed_path = root_dir.join("kek.seed");
+    if seed_path.exists() || std::fs::symlink_metadata(&seed_path).is_ok() {
+        return read_unix_kek_seed_file(&seed_path);
+    }
+    if !create_if_missing {
+        return Err("Missing kek.seed required to unseal Unix master.key".into());
+    }
+
+    let mut fresh = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(fresh.as_mut());
+    if !atomic_write_create_new(&seed_path, fresh.as_ref())? {
+        return read_unix_kek_seed_file(&seed_path);
+    }
+    Ok(fresh)
+}
+
+/// Derives the Unix master-key wrapping KEK from the random `0o600` `kek.seed` secret combined
+/// with per-envelope 256-bit `salt` and domain-separated `root_dir` via HKDF-SHA256 + Argon2id.
+/// Never derives KEKs solely from world-readable machine/environment metadata.
+#[cfg(not(target_os = "windows"))]
+fn derive_unix_sealed_kek(
+    salt: &[u8; 32],
+    root_dir: &Path,
+    create_seed: bool,
+) -> Result<singularity_vault::DerivedVaultKey, String> {
+    let seed = load_or_create_unix_kek_seed(root_dir, create_seed)?;
+    let mut info = Vec::with_capacity(64 + root_dir.as_os_str().len());
+    info.extend_from_slice(b"Singularity-Unix-MasterKey-KEK-v3:");
+    info.extend_from_slice(root_dir.to_string_lossy().as_bytes());
+    let hkdf_ikm = hkdf_sha256(salt, seed.as_ref(), &info);
+    let kdf_cfg = singularity_vault::Argon2idConfig {
+        memory_kib: 4_096,
+        iterations: 2,
+        parallelism: 1,
+    };
+    singularity_vault::DerivedVaultKey::derive_argon2id(hkdf_ikm.as_ref(), salt, kdf_cfg)
+        .map_err(|e| format!("Failed deriving Unix master KEK via Argon2id: {}", e))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2395,36 +2830,54 @@ fn unix_keyring_account_id(root_dir: &Path) -> String {
     format!("roaming-master-{}", &digest[..16])
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_macos_security_bin() -> Option<&'static Path> {
+    let p = Path::new("/usr/bin/security");
+    p.is_file().then_some(p)
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn resolve_unix_secret_tool_bin() -> Option<&'static Path> {
+    const CANDIDATES: &[&str] = &["/usr/bin/secret-tool", "/usr/local/bin/secret-tool"];
+    CANDIDATES.iter().map(Path::new).find(|p| p.is_file())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn try_load_unix_keyring_key(root_dir: &Path) -> Option<[u8; 32]> {
     let account = unix_keyring_account_id(root_dir);
     #[cfg(target_os = "macos")]
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "singularity-browser",
-            "-a",
-            &account,
-            "-w",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = {
+        let bin = resolve_macos_security_bin()?;
+        std::process::Command::new(bin)
+            .args([
+                "find-generic-password",
+                "-s",
+                "singularity-browser",
+                "-a",
+                &account,
+                "-w",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?
+    };
     #[cfg(not(target_os = "macos"))]
-    let out = std::process::Command::new("secret-tool")
-        .args([
-            "lookup",
-            "service",
-            "singularity-browser",
-            "account",
-            &account,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = {
+        let bin = resolve_unix_secret_tool_bin()?;
+        std::process::Command::new(bin)
+            .args([
+                "lookup",
+                "service",
+                "singularity-browser",
+                "account",
+                &account,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?
+    };
 
     if !out.status.success() {
         return None;
@@ -2440,26 +2893,44 @@ fn try_store_unix_keyring_key(root_dir: &Path, master_key: &[u8; 32]) -> bool {
     let encoded = Zeroizing::new(BASE64.encode(master_key));
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                "singularity-browser",
-                "-a",
-                &account,
-                "-w",
-                encoded.as_str(),
-            ])
-            .stdin(std::process::Stdio::null())
+        let Some(bin) = resolve_macos_security_bin() else {
+            return false;
+        };
+        // Pass the secret exclusively via interactive stdin (`security -i`) so the master key
+        // NEVER appears in argv / `ps` process listings.
+        let Ok(mut child) = std::process::Command::new(bin)
+            .arg("-i")
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        else {
+            return false;
+        };
+        let cmd_line = Zeroizing::new(format!(
+            "add-generic-password -U -s singularity-browser -a {} -w {}\n",
+            account,
+            encoded.as_str()
+        ));
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(cmd_line.as_bytes()).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+        let Ok(out) = child.wait_with_output() else {
+            return false;
+        };
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        out.status.success() && !stderr_text.contains("security:")
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let Ok(mut child) = std::process::Command::new("secret-tool")
+        let Some(bin) = resolve_unix_secret_tool_bin() else {
+            return false;
+        };
+        let Ok(mut child) = std::process::Command::new(bin)
             .args([
                 "store",
                 "--label=Singularity Browser Roaming Master Key",
@@ -2476,7 +2947,11 @@ fn try_store_unix_keyring_key(root_dir: &Path, master_key: &[u8; 32]) -> bool {
             return false;
         };
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(encoded.as_bytes());
+            if stdin.write_all(encoded.as_bytes()).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
         }
         child.wait().is_ok_and(|s| s.success())
     }
@@ -2500,6 +2975,11 @@ fn read_dpapi_master_key(dpapi_path: &Path) -> Result<[u8; 32], String> {
 #[cfg(not(target_os = "windows"))]
 fn read_unix_master_key(key_path: &Path, root_dir: &Path) -> Result<[u8; 32], String> {
     // Fail closed on existing key file — NEVER silently regenerate and destroy tokens.enc
+    let meta = std::fs::symlink_metadata(key_path)
+        .map_err(|e| format!("Failed inspecting {}: {}", key_path.display(), e))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(format!("Refusing non-regular master.key at {}", key_path.display()));
+    }
     let raw = Zeroizing::new(
         std::fs::read_to_string(key_path)
             .map_err(|e| format!("Failed reading {}: {}", key_path.display(), e))?,
@@ -2523,17 +3003,9 @@ fn read_unix_master_key(key_path: &Path, root_dir: &Path) -> Result<[u8; 32], St
         let xnonce: [u8; 24] = nonce_vec
             .try_into()
             .map_err(|_| "Invalid master.key nonce length".to_string())?;
-        let kek = derive_unix_machine_kek(&salt, root_dir);
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_ref()));
+        let kek = derive_unix_sealed_kek(&salt, root_dir, false)?;
         let pt = Zeroizing::new(
-            cipher
-                .decrypt(
-                    XNonce::from_slice(&xnonce),
-                    Payload {
-                        msg: &ct,
-                        aad: UNIX_SEALED_KEY_MAGIC.as_bytes(),
-                    },
-                )
+            kek.decrypt_xchacha20_poly1305(&ct, &xnonce, UNIX_SEALED_KEY_MAGIC.as_bytes())
                 .map_err(|_| "Failed to unseal Unix master.key".to_string())?,
         );
         let arr: [u8; 32] = pt
@@ -2543,7 +3015,7 @@ fn read_unix_master_key(key_path: &Path, root_dir: &Path) -> Result<[u8; 32], St
         return Ok(arr);
     }
 
-    // Legacy Base64 plaintext migration path (auto-re-seals to authenticated v2 envelope)
+    // Legacy Base64 plaintext migration path (auto-re-seals to authenticated v3 Argon2id/HKDF envelope)
     let decoded = Zeroizing::new(
         BASE64
             .decode(raw.trim())
@@ -2561,6 +3033,7 @@ fn load_or_create_master_key(root_dir: &Path) -> Result<[u8; 32], String> {
     let _guard = MASTER_KEY_INIT_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let _file_lock = InterProcessFileLock::acquire(&root_dir.join(".keyring.lock"))?;
 
     #[cfg(target_os = "windows")]
     {
@@ -2592,8 +3065,9 @@ fn load_or_create_master_key(root_dir: &Path) -> Result<[u8; 32], String> {
 
         let mut fresh_key = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(fresh_key.as_mut());
-        // Prefer OS keyring (GNOME Keyring / KWallet via secret-tool or macOS Keychain);
-        // fall back to 0600 sealed master.key only when running headless without a keyring daemon.
+        // Prefer OS keyring (GNOME Keyring / KWallet via verified absolute secret-tool path or
+        // macOS Keychain via /usr/bin/security -i stdin); fall back to 0600 kek.seed + Argon2id
+        // sealed master.key only when running headless without a keyring daemon.
         if try_store_unix_keyring_key(root_dir, &fresh_key) {
             return Ok(*fresh_key);
         }
@@ -2614,15 +3088,12 @@ fn encode_unix_sealed_master_key(
     let mut xnonce = [0u8; 24];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut xnonce);
-    let kek = derive_unix_machine_kek(&salt, root_dir);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.as_ref()));
-    let ct = cipher
-        .encrypt(
-            XNonce::from_slice(&xnonce),
-            Payload {
-                msg: master_key.as_ref(),
-                aad: UNIX_SEALED_KEY_MAGIC.as_bytes(),
-            },
+    let kek = derive_unix_sealed_kek(&salt, root_dir, true)?;
+    let ct = kek
+        .encrypt_xchacha20_poly1305(
+            master_key.as_ref(),
+            &xnonce,
+            UNIX_SEALED_KEY_MAGIC.as_bytes(),
         )
         .map_err(|_| "Failed to seal Unix master.key".to_string())?;
     let env = UnixSealedMasterKey {
@@ -2776,7 +3247,10 @@ fn dpapi_unprotect(sealed: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 struct PersistQueueState {
-    pending: Option<(PathBuf, String, UserProfile, WindowGeometry)>,
+    /// Per-`(root_dir, window_id)` dirty snapshots so concurrent saves from multiple windows
+    /// or during active disk I/O are never overwritten or dropped.
+    dirty: HashMap<(PathBuf, String), (UserProfile, WindowGeometry, u64)>,
+    in_flight: usize,
     flush_requested: bool,
     generation: u64,
     flushed_generation: u64,
@@ -2794,7 +3268,8 @@ impl ProfilePersistWorker {
         INSTANCE.get_or_init(|| {
             let worker = ProfilePersistWorker {
                 state: Mutex::new(PersistQueueState {
-                    pending: None,
+                    dirty: HashMap::new(),
+                    in_flight: 0,
                     flush_requested: false,
                     generation: 0,
                     flushed_generation: 0,
@@ -2805,24 +3280,27 @@ impl ProfilePersistWorker {
             let _ = std::thread::Builder::new()
                 .name("singularity-io-persist".into())
                 .spawn(|| {
-                    // Wait until OnceLock initialization completes, then loop forever coalescing writes.
+                    // Wait until OnceLock initialization completes, then loop forever draining
+                    // dirty snapshots until convergence so concurrent writes are never lost.
                     let w = profile_persist_worker();
                     let mut last_backup_at = Instant::now()
                         .checked_sub(Duration::from_secs(60))
                         .unwrap_or_else(Instant::now);
                     loop {
-                        let (job, gen_id, force_bak) = {
+                        let (batch, batch_max_gen, force_bak) = {
                             let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
-                            while st.pending.is_none() {
+                            while st.dirty.is_empty() {
                                 if st.flush_requested {
                                     st.flush_requested = false;
-                                    st.flushed_generation = st.generation;
+                                    if st.generation > st.flushed_generation {
+                                        st.flushed_generation = st.generation;
+                                    }
                                     w.done_cond.notify_all();
                                 }
                                 st = w.wake_cond.wait(st).unwrap_or_else(|e| e.into_inner());
                             }
                             // Brief 220ms coalescing window so rapid tab switches / title ticks
-                            // collapse into ONE single atomic disk write instead of hammering NTFS!
+                            // collapse per `(root_dir, window_id)` instead of hammering disk I/O.
                             if !st.flush_requested {
                                 let (guard, _) = w
                                     .wake_cond
@@ -2830,12 +3308,26 @@ impl ProfilePersistWorker {
                                     .unwrap_or_else(|e| e.into_inner());
                                 st = guard;
                             }
-                            let job = st.pending.take();
-                            let gen_id = st.generation;
+                            let batch: Vec<(PathBuf, String, UserProfile, WindowGeometry, u64)> = st
+                                .dirty
+                                .drain()
+                                .map(|((root_dir, window_id), (profile, geometry, gen_id))| {
+                                    (root_dir, window_id, profile, geometry, gen_id)
+                                })
+                                .collect();
+                            let batch_max_gen = batch
+                                .iter()
+                                .map(|entry| entry.4)
+                                .max()
+                                .unwrap_or(st.flushed_generation);
                             let force_bak = st.flush_requested;
-                            (job, gen_id, force_bak)
+                            st.in_flight += batch.len();
+                            (batch, batch_max_gen, force_bak)
                         };
-                        if let Some((root_dir, window_id, profile, geometry)) = job {
+
+                        let batch_len = batch.len();
+                        let mut wrote_backup = false;
+                        for (root_dir, window_id, profile, geometry, _gen_id) in batch {
                             let write_backup =
                                 force_bak || last_backup_at.elapsed() >= Duration::from_secs(30);
                             let _ = RoamingSingularityStore::write_profile_snapshot(
@@ -2846,12 +3338,19 @@ impl ProfilePersistWorker {
                                 write_backup,
                             );
                             if write_backup {
-                                last_backup_at = Instant::now();
+                                wrote_backup = true;
                             }
                         }
+                        if wrote_backup {
+                            last_backup_at = Instant::now();
+                        }
+
                         let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
-                        st.flushed_generation = gen_id;
-                        if st.pending.is_none() {
+                        st.in_flight = st.in_flight.saturating_sub(batch_len);
+                        if batch_max_gen > st.flushed_generation {
+                            st.flushed_generation = batch_max_gen;
+                        }
+                        if st.dirty.is_empty() && st.in_flight == 0 {
                             st.flush_requested = false;
                         }
                         w.done_cond.notify_all();
@@ -2869,21 +3368,23 @@ impl ProfilePersistWorker {
         geometry: WindowGeometry,
     ) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.pending = Some((root_dir, window_id, profile, geometry));
-        st.generation = st.generation.wrapping_add(1);
+        st.generation = st.generation.saturating_add(1);
+        let gen_id = st.generation;
+        st.dirty
+            .insert((root_dir, window_id), (profile, geometry, gen_id));
         self.wake_cond.notify_one();
     }
 
     fn flush_now(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let target = st.generation;
-        if st.pending.is_none() && st.flushed_generation == target {
+        if st.dirty.is_empty() && st.in_flight == 0 && st.flushed_generation >= target {
             return;
         }
         st.flush_requested = true;
         self.wake_cond.notify_one();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while st.flushed_generation != target || st.pending.is_some() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.flushed_generation < target {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -2905,9 +3406,15 @@ fn profile_persist_worker() -> &'static ProfilePersistWorker {
 mod tests {
     use super::*;
 
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let mut rnd = [0u8; 6];
+        OsRng.fill_bytes(&mut rnd);
+        std::env::temp_dir().join(format!("{}_{}_{}", prefix, unix_now(), hex::encode(rnd)))
+    }
+
     #[test]
     fn test_roaming_singularity_encrypted_google_microsoft_tokens_roundtrip() {
-        let test_dir = std::env::temp_dir().join(format!("singularity_roaming_test_{}", unix_now()));
+        let test_dir = unique_test_dir("singularity_roaming_test");
         let _ = std::fs::remove_dir_all(&test_dir);
 
         {
@@ -2933,6 +3440,8 @@ mod tests {
                     secret_value: "g.a000secretGoogleSessionToken998877".into(),
                     http_only: true,
                     secure: true,
+                    same_site: Some("lax".into()),
+                    host_only: false,
                     expires_unix: Some(1_900_000_000),
                     updated_unix: unix_now(),
                     kind: "cookie_session".into(),
@@ -2949,6 +3458,8 @@ mod tests {
                     secret_value: "msft_live_encrypted_oauth_session_token_445566".into(),
                     http_only: true,
                     secure: true,
+                    same_site: Some("none".into()),
+                    host_only: true,
                     expires_unix: Some(1_900_000_000),
                     updated_unix: unix_now(),
                     kind: "cookie_session".into(),
@@ -2965,30 +3476,25 @@ mod tests {
         let reopened =
             RoamingSingularityStore::open_at(test_dir.clone()).expect("Re-open .singularity");
         assert_eq!(reopened.tokens.sessions.len(), 2);
-        assert!(reopened
-            .tokens
-            .sessions
-            .iter()
-            .any(|t| t.provider == "Google"
-                && t.secret_value == "g.a000secretGoogleSessionToken998877"));
-        assert!(reopened
-            .tokens
-            .sessions
-            .iter()
-            .any(|t| t.provider == "Microsoft"
-                && t.secret_value == "msft_live_encrypted_oauth_session_token_445566"));
+        assert!(reopened.tokens.sessions.iter().any(|t| {
+            t.provider == "Google"
+                && t.secret_value == "g.a000secretGoogleSessionToken998877"
+                && t.same_site.as_deref() == Some("lax")
+                && !t.host_only
+        }));
+        assert!(reopened.tokens.sessions.iter().any(|t| {
+            t.provider == "Microsoft"
+                && t.secret_value == "msft_live_encrypted_oauth_session_token_445566"
+                && t.same_site.as_deref() == Some("none")
+                && t.host_only
+        }));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     #[test]
     fn test_concurrent_first_launch_never_corrupts_master_key_or_tokens() {
-        let mut rnd = [0u8; 6];
-        OsRng.fill_bytes(&mut rnd);
-        let test_dir = std::env::temp_dir().join(format!(
-            "singularity_concurrent_init_{}",
-            hex::encode(rnd)
-        ));
+        let test_dir = unique_test_dir("singularity_concurrent_init");
         let _ = std::fs::remove_dir_all(&test_dir);
 
         let handles: Vec<_> = (0..16)
@@ -3007,9 +3513,260 @@ mod tests {
             .map(|h| h.join().expect("Worker thread panicked"))
             .collect();
         for k in &keys[1..] {
-            assert_eq!(k, &keys[0], "All concurrent instances must converge on the exact same master key");
+            assert_eq!(
+                k, &keys[0],
+                "All concurrent instances must converge on the exact same master key"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_is_valid_window_id_and_path_traversal_rejection() {
+        assert!(is_valid_window_id("win-1234-abcdef01"));
+        assert!(is_valid_window_id("Main_Window-0"));
+        assert!(is_valid_window_id(&"a".repeat(64)));
+
+        for bad in [
+            "",
+            &"a".repeat(65),
+            ".",
+            "..",
+            "../evil",
+            "a/b",
+            "a\\b",
+            "C:win",
+            "win\0id",
+            "win id",
+            "win.json",
+        ] {
+            assert!(
+                !is_valid_window_id(bad),
+                "Expected invalid window_id to be rejected: {:?}",
+                bad
+            );
+        }
+
+        let test_dir = unique_test_dir("singularity_winid_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let store = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        let res = store.save_window_session_for(
+            "../escaped_session",
+            &[],
+            &[],
+            0,
+            WindowGeometry::default(),
+            false,
+            true,
+        );
+        assert!(res.is_err(), "Path traversal window_id must return Err");
+        assert!(!test_dir.join("escaped_session.json").exists());
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_debug_redacts_secrets_on_all_sensitive_structs() {
+        let token_secret = "SUPER_SECRET_OAUTH_TOKEN_XYZ_987654";
+        let mullvad_secret = "1122334455667788";
+        let transfer_secret = "PEER_TRANSFER_TOKEN_SECRET_ABC";
+
+        let rec = EncryptedAuthTokenRecord {
+            id: "id-1".into(),
+            provider: "Google".into(),
+            domain: ".google.com".into(),
+            path: "/".into(),
+            token_name: "SID".into(),
+            secret_value: token_secret.into(),
+            http_only: true,
+            secure: true,
+            same_site: Some("strict".into()),
+            host_only: true,
+            expires_unix: None,
+            updated_unix: 100,
+            kind: "cookie_session".into(),
+        };
+        let rec_dbg = format!("{:?}", rec);
+        assert!(rec_dbg.contains("[REDACTED]"));
+        assert!(!rec_dbg.contains(token_secret));
+
+        let plain = RoamingTokensPlaintext {
+            sessions: vec![rec],
+            saved_mullvad_account: Some(mullvad_secret.into()),
+        };
+        let plain_dbg = format!("{:?}", plain);
+        assert!(plain_dbg.contains("[REDACTED]"));
+        assert!(!plain_dbg.contains(token_secret));
+        assert!(!plain_dbg.contains(mullvad_secret));
+
+        let desc = LiveWindowDescriptor {
+            window_id: "win-1".into(),
+            pid: 42,
+            port: 9999,
+            hwnd: 1,
+            transfer_token: transfer_secret.into(),
+            updated_unix: 100,
+        };
+        let desc_dbg = format!("{:?}", desc);
+        assert!(desc_dbg.contains("[REDACTED]"));
+        assert!(!desc_dbg.contains(transfer_secret));
+
+        let env = EncryptedTokensEnvelope {
+            magic: TOKENS_ENVELOPE_MAGIC.into(),
+            xnonce_base64: "NONCE_RAW_LEAK".into(),
+            ciphertext_base64: "CIPHER_RAW_LEAK".into(),
+        };
+        let env_dbg = format!("{:?}", env);
+        assert!(env_dbg.contains("[REDACTED]"));
+        assert!(!env_dbg.contains("NONCE_RAW_LEAK"));
+        assert!(!env_dbg.contains("CIPHER_RAW_LEAK"));
+
+        let test_dir = unique_test_dir("singularity_dbg_store");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let store = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        let store_dbg = format!("{:?}", store);
+        assert!(store_dbg.contains("master_key: \"[REDACTED]\""));
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_ad_and_tracker_domains_override_session_cookie_name_protection() {
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(
+                ".doubleclick.net",
+                "__Secure-ad_session_token",
+                "val"
+            ),
+            Some(CookieThreatKind::Advertising)
+        );
+        assert_eq!(
+            classify_tracker_or_malicious_cookie("ads.google.com", "session_token", "val"),
+            Some(CookieThreatKind::Advertising)
+        );
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(".hotjar.com", "hj_session_token", "val"),
+            Some(CookieThreatKind::Tracker)
+        );
+        // First-party legitimate login/session cookies remain strictly protected
+        assert_eq!(
+            classify_tracker_or_malicious_cookie(".google.com", "__Secure-1PSID", "val"),
+            None
+        );
+        assert_eq!(
+            classify_tracker_or_malicious_cookie("accounts.google.com", "SID", "val"),
+            None
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_unix_kek_seed_v3_and_posix_kill_process_liveness() {
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
+
+        let test_dir = unique_test_dir("singularity_unix_kek_v3");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
+        let key_path = test_dir.join("master.key");
+        save_unix_sealed_master_key(&key_path, &test_dir, &key).expect("Seal v3 master.key");
+
+        let seed_path = test_dir.join("kek.seed");
+        assert!(seed_path.is_file(), "Random 256-bit kek.seed must be created");
+        assert_eq!(std::fs::read(&seed_path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&seed_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "kek.seed must have strict 0600 permissions");
+        }
+
+        let raw_key_json = std::fs::read_to_string(&key_path).unwrap();
+        let parsed: UnixSealedMasterKey = serde_json::from_str(&raw_key_json).unwrap();
+        assert_eq!(parsed.magic, UNIX_SEALED_KEY_MAGIC);
+        let dbg = format!("{:?}", parsed);
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains(&parsed.ciphertext_b64));
+
+        let recovered = read_unix_master_key(&key_path, &test_dir).expect("Unseal v3 master.key");
+        assert_eq!(recovered, key);
+
+        // Removing kek.seed must fail closed and NOT silently create a replacement seed.
+        std::fs::remove_file(&seed_path).unwrap();
+        assert!(read_unix_master_key(&key_path, &test_dir).is_err());
+        assert!(!seed_path.exists());
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_ui_webview_slot_atomic_owner_pid_and_distinct_slots() {
+        let test_dir = unique_test_dir("singularity_slots_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        let mut store_a = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        let mut store_b = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        let slot_a = store_a.allocate_ui_webview_slot();
+        let slot_b = store_b.allocate_ui_webview_slot();
+        assert_ne!(slot_a, slot_b, "Distinct window instances must receive distinct slots");
+
+        let pid_str = std::process::id().to_string();
+        for (slot, win_id) in [(&slot_a, store_a.window_id()), (&slot_b, store_b.window_id())] {
+            let owner = std::fs::read_to_string(slot.join(".owner.pid")).unwrap();
+            assert!(!owner.trim().is_empty());
+            assert!(owner.contains(&pid_str));
+            assert!(owner.contains(win_id));
+        }
+
+        drop(store_a);
+        drop(store_b);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_profile_persist_worker_concurrent_multi_window_convergence() {
+        let dir_a = unique_test_dir("singularity_persist_a");
+        let dir_b = unique_test_dir("singularity_persist_b");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+
+        let mut store_a = RoamingSingularityStore::open_at(dir_a.clone()).unwrap();
+        let mut store_b = RoamingSingularityStore::open_at(dir_b.clone()).unwrap();
+
+        store_a.profile.default_search_engine = "brave".into();
+        store_b.profile.default_search_engine = "startpage".into();
+        store_a.profile.saved_tabs.push(SavedTabEntry {
+            title: "Alpha".into(),
+            url: "https://alpha.example".into(),
+            media_time_sec: None,
+            scroll_y: None,
+            group_id: None,
+            favicon_url: None,
+        });
+        store_b.profile.saved_tabs.push(SavedTabEntry {
+            title: "Beta".into(),
+            url: "https://beta.example".into(),
+            media_time_sec: None,
+            scroll_y: None,
+            group_id: None,
+            favicon_url: None,
+        });
+
+        // Back-to-back async schedules for distinct windows must BOTH converge on disk.
+        store_a.schedule_save_profile();
+        store_b.schedule_save_profile();
+        store_b.flush_async_persistence();
+
+        let loaded_a = load_profile(&dir_a);
+        let loaded_b = load_profile(&dir_b);
+        assert_eq!(loaded_a.default_search_engine, "brave");
+        assert_eq!(loaded_b.default_search_engine, "startpage");
+        assert!(loaded_a.saved_tabs.iter().any(|t| t.url == "https://alpha.example"));
+        assert!(loaded_b.saved_tabs.iter().any(|t| t.url == "https://beta.example"));
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }

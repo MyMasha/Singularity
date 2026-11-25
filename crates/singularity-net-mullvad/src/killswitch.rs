@@ -183,7 +183,9 @@ pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 /// Checks whether an IPv6 address is loopback, unspecified, link-local, ULA (fc00::/7),
-/// multicast, or an IPv4-mapped/compatible address pointing to a non-global IPv4.
+/// multicast, documentation, IPv4-mapped/compatible pointing to non-global IPv4,
+/// or an IPv6 transition/tunneling prefix (NAT64 `64:ff9b::/96` & `64:ff9b:1::/48`,
+/// 6to4 `2002::/16`, Teredo `2001::/32`).
 pub fn is_non_global_ipv6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_non_global_ipv4(v4);
@@ -197,7 +199,16 @@ pub fn is_non_global_ipv6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()
         || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 Unique Local Addresses
         || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 Link-Local
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 Documentation
+        || (segs[0] == 0x0064
+            && segs[1] == 0xff9b
+            && segs[2] == 0
+            && segs[3] == 0
+            && segs[4] == 0
+            && segs[5] == 0) // 64:ff9b::/96 NAT64 Well-Known Prefix (RFC 6052)
+        || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001) // 64:ff9b:1::/48 NAT64 Local-Use Prefix (RFC 8215)
+        || segs[0] == 0x2002 // 2002::/16 6to4 Transition Prefix (RFC 3056)
+        || (segs[0] == 0x2001 && segs[1] == 0x0000) // 2001::/32 Teredo Tunneling Prefix (RFC 4380)
 }
 
 pub fn is_non_global_ip(ip: IpAddr) -> bool {
@@ -268,4 +279,51 @@ pub fn is_rfc1918_or_local(host: &str) -> bool {
         return is_non_global_ip(ip);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blocks_ipv6_transition_prefixes_nat64_6to4_teredo() {
+        let ks = AtomicSocketKillSwitch::new(true, true);
+        ks.set_tunnel_established(true);
+
+        for transition_target in [
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::8.8.8.8",
+            "64:ff9b:1::10.0.0.1",
+            "64:ff9b:1:abcd::1",
+            "2002:7f00:0001::1",
+            "2002:c0a8:0101::1",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+            "2001::1",
+        ] {
+            let v6: Ipv6Addr = transition_target.parse().expect("valid ipv6 literal");
+            assert!(
+                is_non_global_ipv6(v6),
+                "Expected transition IPv6 {} to be blocked",
+                transition_target
+            );
+            assert_eq!(
+                ks.authorize_outbound_packet(transition_target),
+                Err(KillSwitchBlockReason::LanAccessBlocked),
+                "KillSwitch must block {}",
+                transition_target
+            );
+            assert_eq!(
+                ks.authorize_outbound_ip(IpAddr::V6(v6)),
+                Err(KillSwitchBlockReason::LanAccessBlocked)
+            );
+        }
+
+        // Standard globally routable IPv6 addresses must remain permitted
+        for global_v6 in ["2606:4700:4700::1111", "2001:4860:4860::8888", "2001:67c:24ec::78"] {
+            let v6: Ipv6Addr = global_v6.parse().expect("valid global ipv6");
+            assert!(!is_non_global_ipv6(v6));
+            assert!(ks.authorize_outbound_ip(IpAddr::V6(v6)).is_ok());
+        }
+    }
 }

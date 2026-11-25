@@ -147,17 +147,39 @@ impl CustomCursorEngine {
         if trimmed.is_empty() || trimmed.len() > 2048 {
             return false;
         }
+        if trimmed.chars().any(|c| {
+            matches!(c, '\'' | '"' | '(' | ')' | '\\' | '{' | '}' | '\r' | '\n' | '\0')
+                || c.is_control()
+        }) {
+            return false;
+        }
         let lower = trimmed.to_ascii_lowercase();
-        let allowed_scheme = lower.starts_with("singularity://")
-            || lower.starts_with("https://")
-            || lower.starts_with("data:image/");
+        if lower.starts_with("data:image/") {
+            const ALLOWED_DATA_PREFIXES: &[&str] = &[
+                "data:image/png;base64,",
+                "data:image/svg+xml;base64,",
+                "data:image/webp;base64,",
+                "data:image/x-icon;base64,",
+                "data:image/gif;base64,",
+                "data:image/jpeg;base64,",
+            ];
+            let Some(prefix) = ALLOWED_DATA_PREFIXES
+                .iter()
+                .find(|p| lower.starts_with(*p))
+            else {
+                return false;
+            };
+            let payload = &trimmed[prefix.len()..];
+            return !payload.is_empty()
+                && payload
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+        }
+        let allowed_scheme = lower.starts_with("singularity://") || lower.starts_with("https://");
         if !allowed_scheme {
             return false;
         }
-        !trimmed.chars().any(|c| {
-            matches!(c, '\'' | '"' | '(' | ')' | '\\' | ';' | '{' | '}' | '\r' | '\n' | '\0')
-                || c.is_control()
-        })
+        !trimmed.contains(';')
     }
 
     /// Registers a per-domain custom cursor override rule (rejects unsafe CSS-injectable URIs).

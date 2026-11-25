@@ -68,6 +68,9 @@ mod tests {
         // Reject oversized segment exceeding cap
         assert!(!rec.ingest_stream_segment(&vec![0u8; 2048]));
         let muxed = rec.stop_and_finalize();
-        assert!(muxed.starts_with(b"SINGULARITY-MUX:MKV:AV1_FRAME_01OPUS_PKT_01"));
+        assert!(muxed.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]));
+        assert!(muxed.windows(b"matroska".len()).any(|w| w == b"matroska"));
+        assert!(muxed.windows(b"AV1_FRAME_01".len()).any(|w| w == b"AV1_FRAME_01"));
+        assert!(muxed.windows(b"OPUS_PKT_01".len()).any(|w| w == b"OPUS_PKT_01"));
     }
 }

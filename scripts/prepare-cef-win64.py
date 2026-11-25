@@ -15,6 +15,7 @@ Twitch fail to play. OBS Studio's official CEF 150/7871 build is pure Chromium w
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -34,38 +35,128 @@ EXPECTED_CEF_MAJOR = 150
 # staged CEF_PATH directly without ever falling back to Spotify CDN.
 ARCHIVE_JSON_NAME = "cef_binary_150.0.14+obs-7871_windows64_minimal.tar.bz2"
 STAMP_FILENAME = ".singularity-cef-stamp.json"
+STAMP_SCHEMA_VERSION = 2
 
 REQUIRED_STAGED_FILES = (
     "archive.json",
     "CMakeLists.txt",
     "libcef.dll",
+    "chrome_elf.dll",
     "libcef.lib",
     "icudtl.dat",
     "resources.pak",
-    os.path.join("include", "cef_version.h"),
-    os.path.join("include", "cef_api_versions.h"),
-    os.path.join("libcef_dll", "CMakeLists.txt"),
-    os.path.join("cmake", "cef_variables.cmake"),
-    os.path.join("locales", "en-US.pak"),
-    os.path.join("locales", "fr.pak"),
+    "include/cef_version.h",
+    "include/cef_api_versions.h",
+    "libcef_dll/CMakeLists.txt",
+    "cmake/cef_variables.cmake",
+    "locales/en-US.pak",
+    "locales/fr.pak",
 )
+
+CRITICAL_ROOT_SUFFIXES = (".dll", ".lib", ".exe", ".dat", ".bin", ".pak", ".json", ".txt")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def enumerate_critical_relpaths(cef_dir: Path) -> set[str]:
+    rels: set[str] = set(REQUIRED_STAGED_FILES)
+    if cef_dir.is_dir():
+        for entry in cef_dir.iterdir():
+            if entry.name == STAMP_FILENAME:
+                continue
+            if entry.is_symlink() or (entry.is_file() and entry.suffix.lower() in CRITICAL_ROOT_SUFFIXES):
+                rels.add(entry.name)
+        cmake_dir = cef_dir / "cmake"
+        if cmake_dir.is_dir() and not cmake_dir.is_symlink():
+            for entry in cmake_dir.iterdir():
+                if entry.is_symlink() or (entry.is_file() and entry.suffix.lower() == ".cmake"):
+                    rels.add(f"cmake/{entry.name}")
+    return rels
+
+
+def compute_critical_file_hashes(cef_dir: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for rel in sorted(enumerate_critical_relpaths(cef_dir)):
+        full = cef_dir / rel
+        if full.is_symlink() or not full.is_file():
+            raise RuntimeError(f"Missing or symlinked critical CEF file: {rel}")
+        hashes[rel] = sha256_file(full)
+    return hashes
+
+
+def _is_valid_sha256_hex(val: object) -> bool:
+    return isinstance(val, str) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", val))
 
 
 def is_already_staged(cef_dir: Path) -> bool:
+    if cef_dir.is_symlink() or not cef_dir.is_dir():
+        return False
     stamp_path = cef_dir / STAMP_FILENAME
-    if not stamp_path.is_file():
+    if stamp_path.is_symlink() or not stamp_path.is_file():
         return False
     try:
         stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    if stamp.get("sha256") != OBS_CEF_SHA256 or stamp.get("archive_name") != ARCHIVE_JSON_NAME:
+    if not isinstance(stamp, dict):
+        return False
+    if (
+        stamp.get("schema_version") != STAMP_SCHEMA_VERSION
+        or stamp.get("url") != OBS_CEF_URL
+        or stamp.get("sha256") != OBS_CEF_SHA256
+        or stamp.get("upstream_sha256") != OBS_CEF_SHA256
+        or stamp.get("archive_name") != ARCHIVE_JSON_NAME
+    ):
         return False
     # Ensure no versioned Spotify fallback subdirectory lingers inside CEF_PATH
     if (cef_dir / "150.0.14").exists():
         return False
-    for rel in REQUIRED_STAGED_FILES:
-        if not (cef_dir / rel).is_file():
+
+    recorded_hashes = stamp.get("file_hashes")
+    if not isinstance(recorded_hashes, dict) or not recorded_hashes:
+        return False
+
+    # Every required file must be recorded in the stamp
+    for req in REQUIRED_STAGED_FILES:
+        if req not in recorded_hashes:
+            return False
+
+    # Reject unexpected/injected critical binaries or CMake files in the cached directory
+    current_critical = enumerate_critical_relpaths(cef_dir)
+    if set(recorded_hashes.keys()) != current_critical:
+        print(
+            "[WARN] Cached CEF directory file inventory differs from .singularity-cef-stamp.json; re-staging cleanly.",
+            file=sys.stderr,
+        )
+        return False
+
+    # Re-hash every critical CEF binary/resource/CMake file on disk and verify SHA-256
+    for rel, expected_hex in sorted(recorded_hashes.items()):
+        if not isinstance(rel, str) or "\\" in rel or rel.startswith("/") or ".." in Path(rel).parts:
+            return False
+        if not _is_valid_sha256_hex(expected_hex):
+            return False
+        full = cef_dir / rel
+        if full.is_symlink() or not full.is_file():
+            return False
+        try:
+            actual_hex = sha256_file(full)
+        except OSError:
+            return False
+        if not hmac.compare_digest(actual_hex.lower(), expected_hex.lower()):
+            print(
+                f"[WARN] Cached CEF integrity mismatch on '{rel}' (expected {expected_hex}, got {actual_hex}); re-staging cleanly.",
+                file=sys.stderr,
+            )
             return False
     return True
 
@@ -110,6 +201,9 @@ def safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
     dest_resolved = dest_dir.resolve()
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == 0o120000:
+                raise RuntimeError(f"Refusing symlink entry in CEF archive: {info.filename}")
             target = (dest_dir / info.filename).resolve()
             if target != dest_resolved and dest_resolved not in target.parents:
                 raise RuntimeError(f"Refusing Zip Slip entry: {info.filename}")
@@ -227,21 +321,29 @@ def stage_sdk(cef_dir: Path) -> int:
             json.dumps(archive_meta, indent=2) + "\n", encoding="utf-8"
         )
 
-        stamp = {
-            "url": OBS_CEF_URL,
-            "sha256": OBS_CEF_SHA256,
-            "sha1": got_sha1,
-            "archive_name": ARCHIVE_JSON_NAME,
-        }
-        (staging / STAMP_FILENAME).write_text(
-            json.dumps(stamp, indent=2) + "\n", encoding="utf-8"
-        )
-
         for rel in REQUIRED_STAGED_FILES:
             if not (staging / rel).is_file():
                 raise RuntimeError(f"Staged CEF SDK missing required file: {rel}")
 
-        if cef_dir.exists():
+        file_hashes = compute_critical_file_hashes(staging)
+        stamp = {
+            "schema_version": STAMP_SCHEMA_VERSION,
+            "url": OBS_CEF_URL,
+            "upstream_sha256": got_sha256.lower(),
+            "sha256": OBS_CEF_SHA256,
+            "sha1": got_sha1,
+            "archive_name": ARCHIVE_JSON_NAME,
+            "file_hashes": file_hashes,
+        }
+        (staging / STAMP_FILENAME).write_text(
+            json.dumps(stamp, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        if not is_already_staged(staging):
+            raise RuntimeError("Internal self-check failed: staged CEF stamp verification failed.")
+
+        if cef_dir.is_symlink():
+            cef_dir.unlink()
+        elif cef_dir.exists():
             shutil.rmtree(cef_dir)
         shutil.move(str(staging), str(cef_dir))
 

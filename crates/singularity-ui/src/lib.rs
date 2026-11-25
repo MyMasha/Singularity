@@ -873,7 +873,10 @@ mod tests {
         let cef_src = include_str!("cef_runtime.rs");
         assert!(cef_src.contains("on_before_download"));
         assert!(cef_src.contains("on_download_updated"));
-        assert!(cef_src.contains("safebrowsing-disable-download-protection"));
+        assert!(!cef_src.contains("safebrowsing-disable-download-protection"));
+        assert!(!cef_src.contains("disable-client-side-phishing-detection"));
+        assert!(!cef_src.contains("disable-extensions-file-access-check"));
+        assert!(!cef_src.contains("no_sandbox: 1"));
         assert!(server_src.contains("SHGetKnownFolderPath"));
         assert!(server_src.contains("reveal_download_in_explorer"));
         assert!(server_src.contains("apply_win32_black_class_brush"));
@@ -1686,11 +1689,11 @@ mod tests {
             extensions::find_runtime_extension_id(&tmp_dir, &ext_dir, "my_cashback_ext", "Cashback Helper");
         assert_eq!(resolved.as_deref(), Some(rt_id));
 
-        // 2. Extension host domain extraction collects concrete domains & ignores wildcards
+        // 2. Extension host domain extraction collects concrete host_permissions & excludes homepage_url/wildcards (N3 #25)
         extensions::invalidate_extensions_cache();
         let ext_domains = extensions::collect_installed_extension_host_domains(&tmp_dir);
         assert!(ext_domains.contains(&"cashback-example.com".to_string()));
-        assert!(ext_domains.contains(&"portal.cashback-example.org".to_string()));
+        assert!(!ext_domains.contains(&"portal.cashback-example.org".to_string()));
         assert!(!ext_domains.iter().any(|d| d.contains('*') || d == "<all_urls>"));
         assert!(extensions::host_matches_extension_domains(
             "api.cashback-example.com",

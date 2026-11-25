@@ -7,12 +7,13 @@ use crate::passkey::StoredPasskeyCredential;
 use crate::totp::TotpAlgorithm;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use zeroize::Zeroize;
 
 pub const SINGULARITY_VAULT_MAGIC_HEADER: &str = "SINGULARITY-VAULT-V1-XCHACHA20-POLY1305";
 
 /// A single decrypted login credential + optional TOTP 2FA secret stored inside the vault.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VaultCredentialEntry {
     pub id: String,
     pub origin_url: String,
@@ -25,20 +26,49 @@ pub struct VaultCredentialEntry {
     pub notes: String,
 }
 
+impl fmt::Debug for VaultCredentialEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultCredentialEntry")
+            .field("id", &self.id)
+            .field("origin_url", &self.origin_url)
+            .field("username", &self.username)
+            .field("password_secret", &"[REDACTED]")
+            .field(
+                "totp_secret_base32",
+                &self.totp_secret_base32.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("totp_algorithm", &self.totp_algorithm)
+            .field("totp_digits", &self.totp_digits)
+            .field("totp_period_sec", &self.totp_period_sec)
+            .field("notes", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl Drop for VaultCredentialEntry {
     fn drop(&mut self) {
         self.password_secret.zeroize();
         if let Some(ref mut t) = self.totp_secret_base32 {
             t.zeroize();
         }
+        self.notes.zeroize();
     }
 }
 
 /// Complete decrypted payload inside an unlocked `.singularity-vault`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct VaultPlaintextPayload {
     pub credentials: Vec<VaultCredentialEntry>,
     pub passkeys: Vec<StoredPasskeyCredential>,
+}
+
+impl fmt::Debug for VaultPlaintextPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultPlaintextPayload")
+            .field("credentials", &self.credentials)
+            .field("passkeys", &self.passkeys)
+            .finish()
+    }
 }
 
 /// Outer encrypted `.singularity-vault` container written to disk.
@@ -155,5 +185,43 @@ impl EncryptedSingularityVaultEnvelope {
         let payload = parse_result.map_err(|_| VaultCryptoError::DecryptionFailed)?;
 
         Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vault_debug_redacts_secrets() {
+        let entry = VaultCredentialEntry {
+            id: "c1".into(),
+            origin_url: "https://example.org".into(),
+            username: "alice".into(),
+            password_secret: "SuperSecretPassword!99".into(),
+            totp_secret_base32: Some("JBSWY3DPEHPK3PXP".into()),
+            totp_algorithm: TotpAlgorithm::Sha1,
+            totp_digits: 6,
+            totp_period_sec: 30,
+            notes: "recovery-code-123456".into(),
+        };
+        let pk = StoredPasskeyCredential::enroll_new("example.org", "alice");
+        let seed_copy = pk.secret_seed_hex.clone();
+
+        let dbg_entry = format!("{:?}", entry);
+        assert!(dbg_entry.contains("[REDACTED]"));
+        assert!(!dbg_entry.contains("SuperSecretPassword!99"));
+        assert!(!dbg_entry.contains("JBSWY3DPEHPK3PXP"));
+        assert!(!dbg_entry.contains("recovery-code-123456"));
+
+        let payload = VaultPlaintextPayload {
+            credentials: vec![entry],
+            passkeys: vec![pk],
+        };
+        let dbg_payload = format!("{:?}", payload);
+        assert!(dbg_payload.contains("[REDACTED]"));
+        assert!(!dbg_payload.contains("SuperSecretPassword!99"));
+        assert!(!dbg_payload.contains("JBSWY3DPEHPK3PXP"));
+        assert!(!dbg_payload.contains(&seed_copy));
     }
 }

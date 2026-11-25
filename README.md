@@ -77,7 +77,7 @@ Static zero-dependency packages are built for each supported distribution on [Gi
 | **`Singularity.(Debian)`** | Debian (`amd64` `.deb`) | `sudo apt install ./Singularity-Debian.deb` |
 | **`Singularity.(Ubuntu)`** | Ubuntu (`amd64` `.deb`) | `sudo apt install ./Singularity-Ubuntu.deb` |
 | **`Singularity.(Mint)`** | Linux Mint (`amd64` `.deb`) | `sudo apt install ./Singularity-Mint.deb` |
-| **`Singularity.(Bazzit)`** | Bazzite / Fedora Atomic (`x86_64` `.rpm`) | `rpm-ostree install ./Singularity-Bazzite.rpm` |
+| **`Singularity.(Bazzite)`** | Bazzite / Fedora Atomic (`x86_64` `.rpm`) | `rpm-ostree install ./Singularity-Bazzite.rpm` |
 | **`singularity-linux-x86_64`** | Any Linux x64 (portable static binary) | `chmod +x singularity-linux-x86_64 && ./singularity-linux-x86_64` |
 
 

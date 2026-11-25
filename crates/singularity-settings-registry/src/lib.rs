@@ -11,7 +11,7 @@ use crate::catalog::build_full_settings_catalog;
 use crate::schema::{HotReloadEvent, SettingCategory, SettingEntry, SettingValue};
 use crate::search::{compute_virtualized_viewport, VirtualizedViewport};
 use crate::storage::{export_sqlite_transaction_sql, TomlSettingsSnapshot};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -40,6 +40,7 @@ pub struct SettingsRegistry {
     entries: Vec<SettingEntry>,
     key_to_index: HashMap<String, usize>,
     hot_reload_hooks: Vec<HotReloadCallback>,
+    pending_restart_keys: BTreeSet<String>,
 }
 
 impl Default for SettingsRegistry {
@@ -60,6 +61,7 @@ impl SettingsRegistry {
             entries,
             key_to_index,
             hot_reload_hooks: Vec::new(),
+            pending_restart_keys: BTreeSet::new(),
         }
     }
 
@@ -96,13 +98,29 @@ impl SettingsRegistry {
             .collect()
     }
 
-    /// Registers a live hot-reload listener notified whenever a setting is updated.
+    /// Registers a live hot-reload listener notified whenever a hot-reloadable setting is updated.
     pub fn register_hot_reload_hook(&mut self, hook: HotReloadCallback) {
         self.hot_reload_hooks.push(hook);
     }
 
-    /// Mutates a setting value after verifying type safety and range/enum constraints,
-    /// immediately firing live hot-reload hooks to Chromium/Network/UI layers.
+    /// Returns `true` if one or more non-hot-reloadable settings were modified and require a restart.
+    pub fn requires_restart(&self) -> bool {
+        !self.pending_restart_keys.is_empty()
+    }
+
+    /// Returns the sorted list of modified setting keys waiting for a browser restart to take effect.
+    pub fn pending_restart_keys(&self) -> Vec<String> {
+        self.pending_restart_keys.iter().cloned().collect()
+    }
+
+    /// Clears recorded restart-required setting keys (e.g. after applying them at process restart).
+    pub fn clear_pending_restart(&mut self) {
+        self.pending_restart_keys.clear();
+    }
+
+    /// Mutates a setting value after verifying type safety, range/enum constraints, and security rules.
+    /// Fires live hot-reload hooks only when `entry.hot_reloadable == true`; otherwise records the
+    /// setting as requiring a restart without invoking hot-reload hooks.
     pub fn set(&mut self, key: &str, new_value: SettingValue) -> Result<HotReloadEvent, RegistryError> {
         let &idx = self
             .key_to_index
@@ -118,14 +136,16 @@ impl SettingsRegistry {
             });
         }
 
-        if !entry.constraint.validate(&new_value) {
+        if !entry.validate_value(&new_value) {
             return Err(RegistryError::ConstraintViolation {
                 key: key.to_string(),
                 value: new_value,
             });
         }
 
+        let hot_reloadable = entry.hot_reloadable;
         let old_value = std::mem::replace(&mut entry.current_value, new_value.clone());
+        let changed = old_value != new_value;
         let event = HotReloadEvent {
             key: entry.key.clone(),
             category: entry.category,
@@ -133,13 +153,23 @@ impl SettingsRegistry {
             old_value,
             new_value,
             chromium_cli_arg: entry.to_chromium_cli_arg(),
+            requires_restart: !hot_reloadable,
         };
 
-        for hook in &self.hot_reload_hooks {
-            hook(&event);
+        if hot_reloadable {
+            for hook in &self.hot_reload_hooks {
+                hook(&event);
+            }
+        } else if changed {
+            self.pending_restart_keys.insert(event.key.clone());
         }
 
         Ok(event)
+    }
+
+    /// Alias for [`Self::set`] that validates and applies a setting value.
+    pub fn set_value(&mut self, key: &str, new_value: SettingValue) -> Result<HotReloadEvent, RegistryError> {
+        self.set(key, new_value)
     }
 
     /// Resets a single setting back to its schema default value.
@@ -152,31 +182,38 @@ impl SettingsRegistry {
         self.set(key, default_val)
     }
 
-    /// Resets all modified settings back to their factory defaults, firing hot-reload hooks,
-    /// and returns the count reset.
+    /// Resets all modified settings back to their factory defaults, firing hot-reload hooks
+    /// only for hot-reloadable settings (and recording restart requirements for the rest),
+    /// and returns the total count reset.
     pub fn reset_all_to_defaults(&mut self) -> usize {
-        let mut events = Vec::new();
+        let mut reset_count = 0usize;
+        let mut hot_reload_events = Vec::new();
         for entry in &mut self.entries {
             if entry.is_modified() {
+                reset_count += 1;
                 let new_value = entry.default_value.clone();
                 let old_value = std::mem::replace(&mut entry.current_value, new_value.clone());
-                events.push(HotReloadEvent {
-                    key: entry.key.clone(),
-                    category: entry.category,
-                    subsystem: entry.subsystem,
-                    old_value,
-                    new_value,
-                    chromium_cli_arg: entry.to_chromium_cli_arg(),
-                });
+                if entry.hot_reloadable {
+                    hot_reload_events.push(HotReloadEvent {
+                        key: entry.key.clone(),
+                        category: entry.category,
+                        subsystem: entry.subsystem,
+                        old_value,
+                        new_value,
+                        chromium_cli_arg: entry.to_chromium_cli_arg(),
+                        requires_restart: false,
+                    });
+                } else {
+                    self.pending_restart_keys.insert(entry.key.clone());
+                }
             }
         }
-        let count = events.len();
-        for evt in &events {
+        for evt in &hot_reload_events {
             for hook in &self.hot_reload_hooks {
                 hook(evt);
             }
         }
-        count
+        reset_count
     }
 
     /// Collects all active Chromium command-line switches generated by the registry.
@@ -310,5 +347,141 @@ mod tests {
         assert!(vp.total_matching_items >= 5);
         assert!(!vp.visible_slice.is_empty());
         assert!(vp.visible_slice[0].key.contains("daita"));
+    }
+
+    #[test]
+    fn test_hot_reload_gated_by_hot_reloadable_flag() {
+        let mut registry = SettingsRegistry::new();
+        let fired_keys = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let fired_clone = Arc::clone(&fired_keys);
+
+        registry.register_hot_reload_hook(Arc::new(move |evt| {
+            fired_clone.lock().unwrap().push(evt.key.clone());
+        }));
+
+        // Non-hot-reloadable setting must NOT trigger hook and must record pending restart.
+        let evt_restart = registry
+            .set("security.sandbox.level", SettingValue::Int(2))
+            .expect("Valid sandbox level");
+        assert!(evt_restart.requires_restart);
+        assert!(fired_keys.lock().unwrap().is_empty());
+        assert!(registry.requires_restart());
+        assert_eq!(
+            registry.pending_restart_keys(),
+            vec!["security.sandbox.level".to_string()]
+        );
+
+        // Hot-reloadable setting MUST trigger hook and must NOT add to pending restart keys.
+        let evt_live = registry
+            .set_value("media.audio.volume_boost_percent", SettingValue::Float(250.0))
+            .expect("Valid volume boost");
+        assert!(!evt_live.requires_restart);
+        assert_eq!(
+            *fired_keys.lock().unwrap(),
+            vec!["media.audio.volume_boost_percent".to_string()]
+        );
+        assert_eq!(
+            registry.pending_restart_keys(),
+            vec!["security.sandbox.level".to_string()]
+        );
+
+        // Resetting all restores both settings, only firing hook for the hot-reloadable one.
+        registry.clear_pending_restart();
+        fired_keys.lock().unwrap().clear();
+        let reset_count = registry.reset_all_to_defaults();
+        assert_eq!(reset_count, 2);
+        assert_eq!(
+            *fired_keys.lock().unwrap(),
+            vec!["media.audio.volume_boost_percent".to_string()]
+        );
+        assert_eq!(
+            registry.pending_restart_keys(),
+            vec!["security.sandbox.level".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_set_value_and_import_toml_reject_malicious_values() {
+        let mut registry = SettingsRegistry::new();
+
+        // Direct set / set_value rejections
+        assert!(registry
+            .set_value(
+                "network.proxy.global_socks5_endpoint",
+                SettingValue::Text("socks5h://10.64.0.1:1080 --no-sandbox".into()),
+            )
+            .is_err());
+        assert!(registry
+            .set_value(
+                "vault.storage.file_path",
+                SettingValue::Text("../../../etc/passwd".into()),
+            )
+            .is_err());
+        assert!(registry
+            .set_value(
+                "mullvad.api.endpoint_url",
+                SettingValue::Text("javascript:alert(1)".into()),
+            )
+            .is_err());
+        assert!(registry
+            .set_value(
+                "privacy.user_agent.uniform_frozen_string",
+                SettingValue::Text("Mozilla/5.0\r\n--no-sandbox".into()),
+            )
+            .is_err());
+
+        // TOML import skips malicious overrides while still applying safe ones
+        let malicious_toml = r#"
+version = "1.0.0"
+
+[overrides."network.proxy.global_socks5_endpoint"]
+type = "Text"
+value = "socks5h://10.64.0.1:1080 --disable-web-security"
+
+[overrides."vault.storage.file_path"]
+type = "Text"
+value = "../../etc/shadow"
+
+[overrides."mullvad.api.endpoint_url"]
+type = "Text"
+value = "file:///etc/passwd"
+
+[overrides."network.dns.primary_doq_endpoint"]
+type = "Text"
+value = "quic://dns.quad9.net:853"
+"#;
+        let applied = registry.import_toml(malicious_toml).expect("Parse TOML");
+        assert_eq!(applied, 1);
+        assert_eq!(
+            registry.get("network.dns.primary_doq_endpoint").unwrap().current_value,
+            SettingValue::Text("quic://dns.quad9.net:853".into())
+        );
+        assert_eq!(
+            registry.get("network.proxy.global_socks5_endpoint").unwrap().current_value,
+            SettingValue::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn test_compiled_chromium_switches_are_safe_and_accurate() {
+        let registry = SettingsRegistry::new();
+        let switches = registry.compile_chromium_command_line_switches();
+
+        assert!(
+            !switches.iter().any(|s| s.ends_with("=false")),
+            "Must never emit `=false` for boolean switches"
+        );
+        assert!(!switches.iter().any(|s| s == "--jitless" || s.starts_with("--jitless=")));
+        assert!(
+            !switches.iter().any(|s| s == "--proxy-server="),
+            "Must never emit empty `--proxy-server=`"
+        );
+        assert!(
+            switches.iter().any(|s| s == "--disk-cache-size=1073741824"),
+            "Expected 1024 MiB disk-cache-size to be converted to 1073741824 bytes"
+        );
+        for sw in &switches {
+            assert!(!sw.contains('\0') && !sw.contains('\r') && !sw.contains('\n'));
+        }
     }
 }

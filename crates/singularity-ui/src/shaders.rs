@@ -131,7 +131,7 @@ struct CursorTrailPoint {
 @fragment
 fn fs_cursor_glow(@location(0) local_uv: vec2<f32>, @location(1) age_norm: f32) -> @location(0) vec4<f32> {
     let dist = length(local_uv - vec2<f32>(0.5, 0.5)) * 2.0;
-    let alpha = smoothstep(1.0, 0.0, dist) * (1.0 - age_norm);
+    let alpha = (1.0 - smoothstep(0.0, 1.0, dist)) * (1.0 - age_norm);
     let cream = vec3<f32>(1.0, 0.92, 0.74);
     let amber = vec3<f32>(0.94, 0.62, 0.24);
     let color = mix(cream, amber, age_norm);

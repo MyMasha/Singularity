@@ -6,9 +6,80 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/singularity.ico");
     println!("cargo:rerun-if-changed=assets/icon_64.rgba");
     println!("cargo:rerun-if-changed=assets/logo_128.png");
+    println!("cargo:rerun-if-env-changed=SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX");
+    if let Ok(pubkey) = std::env::var("SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX") {
+        let trimmed = pubkey.trim();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX={trimmed}");
+        }
+    }
+    println!("cargo:rustc-check-cfg=cfg(singularity_cef_sandbox)");
+    println!("cargo:rerun-if-env-changed=CEF_PATH");
+    println!("cargo:rerun-if-env-changed=CEF_SANDBOX_LIB");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        configure_windows_cef_sandbox();
         embed_windows_exe_resources();
+    }
+}
+
+fn find_windows_cef_sandbox_lib() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("CEF_SANDBOX_LIB") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_file() {
+                return Some(p);
+            }
+            if p.is_dir() {
+                let cand = p.join("cef_sandbox.lib");
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    if let Ok(raw) = std::env::var("CEF_PATH") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let root = PathBuf::from(trimmed);
+            for cand in [
+                root.join("cef_sandbox.lib"),
+                root.join("Release").join("cef_sandbox.lib"),
+                root.join("lib").join("cef_sandbox.lib"),
+            ] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn configure_windows_cef_sandbox() {
+    let is_msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    if !is_msvc {
+        return;
+    }
+
+    if let Some(sandbox_lib) = find_windows_cef_sandbox_lib() {
+        println!("cargo:rerun-if-changed={}", sandbox_lib.display());
+        if let Some(parent) = sandbox_lib.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        let stem = sandbox_lib
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("cef_sandbox");
+        println!("cargo:rustc-link-lib=static={stem}");
+        for sdk_lib in ["advapi32", "dbghelp", "ntdll", "psapi", "rpcrt4", "userenv"] {
+            println!("cargo:rustc-link-lib=dylib={sdk_lib}");
+        }
+        println!("cargo:rustc-cfg=singularity_cef_sandbox");
     }
 }
 
@@ -97,6 +168,8 @@ fn embed_windows_exe_resources() {
         // standalone: `main()` checks local CEF presence and auto-installs it via Singularity-setup.exe.
         println!("cargo:rustc-link-arg-bin=singularity=/DELAYLOAD:libcef.dll");
         println!("cargo:rustc-link-lib=dylib=delayimp");
+        // Restrict implicit OS DLL search to System32 (LOAD_LIBRARY_SEARCH_SYSTEM32) to prevent DLL hijacking.
+        println!("cargo:rustc-link-arg-bin=singularity=/DEPENDENTLOADFLAG:0x800");
 
         let res_path = out_path.join("singularity_res.res");
         let obj_path = out_path.join("singularity_res.o");

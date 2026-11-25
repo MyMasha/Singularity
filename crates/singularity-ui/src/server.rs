@@ -20,10 +20,10 @@ use crate::extensions;
 #[cfg(target_os = "windows")]
 use crate::roaming_store::{apply_media_timestamp_to_url, normalize_url_without_media_time};
 use crate::roaming_store::{
-    is_valid_language, is_valid_theme_id, unix_now, BookmarkEntry, EncryptedAuthTokenRecord,
-    SavedTabEntry, SavedTabGroup, TabHandoffPayload, WindowGeometry,
+    is_valid_language, is_valid_theme_id, is_valid_window_id, unix_now, BookmarkEntry,
+    EncryptedAuthTokenRecord, SavedTabEntry, SavedTabGroup, TabHandoffPayload, WindowGeometry,
 };
-use crate::shell::SingularityBrowserShell;
+use crate::shell::{SingularityBrowserShell, DESKTOP_VAULT_KDF};
 use crate::ui_app::SINGULARITY_UI_HTML;
 use rand_core::{OsRng, RngCore};
 #[cfg(target_os = "windows")]
@@ -34,26 +34,31 @@ use singularity_core::{
     FilterDecision, HoverIntentSignal, NetworkResourceType, UBlockNetworkEngine,
 };
 use singularity_settings_registry::schema::{SettingCategory, SettingValue};
-use singularity_vault::{generate_totp_code, TotpAlgorithm, VaultCredentialEntry};
+use singularity_vault::{
+    generate_totp_code, Argon2idConfig, EncryptedSingularityVaultEnvelope, SingularityVault,
+    StoredPasskeyCredential, TotpAlgorithm, VaultCredentialEntry, VaultPlaintextPayload,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
-#[cfg(target_os = "windows")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const BRAND_LOGO_128_PNG: &[u8] = include_bytes!("../assets/logo_128.png");
 const MAX_CONCURRENT_CONNECTIONS: usize = 96;
 const HTTP_WORKER_THREADS: usize = 32;
 const MAX_KEEPALIVE_REQUESTS_PER_CONN: usize = 64;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_UNAUTH_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 512 * 1024;
 const MAX_BOOKMARK_IMPORT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HTTP_REQUEST_READ_DURATION: Duration = Duration::from_secs(5);
+const MAX_WINDOW_SESSIONS: usize = 64;
 const MAX_PROXY_REDIRECTS: usize = 5;
 const MAX_PROXY_BODY_BYTES: usize = 5 * 1024 * 1024;
 
@@ -69,6 +74,55 @@ const WINDOW_ICON_64_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
 const APPLE_BAR_LOGICAL_HEIGHT: f64 = 46.0;
 
 type AdoptTabCallback = Arc<Mutex<Option<Box<dyn Fn(TabHandoffPayload) + Send + Sync>>>>;
+type PrivateModeCallback = Arc<Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>>;
+
+/// Cached verified master secret & passkeys for performing Argon2id vault sealing outside `shell_mutex`.
+/// Immediately cleared and zeroized on manual lock or auto-lock.
+struct VaultSessionCache {
+    master: Zeroizing<Vec<u8>>,
+    passkeys: Vec<StoredPasskeyCredential>,
+}
+
+/// Progressive exponential backoff and temporary lockout protecting `/api/vault/unlock` against brute force.
+#[derive(Default)]
+struct VaultUnlockRateLimiter {
+    consecutive_failures: u32,
+    locked_until: Option<Instant>,
+}
+
+impl VaultUnlockRateLimiter {
+    fn check_locked(&mut self) -> Option<u64> {
+        if let Some(until) = self.locked_until {
+            let now = Instant::now();
+            if now < until {
+                return Some(until.duration_since(now).as_secs().max(1));
+            }
+            self.locked_until = None;
+        }
+        None
+    }
+
+    fn record_failure(&mut self) -> u64 {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay_secs: u64 = if self.consecutive_failures < 3 {
+            0
+        } else if self.consecutive_failures >= 10 {
+            300
+        } else {
+            let exp = self.consecutive_failures - 2;
+            1u64.checked_shl(exp).unwrap_or(300).min(300)
+        };
+        if delay_secs > 0 {
+            self.locked_until = Some(Instant::now() + Duration::from_secs(delay_secs));
+        }
+        delay_secs
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.locked_until = None;
+    }
+}
 
 /// Per-window session state stored inside our single low-RAM Chromium (CEF) browser process so
 /// multiple open Singularity windows each keep independent tabs, tab groups, active tab, and
@@ -88,13 +142,19 @@ struct WindowTabSession {
 struct ServerConfig {
     bind_port: u16,
     ipc_token: Arc<String>,
+    session_cookie: Arc<String>,
     transfer_token: Arc<String>,
     bootstrap_nonce: Arc<String>,
     bootstrap_consumed: Arc<AtomicBool>,
+    bootstrap_file_path: Arc<Mutex<Option<PathBuf>>>,
     extra_bootstrap_nonces: Arc<Mutex<HashSet<String>>>,
     window_sessions: Arc<Mutex<HashMap<String, WindowTabSession>>>,
-    rendered_html: Arc<Vec<u8>>,
+    rendered_html_template: Arc<String>,
     adopt_tab_tx: AdoptTabCallback,
+    private_mode_tx: PrivateModeCallback,
+    vault_op_lock: Arc<Mutex<()>>,
+    vault_session_cache: Arc<Mutex<Option<VaultSessionCache>>>,
+    vault_rate_limiter: Arc<Mutex<VaultUnlockRateLimiter>>,
 }
 
 impl ServerConfig {
@@ -102,26 +162,58 @@ impl ServerConfig {
         let mut raw = [0u8; 32];
         OsRng.fill_bytes(&mut raw);
         let token = hex::encode(raw);
+        let mut cookie_raw = [0u8; 32];
+        OsRng.fill_bytes(&mut cookie_raw);
+        let session_cookie = hex::encode(cookie_raw);
         let mut xfer_raw = [0u8; 32];
         OsRng.fill_bytes(&mut xfer_raw);
         let transfer_token = hex::encode(xfer_raw);
         let mut boot_raw = [0u8; 24];
         OsRng.fill_bytes(&mut boot_raw);
         let bootstrap_nonce = hex::encode(boot_raw);
-        let rendered_html = SINGULARITY_UI_HTML
-            .replace("__SINGULARITY_IPC_TOKEN__", &token)
-            .into_bytes();
+        let rendered_html_template =
+            SINGULARITY_UI_HTML.replace("__SINGULARITY_IPC_TOKEN__", &token);
         Self {
             bind_port,
             ipc_token: Arc::new(token),
+            session_cookie: Arc::new(session_cookie),
             transfer_token: Arc::new(transfer_token),
             bootstrap_nonce: Arc::new(bootstrap_nonce),
             bootstrap_consumed: Arc::new(AtomicBool::new(false)),
+            bootstrap_file_path: Arc::new(Mutex::new(None)),
             extra_bootstrap_nonces: Arc::new(Mutex::new(HashSet::new())),
             window_sessions: Arc::new(Mutex::new(HashMap::new())),
-            rendered_html: Arc::new(rendered_html),
+            rendered_html_template: Arc::new(rendered_html_template),
             adopt_tab_tx: Arc::new(Mutex::new(None)),
+            private_mode_tx: Arc::new(Mutex::new(None)),
+            vault_op_lock: Arc::new(Mutex::new(())),
+            vault_session_cache: Arc::new(Mutex::new(None)),
+            vault_rate_limiter: Arc::new(Mutex::new(VaultUnlockRateLimiter::default())),
         }
+    }
+
+    fn set_bootstrap_file_path(&self, path: PathBuf) {
+        if let Ok(mut guard) = self.bootstrap_file_path.lock() {
+            *guard = Some(path);
+        }
+    }
+
+    fn cleanup_bootstrap_file(&self) {
+        if let Ok(mut guard) = self.bootstrap_file_path.lock() {
+            if let Some(p) = guard.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    fn clear_vault_session_cache(&self) {
+        if let Ok(mut guard) = self.vault_session_cache.lock() {
+            *guard = None;
+        }
+    }
+
+    fn render_index_html_with_nonce(&self, csp_nonce: &str) -> Vec<u8> {
+        inject_csp_nonce(&self.rendered_html_template, csp_nonce).into_bytes()
     }
 
     #[cfg(target_os = "windows")]
@@ -158,6 +250,24 @@ impl ServerConfig {
         false
     }
 
+    #[cfg(target_os = "windows")]
+    fn set_private_mode_handler<F>(&self, handler: F)
+    where
+        F: Fn(bool) + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.private_mode_tx.lock() {
+            *guard = Some(Box::new(handler));
+        }
+    }
+
+    fn dispatch_private_mode(&self, enabled: bool) {
+        if let Ok(guard) = self.private_mode_tx.lock() {
+            if let Some(ref f) = *guard {
+                f(enabled);
+            }
+        }
+    }
+
     fn consume_bootstrap_nonce(&self, provided: Option<&str>) -> bool {
         let Some(nonce) = provided else {
             return false;
@@ -166,7 +276,11 @@ impl ServerConfig {
         let actual = trimmed.as_bytes();
         let expected = self.bootstrap_nonce.as_bytes();
         if expected.len() == actual.len() && bool::from(expected.ct_eq(actual)) {
-            return !self.bootstrap_consumed.swap(true, Ordering::AcqRel);
+            let ok = !self.bootstrap_consumed.swap(true, Ordering::AcqRel);
+            if ok {
+                self.cleanup_bootstrap_file();
+            }
+            return ok;
         }
         if let Ok(mut guard) = self.extra_bootstrap_nonces.lock() {
             if let Some(found) = guard
@@ -175,6 +289,7 @@ impl ServerConfig {
                 .cloned()
             {
                 guard.remove(&found);
+                self.cleanup_bootstrap_file();
                 return true;
             }
         }
@@ -201,6 +316,29 @@ impl ServerConfig {
         expected.len() == actual.len() && bool::from(expected.ct_eq(actual))
     }
 
+    fn verify_session_cookie(&self, cookie_header: Option<&str>) -> bool {
+        let Some(raw) = cookie_header else {
+            return false;
+        };
+        let expected = self.session_cookie.as_bytes();
+        for part in raw.split(';') {
+            if let Some((k, v)) = part.split_once('=') {
+                if k.trim() == "singularity_sid" {
+                    let actual = v.trim().as_bytes();
+                    if expected.len() == actual.len() && bool::from(expected.ct_eq(actual)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn verify_token_or_session_cookie(&self, req: &ParsedHttpRequest) -> bool {
+        self.verify_token(req.headers.get("x-singularity-token").map(String::as_str))
+            || self.verify_session_cookie(req.headers.get("cookie").map(String::as_str))
+    }
+
     fn verify_transfer_token(&self, provided: Option<&str>) -> bool {
         let Some(tok) = provided else {
             return false;
@@ -222,7 +360,8 @@ impl Drop for ConnGuard {
 }
 
 /// Fixed-size warm Rust worker pool for loopback HTTP/IPC requests — eliminates per-request
-/// Windows OS thread creation overhead (`CreateThread` + 2 MiB stack + DLL_THREAD_ATTACH).
+/// Windows OS thread creation overhead (`CreateThread` + DLL_THREAD_ATTACH) while providing
+/// a safe 2 MiB stack for JSON, TLS, and crypto operations.
 struct HttpThreadPool {
     queue: Arc<(Mutex<VecDeque<TcpStream>>, Condvar)>,
 }
@@ -243,7 +382,7 @@ impl HttpThreadPool {
             let conns = Arc::clone(&active_conns);
             let _ = std::thread::Builder::new()
                 .name(format!("singularity-http-{}", idx))
-                .stack_size(256 * 1024)
+                .stack_size(2 * 1024 * 1024)
                 .spawn(move || loop {
                     let stream = {
                         let (lock, cvar) = &*q;
@@ -270,6 +409,7 @@ impl HttpThreadPool {
         if prev >= MAX_CONCURRENT_CONNECTIONS {
             active_conns.fetch_sub(1, Ordering::AcqRel);
             let mut s = stream;
+            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
             let _ = write_http_response(
                 &mut s,
                 &HttpResponse::text("503 Service Unavailable", "Too many concurrent requests"),
@@ -355,7 +495,6 @@ pub fn run_interactive_browser_app_with_smoke(
 
     let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
     let cfg = ServerConfig::new(local_addr.port());
-    let app_url = format!("http://{}/?boot={}", local_addr, cfg.bootstrap_nonce);
     let shared_shell = Arc::new(Mutex::new(shell));
     let active_conns = Arc::new(AtomicUsize::new(0));
     let pool = HttpThreadPool::new(
@@ -364,6 +503,21 @@ pub fn run_interactive_browser_app_with_smoke(
         cfg.clone(),
         Arc::clone(&active_conns),
     );
+
+    // Lightweight background watchdog: enforces vault auto-lock in RAM every 15s even with zero HTTP traffic.
+    {
+        let guard_shell = Arc::clone(&shared_shell);
+        let guard_cfg = cfg.clone();
+        let _ = std::thread::Builder::new()
+            .name("singularity-vault-autolock".into())
+            .stack_size(512 * 1024)
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(15));
+                if let Ok(mut shell) = guard_shell.lock() {
+                    enforce_vault_auto_lock_and_sync(&mut shell, &guard_cfg);
+                }
+            });
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -388,7 +542,7 @@ pub fn run_interactive_browser_app_with_smoke(
             if is_smoke {
                 return Err(err);
             }
-            launch_native_chromium_window(&app_url);
+            launch_bootstrap_chromium_window(local_addr.port(), &cfg);
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
@@ -399,7 +553,7 @@ pub fn run_interactive_browser_app_with_smoke(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = smoke;
-        launch_native_chromium_window(&app_url);
+        launch_bootstrap_chromium_window(local_addr.port(), &cfg);
         for stream in listener.incoming().flatten() {
             pool.submit(stream, &active_conns);
         }
@@ -428,6 +582,7 @@ fn run_windows_frameless_browser(
         CefCallback(WindowId, CefCallbackEvent),
         OpenNewWindowInProcess,
         AdoptExternalTab(TabHandoffPayload),
+        ApplyPrivateMode(bool),
         UiStartupWatchdog(WindowId),
         SmokeCheckPixels(WindowId),
         SmokeFinalize(WindowId),
@@ -1031,6 +1186,15 @@ fn run_windows_frameless_browser(
     }
 
     fn enable_win32_dark_menus() {
+        #[repr(C)]
+        struct RtlOsVersionInfoW {
+            dw_os_version_info_size: u32,
+            dw_major_version: u32,
+            dw_minor_version: u32,
+            dw_build_number: u32,
+            dw_platform_id: u32,
+            sz_csd_version: [u16; 128],
+        }
         #[link(name = "kernel32")]
         extern "system" {
             fn LoadLibraryExW(
@@ -1044,8 +1208,41 @@ fn run_windows_frameless_browser(
             ) -> *mut core::ffi::c_void;
         }
         const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+        const MIN_WIN10_1903_BUILD: u32 = 18362;
+        let ntdll_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
         let lib_name: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
         unsafe {
+            // Ordinals 135 (SetPreferredAppMode) and 136 (FlushMenuThemes) changed ABI on
+            // Windows 10 1903 (build 18362). Guard strictly via RtlGetVersion before calling.
+            let h_ntdll = LoadLibraryExW(
+                ntdll_name.as_ptr(),
+                core::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+            if h_ntdll.is_null() {
+                return;
+            }
+            let p_rtl = GetProcAddress(h_ntdll, b"RtlGetVersion\0".as_ptr());
+            if p_rtl.is_null() {
+                return;
+            }
+            let rtl_get_version: unsafe extern "system" fn(*mut RtlOsVersionInfoW) -> i32 =
+                core::mem::transmute(p_rtl);
+            let mut info = RtlOsVersionInfoW {
+                dw_os_version_info_size: core::mem::size_of::<RtlOsVersionInfoW>() as u32,
+                dw_major_version: 0,
+                dw_minor_version: 0,
+                dw_build_number: 0,
+                dw_platform_id: 0,
+                sz_csd_version: [0u16; 128],
+            };
+            if rtl_get_version(&mut info) != 0
+                || info.dw_major_version < 10
+                || (info.dw_major_version == 10 && info.dw_build_number < MIN_WIN10_1903_BUILD)
+            {
+                return;
+            }
+
             let hmod = LoadLibraryExW(
                 lib_name.as_ptr(),
                 core::ptr::null_mut(),
@@ -1423,7 +1620,7 @@ fn run_windows_frameless_browser(
         let raw_name = if !suggested_name.trim().is_empty() {
             suggested_name.trim().to_string()
         } else {
-            uri.split('?')
+            uri.split(['?', '#'])
                 .next()
                 .and_then(|base| base.rsplit('/').next())
                 .filter(|s| !s.trim().is_empty())
@@ -1439,9 +1636,11 @@ fn run_windows_frameless_browser(
             })
             .take(180)
             .collect();
-        let trimmed = clean.trim().trim_matches('.');
+        let trimmed = clean.trim_matches(|c: char| c.is_whitespace() || c == '.');
         let safe_base = if trimmed.is_empty() {
             "download.bin".to_string()
+        } else if is_windows_reserved_device_name(trimmed) {
+            format!("_{}", trimmed)
         } else {
             trimmed.to_string()
         };
@@ -1467,18 +1666,38 @@ fn run_windows_frameless_browser(
 
     fn reveal_download_in_explorer(raw_path: &str) {
         let trimmed = raw_path.trim();
-        if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f || b == b'"') {
+        if trimmed.is_empty()
+            || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f || b == b'"')
+            || trimmed.starts_with("\\\\")
+            || trimmed.starts_with("//")
+        {
             return;
         }
-        let target = std::path::Path::new(trimmed);
         let downloads_dir = resolve_user_downloads_dir();
-        let valid_target = if target.exists() {
-            target.to_path_buf()
-        } else if let Some(parent) = target.parent().filter(|p| p.is_dir()) {
-            parent.to_path_buf()
-        } else {
-            downloads_dir
+        let Ok(canon_downloads) = std::fs::canonicalize(&downloads_dir) else {
+            return;
         };
+        let target = std::path::Path::new(trimmed);
+        let Ok(canon_target) = std::fs::canonicalize(target) else {
+            return;
+        };
+        if !canon_target.starts_with(&canon_downloads) {
+            return;
+        }
+        let canon_str = canon_target.to_string_lossy();
+        if canon_str.to_ascii_uppercase().starts_with("\\\\?\\UNC\\") {
+            return;
+        }
+        let explorer_path = canon_str.strip_prefix("\\\\?\\").unwrap_or(&canon_str);
+        if explorer_path.is_empty()
+            || explorer_path.starts_with("\\\\")
+            || explorer_path.starts_with("//")
+            || explorer_path
+                .bytes()
+                .any(|b| b <= 0x1f || b == 0x7f || b == b'"')
+        {
+            return;
+        }
 
         use std::os::windows::ffi::OsStrExt;
         #[link(name = "shell32")]
@@ -1492,39 +1711,28 @@ fn run_windows_frameless_browser(
                 n_show_cmd: i32,
             ) -> isize;
         }
-        let op: Vec<u16> = std::ffi::OsStr::new("open").encode_wide().chain(Some(0)).collect();
-        if valid_target.is_file() {
-            let exe: Vec<u16> = std::ffi::OsStr::new("explorer.exe")
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            let params_str = format!("/select,\"{}\"", valid_target.display());
-            let params: Vec<u16> = std::ffi::OsStr::new(&params_str)
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            unsafe {
-                let _ = ShellExecuteW(
-                    core::ptr::null_mut(),
-                    op.as_ptr(),
-                    exe.as_ptr(),
-                    params.as_ptr(),
-                    core::ptr::null(),
-                    1,
-                );
-            }
-        } else {
-            let dir_w: Vec<u16> = valid_target.as_os_str().encode_wide().chain(Some(0)).collect();
-            unsafe {
-                let _ = ShellExecuteW(
-                    core::ptr::null_mut(),
-                    op.as_ptr(),
-                    dir_w.as_ptr(),
-                    core::ptr::null(),
-                    core::ptr::null(),
-                    1,
-                );
-            }
+        let op: Vec<u16> = std::ffi::OsStr::new("open")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let exe: Vec<u16> = std::ffi::OsStr::new("explorer.exe")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let params_str = format!("/select,\"{}\"", explorer_path);
+        let params: Vec<u16> = std::ffi::OsStr::new(&params_str)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            let _ = ShellExecuteW(
+                core::ptr::null_mut(),
+                op.as_ptr(),
+                exe.as_ptr(),
+                params.as_ptr(),
+                core::ptr::null(),
+                1,
+            );
         }
     }
 
@@ -2154,8 +2362,8 @@ fn run_windows_frameless_browser(
     }
 
     const EXT_POPUP_INIT_SCRIPT: &str = r##"(function(){
-  if (window.__sgExtPopupHooked) return;
-  window.__sgExtPopupHooked = true;
+  const popupHookToken = Symbol();
+  if (!popupHookToken) return;
   document.addEventListener("keydown", function(e) {
     if (e && e.isTrusted !== false && e.key === "Escape") {
       try {
@@ -2166,8 +2374,8 @@ fn run_windows_frameless_browser(
 })();"##;
 
     const CONTENT_LINK_INTENT_SCRIPT: &str = r##"(function(){
-  if (window.__sgLinkHooked) return;
-  window.__sgLinkHooked = true;
+  const hookToken = Symbol();
+  if (!hookToken) return;
   const postIpc = (window.ipc && typeof window.ipc.postMessage === "function")
     ? window.ipc.postMessage.bind(window.ipc)
     : null;
@@ -2265,7 +2473,7 @@ fn run_windows_frameless_browser(
       sendShortcut("new_tab", 0, e);
     } else if (ctrl && !e.shiftKey && (k === "n" || code === "KeyN")) {
       sendShortcut("new_window", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "w" || code === "KeyW" || code === "F4")) {
+    } else if (ctrl && !e.shiftKey && (k === "w" || code === "F4")) {
       sendShortcut("close_active_tab", 0, e);
     } else if (ctrl && e.shiftKey && (k === "tab" || code === "Tab")) {
       sendShortcut("prev_tab", 0, e);
@@ -2281,7 +2489,7 @@ fn run_windows_frameless_browser(
       sendShortcut("toggle_bookmark", 0, e);
     } else if (ctrl && !e.shiftKey && (k === "h" || code === "KeyH")) {
       sendShortcut("open_history", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "," || code === "Comma")) {
+    } else if (ctrl && !e.shiftKey && (k === ",")) {
       sendShortcut("open_settings", 0, e);
     } else if (ctrl && !e.shiftKey && (k === "+" || k === "=" || code === "Equal" || code === "NumpadAdd")) {
       sendShortcut("zoom_in", 0, e);
@@ -2336,44 +2544,9 @@ fn run_windows_frameless_browser(
 
   if (window.top !== window) return;
 
-  let lastFsState = null;
-  function reportFullscreen() {
-    try {
-      const fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-      if (fs !== lastFsState) {
-        lastFsState = fs;
-        postIpc(JSON.stringify({ k: "fullscreen", fs: fs }));
-      }
-    } catch (_) {}
-  }
-  document.addEventListener("fullscreenchange", reportFullscreen, true);
-  document.addEventListener("webkitfullscreenchange", reportFullscreen, true);
+  // HTML5 fullscreenchange & favicon updates are enforced natively via CEF DisplayHandler callbacks
+  // (never accepted over untrusted web ContentIpc).
 
-  let lastFaviconSent = "";
-  function reportFavicon() {
-    try {
-      const sel = "link[rel='icon'][sizes*='32'], link[rel='icon'][sizes*='64'], link[rel~='icon'], link[rel='shortcut icon'], link[rel='apple-touch-icon']";
-      const el = document.querySelector(sel);
-      let href = el && el.href ? String(el.href) : "";
-      if (!/^https?:\/\//i.test(href)) {
-        if (/^https?:\/\//i.test(location.origin)) {
-          href = location.origin + "/favicon.ico";
-        } else {
-          return;
-        }
-      }
-      if (href !== lastFaviconSent && href.length <= 512) {
-        lastFaviconSent = href;
-        postIpc(JSON.stringify({ k: "favicon", u: href }));
-      }
-    } catch (_) {}
-  }
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", reportFavicon, { once: true });
-  } else {
-    reportFavicon();
-  }
-  window.addEventListener("load", function() { setTimeout(reportFavicon, 250); }, { once: true });
 
   let lastSentSec = -1;
   let lastSentScroll = -1;
@@ -2675,6 +2848,11 @@ fn run_windows_frameless_browser(
         let _ = adopt_proxy.send_event(WinEvent::AdoptExternalTab(payload));
     });
 
+    let pm_proxy = proxy.clone();
+    server_cfg.set_private_mode_handler(move |enabled| {
+        let _ = pm_proxy.send_event(WinEvent::ApplyPrivateMode(enabled));
+    });
+
     // 1. Initialize ONE single Pure Chromium (CEF) runtime shared across ALL windows & tabs!
     let (cef_profile_dir, extensions_dir, root_dir, primary_session_id, primary_session, pending_restore_ids, startup_pos) = {
         let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
@@ -2894,8 +3072,12 @@ fn run_windows_frameless_browser(
         override_pos: Option<(i32, i32)>,
     ) -> Result<(WindowId, BrowserWindowState), String> {
         let saved_geom = session.geometry;
-        if let Ok(mut map) = server_cfg.window_sessions.lock() {
-            map.insert(session_id.clone(), session);
+        if is_valid_window_id(&session_id) {
+            if let Ok(mut map) = server_cfg.window_sessions.lock() {
+                if map.contains_key(&session_id) || map.len() < MAX_WINDOW_SESSIONS {
+                    map.insert(session_id.clone(), session);
+                }
+            }
         }
 
         let effective_pos = override_pos.or_else(|| match (saved_geom.pos_x, saved_geom.pos_y) {
@@ -3348,6 +3530,17 @@ fn run_windows_frameless_browser(
         st.close_ext_popup();
 
         let tid = st.active_tab_id;
+        if let Some(reason) = check_killswitch_global_block(shared_shell) {
+            emit_ui_sync(
+                &st.ui_browser,
+                &serde_json::json!({
+                    "tab_id": tid,
+                    "nav_blocked": true,
+                    "reason": reason
+                }),
+            );
+            return;
+        }
         if st.web_visible {
             if let Some(b) = st.tab_browsers.get(&tid) {
                 if b.go_back() {
@@ -3365,18 +3558,22 @@ fn run_windows_frameless_browser(
 
         // Fallback via per-tab URL history stack (handles returning to New Tab, RAM-unloaded
         // tabs whose Chromium NavigationController reset, and restored sessions).
-        let target_opt = st.tab_nav_history.get_mut(&tid).and_then(|nav| {
+        let peek_target = st.tab_nav_history.get(&tid).and_then(|nav| {
             if nav.index > 0 {
-                nav.index -= 1;
-                nav.pending_traversal_at = Some(now);
-                nav.entries.get(nav.index).cloned()
+                nav.entries.get(nav.index - 1).cloned()
             } else {
                 None
             }
         });
 
-        if let Some(target_url) = target_opt {
+        if let Some(target_url) = peek_target {
             if target_url.is_empty() {
+                if let Some(nav) = st.tab_nav_history.get_mut(&tid) {
+                    if nav.index > 0 {
+                        nav.index -= 1;
+                        nav.pending_traversal_at = Some(now);
+                    }
+                }
                 // Smoothly step back to the New Tab page while preserving forward history!
                 st.tab_browsers.remove(&tid);
                 st.layout_cache.invalidate_tab(Some(tid));
@@ -3397,17 +3594,38 @@ fn run_windows_frameless_browser(
                         "ram_active_count": st.tab_browsers.len()
                     }),
                 );
-            } else if parse_http_url_authority(&target_url).is_ok() {
+            } else {
+                let scrubbed_target = match check_navigation_policy(&target_url, shared_shell) {
+                    Ok(u) => u,
+                    Err(reason) => {
+                        emit_ui_sync(
+                            &st.ui_browser,
+                            &serde_json::json!({
+                                "tab_id": tid,
+                                "nav_blocked": true,
+                                "url": target_url,
+                                "reason": reason
+                            }),
+                        );
+                        return;
+                    }
+                };
+                if let Some(nav) = st.tab_nav_history.get_mut(&tid) {
+                    if nav.index > 0 {
+                        nav.index -= 1;
+                        nav.pending_traversal_at = Some(now);
+                    }
+                }
                 st.web_visible = true;
-                st.tab_last_urls.insert(tid, target_url.clone());
+                st.tab_last_urls.insert(tid, scrubbed_target.clone());
                 if let Some(existing) = st.tab_browsers.get(&tid) {
-                    existing.load_url(&target_url);
+                    existing.load_url(&scrubbed_target);
                 } else {
                     spawn_content_tab_cef(
                         win_id,
                         st,
                         tid,
-                        &target_url,
+                        &scrubbed_target,
                         bind_port,
                         is_private,
                         incognito_ctx,
@@ -3424,7 +3642,7 @@ fn run_windows_frameless_browser(
                     &st.ui_browser,
                     &serde_json::json!({
                         "tab_id": tid,
-                        "url": target_url,
+                        "url": scrubbed_target,
                         "nav_restore_web": true,
                         "ram_active_count": st.tab_browsers.len()
                     }),
@@ -3465,6 +3683,17 @@ fn run_windows_frameless_browser(
         st.close_ext_popup();
 
         let tid = st.active_tab_id;
+        if let Some(reason) = check_killswitch_global_block(shared_shell) {
+            emit_ui_sync(
+                &st.ui_browser,
+                &serde_json::json!({
+                    "tab_id": tid,
+                    "nav_blocked": true,
+                    "reason": reason
+                }),
+            );
+            return;
+        }
         if st.web_visible {
             if let Some(b) = st.tab_browsers.get(&tid) {
                 if b.go_forward() {
@@ -3480,28 +3709,47 @@ fn run_windows_frameless_browser(
             }
         }
 
-        let target_opt = st.tab_nav_history.get_mut(&tid).and_then(|nav| {
+        let peek_target = st.tab_nav_history.get(&tid).and_then(|nav| {
             if nav.index + 1 < nav.entries.len() {
-                nav.index += 1;
-                nav.pending_traversal_at = Some(now);
-                nav.entries.get(nav.index).cloned()
+                nav.entries.get(nav.index + 1).cloned()
             } else {
                 None
             }
         });
 
-        if let Some(target_url) = target_opt {
-            if !target_url.is_empty() && parse_http_url_authority(&target_url).is_ok() {
+        if let Some(target_url) = peek_target {
+            if !target_url.is_empty() {
+                let scrubbed_target = match check_navigation_policy(&target_url, shared_shell) {
+                    Ok(u) => u,
+                    Err(reason) => {
+                        emit_ui_sync(
+                            &st.ui_browser,
+                            &serde_json::json!({
+                                "tab_id": tid,
+                                "nav_blocked": true,
+                                "url": target_url,
+                                "reason": reason
+                            }),
+                        );
+                        return;
+                    }
+                };
+                if let Some(nav) = st.tab_nav_history.get_mut(&tid) {
+                    if nav.index + 1 < nav.entries.len() {
+                        nav.index += 1;
+                        nav.pending_traversal_at = Some(now);
+                    }
+                }
                 st.web_visible = true;
-                st.tab_last_urls.insert(tid, target_url.clone());
+                st.tab_last_urls.insert(tid, scrubbed_target.clone());
                 if let Some(existing) = st.tab_browsers.get(&tid) {
-                    existing.load_url(&target_url);
+                    existing.load_url(&scrubbed_target);
                 } else {
                     spawn_content_tab_cef(
                         win_id,
                         st,
                         tid,
-                        &target_url,
+                        &scrubbed_target,
                         bind_port,
                         is_private,
                         incognito_ctx,
@@ -3523,7 +3771,7 @@ fn run_windows_frameless_browser(
                     &st.ui_browser,
                     &serde_json::json!({
                         "tab_id": tid,
-                        "url": target_url,
+                        "url": scrubbed_target,
                         "nav_restore_web": true,
                         "ram_active_count": st.tab_browsers.len()
                     }),
@@ -3555,6 +3803,93 @@ fn run_windows_frameless_browser(
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_private_mode_all_windows(
+        enabled: bool,
+        cef_private_mode_applied: &mut bool,
+        windows: &mut HashMap<WindowId, BrowserWindowState>,
+        bind_port: u16,
+        incognito_ctx: &mut Option<cef::RequestContext>,
+        proxy: &EventLoopProxy<WinEvent>,
+        shared_shell: &Arc<Mutex<SingularityBrowserShell>>,
+        download_resolver: &CefDownloadResolver,
+    ) {
+        if *cef_private_mode_applied == enabled {
+            return;
+        }
+        *cef_private_mode_applied = enabled;
+        if enabled {
+            cef_runtime::run_cookie_hygiene_cef(shared_shell, false, true, None);
+        }
+        {
+            let mut shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
+            shell.private_browsing_active = enabled;
+        }
+        bump_state_revision();
+        if !enabled {
+            *incognito_ctx = None;
+        }
+        let all_wids: Vec<WindowId> = windows.keys().copied().collect();
+        for cur_wid in all_wids {
+            if let Some(st) = windows.get_mut(&cur_wid) {
+                st.close_ext_popup();
+                let active_url = st.tab_last_urls.get(&st.active_tab_id).cloned();
+                let active_sec = st.tab_media_times.get(&st.active_tab_id).copied();
+                let active_sy = st.tab_scroll_ys.get(&st.active_tab_id).copied();
+                let active_tid = st.active_tab_id;
+                st.tab_browsers.clear();
+                st.layout_cache.invalidate_tab(None);
+                if st.web_visible {
+                    if let Some(u) = active_url {
+                        match check_navigation_policy(&u, shared_shell) {
+                            Ok(scrubbed) => {
+                                spawn_content_tab_cef(
+                                    cur_wid,
+                                    st,
+                                    active_tid,
+                                    &scrubbed,
+                                    bind_port,
+                                    enabled,
+                                    incognito_ctx,
+                                    active_sec,
+                                    active_sy,
+                                    false,
+                                    proxy,
+                                    shared_shell,
+                                    download_resolver,
+                                );
+                            }
+                            Err(reason) => {
+                                st.web_visible = false;
+                                emit_ui_sync(
+                                    &st.ui_browser,
+                                    &serde_json::json!({
+                                        "tab_id": active_tid,
+                                        "nav_blocked": true,
+                                        "url": u,
+                                        "reason": reason
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                st.sync_layout();
+                emit_ui_sync(
+                    &st.ui_browser,
+                    &serde_json::json!({
+                        "private_browsing": enabled,
+                        "ram_active_count": st.tab_browsers.len()
+                    }),
+                );
+            }
+        }
+    }
+
+    let mut cef_private_mode_applied = shared_shell
+        .lock()
+        .map(|s| s.private_browsing_active)
+        .unwrap_or(false);
     let mut prev_xbtn1_down = false;
     let mut prev_xbtn2_down = false;
 
@@ -3967,6 +4302,18 @@ fn run_windows_frameless_browser(
                             }),
                         );
                     }
+                }
+                WinEvent::ApplyPrivateMode(enabled) => {
+                    apply_private_mode_all_windows(
+                        enabled,
+                        &mut cef_private_mode_applied,
+                        &mut windows,
+                        bind_port,
+                        &mut incognito_ctx,
+                        &proxy,
+                        &shared_shell,
+                        &download_resolver,
+                    );
                 }
                 WinEvent::UiStartupWatchdog(wid) => {
                     if let Some(st) = windows.get_mut(&wid) {
@@ -4538,6 +4885,11 @@ fn run_windows_frameless_browser(
                         }
                     }
                     CefCallbackEvent::NativeShortcut { tab_id, action } => {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_shortcut_at) < Duration::from_millis(60) {
+                            return;
+                        }
+                        last_shortcut_at = now;
                         if let Some(st) = windows.get_mut(&wid) {
                             if tab_id != 0 && tab_id != st.active_tab_id {
                                 return;
@@ -4803,6 +5155,22 @@ fn run_windows_frameless_browser(
                         }
                     }
                     CefCallbackEvent::OpenNewTab { url, background } => {
+                        let scrubbed_url = match check_navigation_policy(&url, &shared_shell) {
+                            Ok(u) => u,
+                            Err(reason) => {
+                                if let Some(st) = windows.get(&wid) {
+                                    emit_ui_sync(
+                                        &st.ui_browser,
+                                        &serde_json::json!({
+                                            "nav_blocked": true,
+                                            "url": url,
+                                            "reason": reason
+                                        }),
+                                    );
+                                }
+                                return;
+                            }
+                        };
                         if let Some(st) = windows.get_mut(&wid) {
                             let mut bg = background;
                             let mut title: Option<String> = None;
@@ -4824,7 +5192,7 @@ fn run_windows_frameless_browser(
                                 }
                             }
                             let mut payload = serde_json::json!({
-                                "new_tab_url": url,
+                                "new_tab_url": scrubbed_url,
                                 "new_tab_background": bg
                             });
                             if let Some(t) = title {
@@ -4863,6 +5231,11 @@ fn run_windows_frameless_browser(
                         }
                     }
                     CefCallbackEvent::ContentIpc { tab_id, body } => {
+                        // ContentIpc originates from untrusted web renderers: NEVER permit any
+                        // privileged browser action (new_window, close_active_tab, toggle_bookmark,
+                        // open_history, open_settings, toggle_private, fullscreen/toggle_fullscreen,
+                        // favicon spoofing, or synthetic shortcuts). Only strictly validated benign
+                        // events from the currently active content tab are accepted.
                         if body.len() > 2048 || tab_id == 0 {
                             return;
                         }
@@ -4872,195 +5245,13 @@ fn run_windows_frameless_browser(
                         let Some(kind) = v.get("k").and_then(|x| x.as_str()) else {
                             return;
                         };
+                        let Some(st) = windows.get_mut(&wid) else {
+                            return;
+                        };
+                        if tab_id != st.active_tab_id || !st.tab_browsers.contains_key(&tab_id) {
+                            return;
+                        }
                         match kind {
-                            "fullscreen" => {
-                                if let (Some(st), Some(enabled)) = (
-                                    windows.get_mut(&wid),
-                                    v.get("fs").and_then(|x| x.as_bool()),
-                                ) {
-                                    if enabled
-                                        && (tab_id != st.active_tab_id
-                                            || !st.web_visible
-                                            || st.overlay_open)
-                                    {
-                                        return;
-                                    }
-                                    if enabled {
-                                        st.close_ext_popup();
-                                    }
-                                    let prev_fs = st.html_fullscreen || st.user_f11_fullscreen;
-                                    st.html_fullscreen = enabled;
-                                    let next_fs = st.html_fullscreen || st.user_f11_fullscreen;
-                                    st.apply_fullscreen(prev_fs, next_fs);
-                                }
-                            }
-                            "shortcut" => {
-                                let Some(action) = v.get("a").and_then(|x| x.as_str()) else {
-                                    return;
-                                };
-                                let allowed = matches!(
-                                    action,
-                                    "toggle_fullscreen"
-                                        | "reopen_closed_tab"
-                                        | "new_tab"
-                                        | "new_window"
-                                        | "close_active_tab"
-                                        | "next_tab"
-                                        | "prev_tab"
-                                        | "focus_omnibar"
-                                        | "reload_tab"
-                                        | "toggle_bookmark"
-                                        | "open_history"
-                                        | "open_settings"
-                                        | "jump_tab"
-                                        | "web_back"
-                                        | "web_forward"
-                                        | "zoom_in"
-                                        | "zoom_out"
-                                        | "zoom_reset"
-                                );
-                                if !allowed {
-                                    return;
-                                }
-                                let now = std::time::Instant::now();
-                                if now.duration_since(last_shortcut_at) < Duration::from_millis(60)
-                                {
-                                    return;
-                                }
-                                last_shortcut_at = now;
-                                if action == "new_window" {
-                                    let _ = proxy.send_event(WinEvent::OpenNewWindowInProcess);
-                                    return;
-                                }
-                                let idx = v
-                                    .get("n")
-                                    .and_then(|x| x.as_u64())
-                                    .filter(|&n| (1..=9).contains(&n))
-                                    .map(|n| n as u8);
-                                if let Some(st) = windows.get_mut(&wid) {
-                                    if tab_id != st.active_tab_id
-                                        || !st.web_visible
-                                        || st.overlay_open
-                                    {
-                                        return;
-                                    }
-                                    match action {
-                                        "toggle_fullscreen" => {
-                                            st.close_ext_popup();
-                                            let prev_fs =
-                                                st.html_fullscreen || st.user_f11_fullscreen;
-                                            if prev_fs {
-                                                st.html_fullscreen = false;
-                                                st.user_f11_fullscreen = false;
-                                                if let Some(b) =
-                                                    st.tab_browsers.get(&st.active_tab_id)
-                                                {
-                                                    b.evaluate_script("document.fullscreenElement && document.exitFullscreen && document.exitFullscreen().catch(()=>{});");
-                                                }
-                                            } else {
-                                                st.user_f11_fullscreen = true;
-                                            }
-                                            let next_fs =
-                                                st.html_fullscreen || st.user_f11_fullscreen;
-                                            st.apply_fullscreen(prev_fs, next_fs);
-                                            return;
-                                        }
-                                        "web_back" => {
-                                            let is_private = shared_shell
-                                                .lock()
-                                                .map(|s| s.private_browsing_active)
-                                                .unwrap_or(false);
-                                            perform_tab_go_back(
-                                                wid,
-                                                st,
-                                                bind_port,
-                                                is_private,
-                                                &mut incognito_ctx,
-                                                &proxy,
-                                                &shared_shell,
-                                                &download_resolver,
-                                            );
-                                            return;
-                                        }
-                                        "web_forward" => {
-                                            let is_private = shared_shell
-                                                .lock()
-                                                .map(|s| s.private_browsing_active)
-                                                .unwrap_or(false);
-                                            perform_tab_go_forward(
-                                                wid,
-                                                st,
-                                                bind_port,
-                                                is_private,
-                                                &mut incognito_ctx,
-                                                &proxy,
-                                                &shared_shell,
-                                                &download_resolver,
-                                            );
-                                            return;
-                                        }
-                                        "zoom_in" | "zoom_out" | "zoom_reset" => {
-                                            perform_tab_zoom(st, action);
-                                            return;
-                                        }
-                                        "reload_tab" => {
-                                            if let Some(b) = st.tab_browsers.get(&st.active_tab_id)
-                                            {
-                                                b.reload();
-                                                return;
-                                            }
-                                        }
-                                        "focus_omnibar"
-                                        | "new_tab"
-                                        | "open_settings"
-                                        | "open_history" => {
-                                            if st.html_fullscreen || st.user_f11_fullscreen {
-                                                st.html_fullscreen = false;
-                                                st.user_f11_fullscreen = false;
-                                                st.apply_fullscreen(true, false);
-                                            }
-                                            st.ui_browser.focus();
-                                        }
-                                        _ => {}
-                                    }
-                                    emit_ui_sync(
-                                        &st.ui_browser,
-                                        &serde_json::json!({
-                                            "shortcut": action,
-                                            "shortcut_index": idx
-                                        }),
-                                    );
-                                }
-                            }
-                            "favicon" => {
-                                if let Some(icon_url) = v.get("u").and_then(|x| x.as_str()) {
-                                    if icon_url.len() <= 512
-                                        && parse_http_url_authority(icon_url).is_ok()
-                                    {
-                                        if let Some(st) = windows.get_mut(&wid) {
-                                            let now = std::time::Instant::now();
-                                            if st
-                                                .last_favicon_at
-                                                .get(&tab_id)
-                                                .is_some_and(|p| {
-                                                    now.duration_since(*p)
-                                                        < Duration::from_millis(1000)
-                                                })
-                                            {
-                                                return;
-                                            }
-                                            st.last_favicon_at.insert(tab_id, now);
-                                            emit_ui_sync(
-                                                &st.ui_browser,
-                                                &serde_json::json!({
-                                                    "tab_id": tab_id,
-                                                    "favicon_url": icon_url
-                                                }),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
                             "media_state" => {
                                 let time_sec = v
                                     .get("s")
@@ -5072,60 +5263,61 @@ fn run_windows_frameless_browser(
                                     .and_then(|x| x.as_u64())
                                     .unwrap_or(0)
                                     .min(10_000_000) as u32;
-                                if let Some(st) = windows.get_mut(&wid) {
-                                    let Some(trusted_url) = st
-                                        .tab_browsers
-                                        .get(&tab_id)
-                                        .and_then(read_live_http_url)
-                                        .or_else(|| st.tab_last_urls.get(&tab_id).cloned())
-                                    else {
-                                        return;
-                                    };
-                                    if time_sec >= 2 {
-                                        st.tab_media_times.insert(tab_id, time_sec);
+                                let Some(trusted_url) = st
+                                    .tab_browsers
+                                    .get(&tab_id)
+                                    .and_then(read_live_http_url)
+                                    .or_else(|| st.tab_last_urls.get(&tab_id).cloned())
+                                else {
+                                    return;
+                                };
+                                if time_sec >= 2 {
+                                    st.tab_media_times.insert(tab_id, time_sec);
+                                }
+                                if scroll_y > 0 {
+                                    st.tab_scroll_ys.insert(tab_id, scroll_y);
+                                }
+                                emit_ui_sync(
+                                    &st.ui_browser,
+                                    &serde_json::json!({
+                                        "tab_id": tab_id,
+                                        "media_time_sec": time_sec,
+                                        "scroll_y": scroll_y
+                                    }),
+                                );
+                                let mut should_flush_checkpoint = false;
+                                if last_media_disk_flush.elapsed() >= Duration::from_secs(6) {
+                                    should_flush_checkpoint = true;
+                                    let mut shell = shared_shell
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if !shell.private_browsing_active
+                                        && shell.roaming.profile.restore_session
+                                        && shell.roaming.update_saved_tab_media_progress(
+                                            &trusted_url,
+                                            time_sec,
+                                            scroll_y,
+                                        )
+                                    {
+                                        shell.roaming.schedule_save_profile();
+                                        history_dirty = false;
+                                        last_history_disk_flush = std::time::Instant::now();
                                     }
-                                    if scroll_y > 0 {
-                                        st.tab_scroll_ys.insert(tab_id, scroll_y);
-                                    }
-                                    emit_ui_sync(
-                                        &st.ui_browser,
-                                        &serde_json::json!({
-                                            "tab_id": tab_id,
-                                            "media_time_sec": time_sec,
-                                            "scroll_y": scroll_y
-                                        }),
-                                    );
-                                    let mut should_flush_checkpoint = false;
-                                    if last_media_disk_flush.elapsed() >= Duration::from_secs(6) {
-                                        should_flush_checkpoint = true;
-                                        let mut shell = shared_shell
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner());
-                                        if !shell.private_browsing_active
-                                            && shell.roaming.profile.restore_session
-                                            && shell.roaming.update_saved_tab_media_progress(
-                                                &trusted_url,
-                                                time_sec,
-                                                scroll_y,
-                                            )
-                                        {
-                                            shell.roaming.schedule_save_profile();
-                                            history_dirty = false;
-                                            last_history_disk_flush = std::time::Instant::now();
-                                        }
-                                        last_media_disk_flush = std::time::Instant::now();
-                                    }
-                                    if should_flush_checkpoint && smoke_tracker.is_none() {
-                                        let _ = st;
-                                        flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
-                                    }
+                                    last_media_disk_flush = std::time::Instant::now();
+                                }
+                                if should_flush_checkpoint && smoke_tracker.is_none() {
+                                    let _ = st;
+                                    flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
                                 }
                             }
                             "bg_click" | "context_link" => {
+                                if !st.web_visible || st.overlay_open {
+                                    return;
+                                }
                                 let Some(href) = v.get("u").and_then(|x| x.as_str()) else {
                                     return;
                                 };
-                                if parse_http_url_authority(href).is_err() {
+                                if href.len() > 2048 || parse_http_url_authority(href).is_err() {
                                     return;
                                 }
                                 let title: String = v
@@ -5138,17 +5330,15 @@ fn run_windows_frameless_browser(
                                     .collect::<String>()
                                     .trim()
                                     .to_string();
-                                if let Some(st) = windows.get_mut(&wid) {
-                                    st.tab_bg_intents.insert(
-                                        tab_id,
-                                        BgLinkIntent {
-                                            kind: kind.to_string(),
-                                            href: href.to_string(),
-                                            title,
-                                            at: std::time::Instant::now(),
-                                        },
-                                    );
-                                }
+                                st.tab_bg_intents.insert(
+                                    tab_id,
+                                    BgLinkIntent {
+                                        kind: kind.to_string(),
+                                        href: href.to_string(),
+                                        title,
+                                        at: std::time::Instant::now(),
+                                    },
+                                );
                             }
                             _ => {}
                         }
@@ -5420,9 +5610,25 @@ fn run_windows_frameless_browser(
                                 url,
                                 overlay_open: ov,
                             } => {
-                                if parse_http_url_authority(&url).is_err() {
-                                    return;
-                                }
+                                let scrubbed_url = match check_navigation_policy(&url, &shared_shell) {
+                                    Ok(u) => u,
+                                    Err(reason) => {
+                                        if let Some(st) = windows.get(&wid) {
+                                            let tid =
+                                                if tab_id == 0 { st.active_tab_id } else { tab_id };
+                                            emit_ui_sync(
+                                                &st.ui_browser,
+                                                &serde_json::json!({
+                                                    "tab_id": tid,
+                                                    "nav_blocked": true,
+                                                    "url": url,
+                                                    "reason": reason
+                                                }),
+                                            );
+                                        }
+                                        return;
+                                    }
+                                };
                                 let is_private = shared_shell
                                     .lock()
                                     .map(|s| s.private_browsing_active)
@@ -5457,7 +5663,7 @@ fn run_windows_frameless_browser(
                                         .get(&tid)
                                         .map(|prev| {
                                             normalize_url_without_media_time(prev)
-                                                != normalize_url_without_media_time(&url)
+                                                != normalize_url_without_media_time(&scrubbed_url)
                                         })
                                         .unwrap_or(true)
                                     {
@@ -5467,20 +5673,20 @@ fn run_windows_frameless_browser(
                                     st.active_tab_id = tid;
                                     st.web_visible = true;
                                     st.overlay_open = ov;
-                                    st.tab_last_urls.insert(tid, url.clone());
+                                    st.tab_last_urls.insert(tid, scrubbed_url.clone());
                                     st.tab_nav_history
                                         .entry(tid)
                                         .or_insert_with(TabNavHistory::new_with_home)
-                                        .record_url(&url);
+                                        .record_url(&scrubbed_url);
 
                                     if let Some(existing) = st.tab_browsers.get(&tid) {
-                                        existing.load_url(&url);
+                                        existing.load_url(&scrubbed_url);
                                     } else {
                                         spawn_content_tab_cef(
                                             wid,
                                             st,
                                             tid,
-                                            &url,
+                                            &scrubbed_url,
                                             bind_port,
                                             is_private,
                                             &mut incognito_ctx,
@@ -5568,58 +5774,77 @@ fn run_windows_frameless_browser(
                                                     }),
                                                 );
                                             }
-                                        } else if parse_http_url_authority(&url).is_ok() {
-                                            let target_sec = resume_time_sec
-                                                .filter(|&t| t >= 3)
-                                                .or_else(|| {
-                                                    st.tab_media_times
-                                                        .get(&tab_id)
-                                                        .copied()
+                                        } else if !url.trim().is_empty() {
+                                            match check_navigation_policy(&url, &shared_shell) {
+                                                Ok(scrubbed_url) => {
+                                                    let target_sec = resume_time_sec
                                                         .filter(|&t| t >= 3)
-                                                });
-                                            let target_scroll = resume_scroll_y
-                                                .filter(|&sy| sy >= 40)
-                                                .or_else(|| {
-                                                    st.tab_scroll_ys
-                                                        .get(&tab_id)
-                                                        .copied()
+                                                        .or_else(|| {
+                                                            st.tab_media_times
+                                                                .get(&tab_id)
+                                                                .copied()
+                                                                .filter(|&t| t >= 3)
+                                                        });
+                                                    let target_scroll = resume_scroll_y
                                                         .filter(|&sy| sy >= 40)
-                                                });
-                                            st.tab_last_urls.insert(tab_id, url.clone());
-                                            st.tab_nav_history
-                                                .entry(tab_id)
-                                                .or_insert_with(|| {
-                                                    TabNavHistory::new_with_url(&url)
-                                                });
-                                            if let Some(t) = target_sec {
-                                                st.tab_media_times.insert(tab_id, t);
+                                                        .or_else(|| {
+                                                            st.tab_scroll_ys
+                                                                .get(&tab_id)
+                                                                .copied()
+                                                                .filter(|&sy| sy >= 40)
+                                                        });
+                                                    st.tab_last_urls
+                                                        .insert(tab_id, scrubbed_url.clone());
+                                                    st.tab_nav_history
+                                                        .entry(tab_id)
+                                                        .or_insert_with(|| {
+                                                            TabNavHistory::new_with_url(
+                                                                &scrubbed_url,
+                                                            )
+                                                        });
+                                                    if let Some(t) = target_sec {
+                                                        st.tab_media_times.insert(tab_id, t);
+                                                    }
+                                                    if let Some(sy) = target_scroll {
+                                                        st.tab_scroll_ys.insert(tab_id, sy);
+                                                    }
+                                                    spawn_content_tab_cef(
+                                                        wid,
+                                                        st,
+                                                        tab_id,
+                                                        &scrubbed_url,
+                                                        bind_port,
+                                                        is_private,
+                                                        &mut incognito_ctx,
+                                                        target_sec,
+                                                        target_scroll,
+                                                        start_paused,
+                                                        &proxy,
+                                                        &shared_shell,
+                                                        &download_resolver,
+                                                    );
+                                                    emit_ui_sync(
+                                                        &st.ui_browser,
+                                                        &serde_json::json!({
+                                                            "tab_id": tab_id,
+                                                            "unloaded": false,
+                                                            "ram_active_count": st.tab_browsers.len()
+                                                        }),
+                                                    );
+                                                }
+                                                Err(reason) => {
+                                                    st.web_visible = false;
+                                                    emit_ui_sync(
+                                                        &st.ui_browser,
+                                                        &serde_json::json!({
+                                                            "tab_id": tab_id,
+                                                            "nav_blocked": true,
+                                                            "url": url,
+                                                            "reason": reason
+                                                        }),
+                                                    );
+                                                }
                                             }
-                                            if let Some(sy) = target_scroll {
-                                                st.tab_scroll_ys.insert(tab_id, sy);
-                                            }
-                                            spawn_content_tab_cef(
-                                                wid,
-                                                st,
-                                                tab_id,
-                                                &url,
-                                                bind_port,
-                                                is_private,
-                                                &mut incognito_ctx,
-                                                target_sec,
-                                                target_scroll,
-                                                start_paused,
-                                                &proxy,
-                                                &shared_shell,
-                                                &download_resolver,
-                                            );
-                                            emit_ui_sync(
-                                                &st.ui_browser,
-                                                &serde_json::json!({
-                                                    "tab_id": tab_id,
-                                                    "unloaded": false,
-                                                    "ram_active_count": st.tab_browsers.len()
-                                                }),
-                                            );
                                         }
                                     } else {
                                         st.tab_nav_history
@@ -6034,53 +6259,16 @@ fn run_windows_frameless_browser(
                                 }
                             }
                             UiIpcCmd::SetPrivateMode { enabled } => {
-                                if enabled {
-                                    cef_runtime::run_cookie_hygiene_cef(
-                                        &shared_shell,
-                                        false,
-                                        true,
-                                        None,
-                                    );
-                                }
-                                {
-                                    let mut shell =
-                                        shared_shell.lock().unwrap_or_else(|e| e.into_inner());
-                                    shell.private_browsing_active = enabled;
-                                }
-                                if !enabled {
-                                    incognito_ctx = None;
-                                }
-                                if let Some(st) = windows.get_mut(&wid) {
-                                    st.close_ext_popup();
-                                    let active_url = st.tab_last_urls.get(&st.active_tab_id).cloned();
-                                    let active_sec = st.tab_media_times.get(&st.active_tab_id).copied();
-                                    let active_sy = st.tab_scroll_ys.get(&st.active_tab_id).copied();
-                                    let active_tid = st.active_tab_id;
-                                    st.tab_browsers.clear();
-                                    st.layout_cache.invalidate_tab(None);
-                                    if st.web_visible {
-                                        if let Some(u) = active_url
-                                            .filter(|u| parse_http_url_authority(u).is_ok())
-                                        {
-                                            spawn_content_tab_cef(
-                                                wid,
-                                                st,
-                                                active_tid,
-                                                &u,
-                                                bind_port,
-                                                enabled,
-                                                &mut incognito_ctx,
-                                                active_sec,
-                                                active_sy,
-                                                false,
-                                                &proxy,
-                                                &shared_shell,
-                                                &download_resolver,
-                                            );
-                                        }
-                                    }
-                                    st.sync_layout();
-                                }
+                                apply_private_mode_all_windows(
+                                    enabled,
+                                    &mut cef_private_mode_applied,
+                                    &mut windows,
+                                    bind_port,
+                                    &mut incognito_ctx,
+                                    &proxy,
+                                    &shared_shell,
+                                    &download_resolver,
+                                );
                             }
                             UiIpcCmd::WebBack => {
                                 if let Some(st) = windows.get_mut(&wid) {
@@ -6126,7 +6314,28 @@ fn run_windows_frameless_browser(
                             UiIpcCmd::WebReload => {
                                 if let Some(st) = windows.get(&wid) {
                                     if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
-                                        b.reload();
+                                        let cur_url = read_live_http_url(b).or_else(|| {
+                                            st.tab_last_urls.get(&st.active_tab_id).cloned()
+                                        });
+                                        let policy_err = match cur_url {
+                                            Some(ref u) => {
+                                                check_navigation_policy(u, &shared_shell).err()
+                                            }
+                                            None => check_killswitch_global_block(&shared_shell),
+                                        };
+                                        if let Some(reason) = policy_err {
+                                            emit_ui_sync(
+                                                &st.ui_browser,
+                                                &serde_json::json!({
+                                                    "tab_id": st.active_tab_id,
+                                                    "nav_blocked": true,
+                                                    "url": cur_url.unwrap_or_default(),
+                                                    "reason": reason
+                                                }),
+                                            );
+                                        } else {
+                                            b.reload();
+                                        }
                                     }
                                 }
                             }
@@ -6557,22 +6766,403 @@ fn run_windows_frameless_browser(
     });
 }
 
+/// Returns `true` if the filename stem (before the first `.`) matches a reserved Windows DOS device name.
+#[allow(dead_code)]
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim();
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Fail-closed check for global Mullvad Kill-Switch / Emergency Lockdown state.
+#[allow(dead_code)]
+fn check_killswitch_global_block(
+    shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
+) -> Option<String> {
+    let Ok(shell) = shell_mutex.lock() else {
+        return Some("Navigation blocked: security policy state unavailable.".to_string());
+    };
+    let ks = shell.core.mullvad_vpn.kill_switch();
+    if ks.is_emergency_lockdown() {
+        return Some("Navigation blocked: Emergency Lockdown is active.".to_string());
+    }
+    if ks.is_strict_enabled() && !ks.is_tunnel_established() {
+        return Some(
+            "Navigation blocked: Mullvad strict kill-switch active with no tunnel.".to_string(),
+        );
+    }
+    None
+}
+
+/// Server-side fail-closed navigation gate enforcing URL syntax, Mullvad Kill-Switch,
+/// Emergency Lockdown, and Singularity Shield ad/tracker filtering. Returns the scrubbed URL.
+fn check_navigation_policy(
+    raw_url: &str,
+    shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
+) -> Result<String, String> {
+    let scrubbed_url = UBlockNetworkEngine::scrub_tracking_query_params(raw_url);
+    let (host, _port) =
+        parse_http_url_authority(&scrubbed_url).map_err(|reason| reason.to_string())?;
+    let shell = shell_mutex
+        .lock()
+        .map_err(|_| "Navigation blocked: security policy state unavailable.".to_string())?;
+    if let Err(ks_err) = shell
+        .core
+        .mullvad_vpn
+        .kill_switch()
+        .authorize_outbound_packet(&host)
+    {
+        return Err(ks_err.to_string());
+    }
+    let decision = shell.core.adblocker.evaluate_request(
+        &scrubbed_url,
+        &host,
+        &host,
+        NetworkResourceType::MainFrameDocument,
+    );
+    if let FilterDecision::BlockedByDomainRule(rule) | FilterDecision::BlockedByPatternRule(rule) =
+        decision
+    {
+        return Err(format!(
+            "Ad/tracker domain blocked by Singularity Shield ({})",
+            rule
+        ));
+    }
+    Ok(scrubbed_url)
+}
+
+/// Strictly validates the optional `X-Singularity-Window` header using `roaming_store::is_valid_window_id`.
+fn extract_validated_window_id(req: &ParsedHttpRequest) -> Result<Option<String>, HttpResponse> {
+    let Some(raw) = req.headers.get("x-singularity-window") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !is_valid_window_id(trimmed) {
+        return Err(HttpResponse::json(
+            "400 Bad Request",
+            &serde_json::json!({ "error": "Invalid X-Singularity-Window identifier." }),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn extract_vault_kdf_config(shell: &SingularityBrowserShell) -> Argon2idConfig {
+    if let Some(mem) = shell
+        .core
+        .settings
+        .get("vault.kdf.argon2id_memory_kib")
+        .and_then(|e| e.current_value.as_int())
+    {
+        let iters = shell
+            .core
+            .settings
+            .get("vault.kdf.argon2id_iterations")
+            .and_then(|e| e.current_value.as_int())
+            .unwrap_or(DESKTOP_VAULT_KDF.iterations as i64);
+        let par = shell
+            .core
+            .settings
+            .get("vault.kdf.argon2id_parallelism")
+            .and_then(|e| e.current_value.as_int())
+            .unwrap_or(DESKTOP_VAULT_KDF.parallelism as i64);
+        Argon2idConfig {
+            memory_kib: mem.clamp(4_096, 1_048_576) as u32,
+            iterations: iters.clamp(1, 64) as u32,
+            parallelism: par.clamp(1, 16) as u32,
+        }
+    } else {
+        DESKTOP_VAULT_KDF
+    }
+}
+
+/// Enforces vault inactivity auto-lock, bumps `STATE_REVISION` on transition to locked,
+/// and immediately wipes any cached master key copy in `ServerConfig`.
+fn enforce_vault_auto_lock_and_sync(shell: &mut SingularityBrowserShell, cfg: &ServerConfig) {
+    let was_locked = shell.vault.is_locked();
+    shell.enforce_vault_auto_lock();
+    if shell.vault.is_locked() {
+        cfg.clear_vault_session_cache();
+        if !was_locked {
+            bump_state_revision();
+        }
+    }
+}
+
+/// Replaces `__CSP_NONCE__` placeholders and automatically injects `nonce="<csp_nonce>"` into
+/// top-level `<script>` (and `<style>`) opening tags without altering text inside `<script>` bodies.
+fn inject_csp_nonce(html: &str, csp_nonce: &str) -> String {
+    let replaced = html.replace("__CSP_NONCE__", csp_nonce);
+    let bytes = replaced.as_bytes();
+    let mut out = String::with_capacity(replaced.len() + 64);
+    let mut i = 0usize;
+    let mut in_script = false;
+
+    while i < bytes.len() {
+        if in_script {
+            if bytes[i] == b'<'
+                && i + 9 <= bytes.len()
+                && bytes[i..i + 8].eq_ignore_ascii_case(b"</script")
+                && (bytes[i + 8] == b'>' || bytes[i + 8].is_ascii_whitespace())
+            {
+                in_script = false;
+            }
+            let ch = replaced[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if bytes[i] == b'<'
+            && i + 7 < bytes.len()
+            && bytes[i..i + 7].eq_ignore_ascii_case(b"<script")
+            && matches!(bytes[i + 7], b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/')
+        {
+            if let Some(rel_end) = replaced[i..].find('>') {
+                let tag = &replaced[i..=i + rel_end];
+                if find_ascii_case_insensitive(tag, "nonce=").is_some() {
+                    out.push_str(tag);
+                } else {
+                    out.push_str(&tag[..7]);
+                    out.push_str(" nonce=\"");
+                    out.push_str(csp_nonce);
+                    out.push('"');
+                    out.push_str(&tag[7..]);
+                }
+                if !tag.ends_with("/>") {
+                    in_script = true;
+                }
+                i += rel_end + 1;
+                continue;
+            }
+        }
+
+        let ch = replaced[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Clears the OS system clipboard natively so vault secret auto-clear works even when unfocused.
+fn clear_system_clipboard() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn OpenClipboard(hwnd_new_owner: *mut core::ffi::c_void) -> i32;
+            fn EmptyClipboard() -> i32;
+            fn CloseClipboard() -> i32;
+        }
+        for attempt in 0..5 {
+            unsafe {
+                if OpenClipboard(core::ptr::null_mut()) != 0 {
+                    let emptied = EmptyClipboard() != 0;
+                    let _ = CloseClipboard();
+                    return emptied;
+                }
+            }
+            if attempt < 4 {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Stdio;
+        let Ok(mut child) = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        drop(child.stdin.take());
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::process::Stdio;
+        if Command::new("wl-copy")
+            .arg("--clear")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Ok(mut child) = Command::new("xclip")
+            .args(["-selection", "clipboard", "-in"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            drop(child.stdin.take());
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+        Command::new("xsel")
+            .args(["--clipboard", "--clear"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 /// Validates that a URL is safe to pass to an external browser launcher (strict `http(s)://`,
-/// valid authority, zero whitespace/control/shell metacharacters).
+/// valid authority, zero whitespace/control/shell metacharacters, and never contains `?boot=` secrets).
 pub fn is_safe_launch_url(url: &str) -> bool {
     if parse_http_url_authority(url).is_err() {
         return false;
     }
-    !url.bytes()
+    if url
+        .bytes()
         .any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'|' | b'^' | b'`'))
+    {
+        return false;
+    }
+    if let Some((_, query)) = url.split_once('?') {
+        let q_no_frag = query.split('#').next().unwrap_or(query);
+        for pair in q_no_frag.split('&') {
+            let key = pair.split('=').next().unwrap_or(pair);
+            if key.eq_ignore_ascii_case("boot") {
+                return false;
+            }
+        }
+    }
+    true
 }
 
-/// Fallback browser launcher when native CEF runtime is unavailable or on non-Windows OSes.
-pub fn launch_native_chromium_window(app_url: &str) {
-    if !is_safe_launch_url(app_url) {
-        return;
+fn path_to_file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(raw.len() + 16);
+    for b in raw.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                encoded.push(*b as char);
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{:02X}", other);
+            }
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{}", encoded)
+    } else {
+        format!("file:///{}", encoded)
+    }
+}
+
+/// Creates a private `0600` ephemeral HTML file inside the user's roaming profile directory that
+/// auto-submits the bootstrap nonce via POST to `http://127.0.0.1:<port>/` so `/proc/<pid>/cmdline`
+/// never exposes `?boot=<nonce>` to other local processes.
+fn create_ephemeral_bootstrap_file(
+    bind_port: u16,
+    bootstrap_nonce: &str,
+) -> Result<PathBuf, String> {
+    let boot_dir = crate::roaming_store::resolve_roaming_singularity_dir().join("bootstrap");
+    std::fs::create_dir_all(&boot_dir)
+        .map_err(|e| format!("Failed creating bootstrap directory: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&boot_dir, std::fs::Permissions::from_mode(0o700));
     }
 
+    let mut rnd = [0u8; 16];
+    OsRng.fill_bytes(&mut rnd);
+    let html_path = boot_dir.join(format!("boot-{}.html", hex::encode(rnd)));
+    let safe_nonce = escape_html_str(bootstrap_nonce);
+    let mut html_content = Zeroizing::new(format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Singularity</title></head>\
+         <body style=\"background:#000;color:#fff;font-family:sans-serif\">\
+         <form id=\"b\" method=\"POST\" action=\"http://127.0.0.1:{}/\">\
+         <input type=\"hidden\" name=\"boot\" value=\"{}\">\
+         <noscript><button type=\"submit\">Launch Singularity</button></noscript>\
+         </form><script>document.getElementById('b').submit();</script></body></html>",
+        bind_port, safe_nonce
+    ));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&html_path)
+        .map_err(|e| format!("Failed creating bootstrap file: {}", e))?;
+    file.write_all(html_content.as_bytes())
+        .map_err(|e| format!("Failed writing bootstrap file: {}", e))?;
+    let _ = file.flush();
+    html_content.zeroize();
+    Ok(html_path)
+}
+
+/// Launches the external browser shell via a `0600` ephemeral HTML redirector file (never passing
+/// `?boot=<nonce>` on the command line) and deletes the file upon consumption or short timeout.
+fn launch_bootstrap_chromium_window(bind_port: u16, cfg: &ServerConfig) {
+    let Ok(html_path) = create_ephemeral_bootstrap_file(bind_port, &cfg.bootstrap_nonce) else {
+        return;
+    };
+    cfg.set_bootstrap_file_path(html_path.clone());
+
+    let cleanup_cfg = cfg.clone();
+    let cleanup_path = html_path.clone();
+    let _ = std::thread::Builder::new()
+        .name("singularity-boot-cleanup".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(15));
+            cleanup_cfg.cleanup_bootstrap_file();
+            let _ = std::fs::remove_file(cleanup_path);
+        });
+
+    let file_uri = path_to_file_uri(&html_path);
+    launch_external_chromium_target(&file_uri, Some(&html_path));
+}
+
+fn launch_external_chromium_target(app_target: &str, local_html_path: Option<&Path>) {
     let profile_dir = crate::roaming_store::resolve_roaming_singularity_dir().join("chromium-profile");
     let default_dir = profile_dir.join("Default");
     let _ = std::fs::create_dir_all(&default_dir);
@@ -6595,7 +7185,7 @@ pub fn launch_native_chromium_window(app_url: &str) {
     }
 
     let profile_arg = format!("--user-data-dir={}", profile_dir.display());
-    let app_arg = format!("--app={}", app_url);
+    let app_arg = format!("--app={}", app_target);
     let chromium_flags = [
         app_arg.as_str(),
         profile_arg.as_str(),
@@ -6639,10 +7229,10 @@ pub fn launch_native_chromium_window(app_url: &str) {
             .encode_wide()
             .chain(Some(0))
             .collect();
-        let target: Vec<u16> = std::ffi::OsStr::new(app_url)
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+        let target_os: &std::ffi::OsStr = local_html_path
+            .map(Path::as_os_str)
+            .unwrap_or_else(|| std::ffi::OsStr::new(app_target));
+        let target: Vec<u16> = target_os.encode_wide().chain(Some(0)).collect();
         unsafe {
             let _ = ShellExecuteW(
                 core::ptr::null_mut(),
@@ -6657,7 +7247,10 @@ pub fn launch_native_chromium_window(app_url: &str) {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg("--").arg(app_url).spawn();
+        let target_arg: std::ffi::OsString = local_html_path
+            .map(|p| p.as_os_str().to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(app_target));
+        let _ = Command::new("open").arg("--").arg(target_arg).spawn();
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -6672,20 +7265,48 @@ pub fn launch_native_chromium_window(app_url: &str) {
                 return;
             }
         }
-        let _ = Command::new("xdg-open").arg(app_url).spawn();
+        let target_arg: std::ffi::OsString = local_html_path
+            .map(|p| p.as_os_str().to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(app_target));
+        let _ = Command::new("xdg-open").arg(target_arg).spawn();
     }
+}
+
+/// Fallback browser launcher when native CEF runtime is unavailable or on non-Windows OSes.
+pub fn launch_native_chromium_window(app_url: &str) {
+    if !is_safe_launch_url(app_url) {
+        return;
+    }
+    launch_external_chromium_target(app_url, None);
 }
 
 fn read_http_request(
     stream: &mut TcpStream,
     idle_timeout: Duration,
+    cfg: &ServerConfig,
 ) -> Result<Option<ParsedHttpRequest>, HttpResponse> {
     let _ = stream.set_read_timeout(Some(idle_timeout));
     let mut raw = Zeroizing::new(Vec::with_capacity(4096));
     let mut chunk = Zeroizing::new([0u8; 4096]);
     let mut header_end: Option<usize> = None;
+    let mut request_deadline: Option<Instant> = None;
 
     while header_end.is_none() {
+        if let Some(dl) = request_deadline {
+            let Some(rem) = dl.checked_duration_since(Instant::now()) else {
+                return Err(HttpResponse::text(
+                    "408 Request Timeout",
+                    "HTTP request timed out",
+                ));
+            };
+            if rem.is_zero() {
+                return Err(HttpResponse::text(
+                    "408 Request Timeout",
+                    "HTTP request timed out",
+                ));
+            }
+            let _ = stream.set_read_timeout(Some(rem));
+        }
         let n = match stream.read(&mut chunk[..]) {
             Ok(0) => {
                 if raw.is_empty() {
@@ -6694,6 +7315,21 @@ fn read_http_request(
                 break;
             }
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if raw.is_empty() {
+                    return Ok(None);
+                }
+                return Err(HttpResponse::text(
+                    "408 Request Timeout",
+                    "HTTP request timed out",
+                ));
+            }
             Err(_) => {
                 if raw.is_empty() {
                     return Ok(None);
@@ -6702,7 +7338,7 @@ fn read_http_request(
             }
         };
         if raw.is_empty() {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            request_deadline = Some(Instant::now() + MAX_HTTP_REQUEST_READ_DURATION);
         }
         raw.extend_from_slice(&chunk[..n]);
         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -6734,11 +7370,43 @@ fn read_http_request(
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().to_string();
+            if key == "content-length" && headers.contains_key("content-length") {
+                return Err(HttpResponse::text(
+                    "400 Bad Request",
+                    "Duplicate Content-Length header",
+                ));
+            }
+            if key == "cookie" {
+                headers
+                    .entry(key)
+                    .and_modify(|existing: &mut String| {
+                        existing.push_str("; ");
+                        existing.push_str(&val);
+                    })
+                    .or_insert(val);
+            } else {
+                headers.insert(key, val);
+            }
         }
     }
 
-    let max_body_bytes = if full_target == "/api/bookmarks/import-file"
+    // Reject Transfer-Encoding (e.g. chunked) to prevent request smuggling and unbounded streaming.
+    if headers.contains_key("transfer-encoding") {
+        return Err(HttpResponse::text(
+            "501 Not Implemented",
+            "Transfer-Encoding is not supported",
+        ));
+    }
+
+    // Cap request body size strictly BEFORE full auth (64 KiB max unauthenticated; 512 KiB / 8 MiB authenticated).
+    let has_valid_auth = cfg.verify_token(headers.get("x-singularity-token").map(String::as_str))
+        || cfg.verify_transfer_token(headers.get("x-singularity-transfer").map(String::as_str))
+        || cfg.verify_session_cookie(headers.get("cookie").map(String::as_str));
+    let max_body_bytes = if !has_valid_auth {
+        MAX_UNAUTH_HTTP_BODY_BYTES
+    } else if full_target == "/api/bookmarks/import-file"
         || full_target.starts_with("/api/bookmarks/import-file?")
     {
         MAX_BOOKMARK_IMPORT_BODY_BYTES
@@ -6761,18 +7429,58 @@ fn read_http_request(
         None => 0,
     };
 
-    let mut body = Zeroizing::new(Vec::with_capacity(content_length));
+    let mut body = Zeroizing::new(Vec::with_capacity(content_length.min(64 * 1024)));
     body.extend_from_slice(&raw[hdr_end..]);
+    let body_deadline = request_deadline.unwrap_or_else(|| Instant::now() + MAX_HTTP_REQUEST_READ_DURATION);
     while body.len() < content_length {
+        let Some(rem) = body_deadline.checked_duration_since(Instant::now()) else {
+            return Err(HttpResponse::text(
+                "408 Request Timeout",
+                "HTTP request body timed out",
+            ));
+        };
+        if rem.is_zero() {
+            return Err(HttpResponse::text(
+                "408 Request Timeout",
+                "HTTP request body timed out",
+            ));
+        }
+        let _ = stream.set_read_timeout(Some(rem));
         let remaining = content_length - body.len();
         let to_read = remaining.min(chunk.len());
         match stream.read(&mut chunk[..to_read]) {
-            Ok(0) => break,
+            Ok(0) => {
+                return Err(HttpResponse::text(
+                    "400 Bad Request",
+                    "Truncated request body",
+                ));
+            }
             Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(HttpResponse::text(
+                    "408 Request Timeout",
+                    "HTTP request body timed out",
+                ));
+            }
             Err(_) => {
-                return Err(HttpResponse::text("400 Bad Request", "Truncated request body"));
+                return Err(HttpResponse::text(
+                    "400 Bad Request",
+                    "Truncated request body",
+                ));
             }
         }
+    }
+    if body.len() < content_length {
+        return Err(HttpResponse::text(
+            "400 Bad Request",
+            "Truncated request body",
+        ));
     }
     if body.len() > content_length {
         body.truncate(content_length);
@@ -6799,13 +7507,14 @@ fn handle_ipc_connection(
     active_conns: &AtomicUsize,
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     for req_idx in 0..MAX_KEEPALIVE_REQUESTS_PER_CONN {
         let timeout = if req_idx == 0 {
             Duration::from_secs(3)
         } else {
             Duration::from_millis(350)
         };
-        match read_http_request(&mut stream, timeout) {
+        match read_http_request(&mut stream, timeout, cfg) {
             Ok(Some(req)) => {
                 let client_wants_close = req
                     .headers
@@ -6860,44 +7569,68 @@ fn dispatch_http_request(
         return HttpResponse::text("403 Forbidden", "Invalid Host header");
     }
 
-    // 2. Reject cross-origin requests and non-same-origin fetches (blocks CSRF & localhost cross-port exfiltration)
+    // 2. Reject cross-origin requests and non-same-origin fetches (blocks CSRF & localhost cross-port exfiltration).
+    // Local `file://` ephemeral bootstrap forms on `/` send `Origin: null` and `Sec-Fetch-Site: cross-site`,
+    // which are strictly gated by the one-time 192-bit CSPRNG bootstrap nonce below.
+    let is_root_bootstrap = matches!(req.path.as_str(), "/" | "/index.html");
     if let Some(origin) = req.headers.get("origin") {
-        if !cfg.is_valid_origin(origin) {
+        let allow_null_bootstrap = is_root_bootstrap && origin.trim().eq_ignore_ascii_case("null");
+        if !allow_null_bootstrap && !cfg.is_valid_origin(origin) {
             return HttpResponse::text("403 Forbidden", "Cross-origin request denied");
         }
     }
     if let Some(sfs) = req.headers.get("sec-fetch-site") {
         let s = sfs.trim();
-        if !s.eq_ignore_ascii_case("same-origin") && !s.eq_ignore_ascii_case("none") {
+        let allow_file_nav = is_root_bootstrap && s.eq_ignore_ascii_case("cross-site");
+        if !allow_file_nav
+            && !s.eq_ignore_ascii_case("same-origin")
+            && !s.eq_ignore_ascii_case("none")
+        {
             return HttpResponse::text("403 Forbidden", "Cross-site or cross-port fetch denied");
         }
     }
 
-    // 3. Static shell HTML, public icons, cross-window tab transfer & sandboxed web proxy
+    // 3. Static shell HTML, icons, cross-window tab transfer & sandboxed web proxy
     match req.path.as_str() {
         "/" | "/index.html" => {
-            if req.method != "GET" {
+            if req.method != "GET" && req.method != "POST" {
                 return HttpResponse::text("405 Method Not Allowed", "Method Not Allowed");
             }
-            // Require the one-time CSPRNG bootstrap nonce so arbitrary local processes or content
-            // tabs cannot harvest the per-session IPC token by issuing GET /.
-            let q = parse_query_params(&req.query);
-            if !cfg.consume_bootstrap_nonce(q.get("boot").map(String::as_str)) {
+            // Require the one-time CSPRNG bootstrap nonce (query string for in-process CEF, or
+            // POST form body from the private `0600` ephemeral bootstrap HTML file).
+            let boot_param = if req.method == "POST" {
+                let form_str = Zeroizing::new(String::from_utf8_lossy(&req.body).into_owned());
+                let form = parse_query_params(&form_str);
+                form.get("boot").cloned()
+            } else {
+                let q = parse_query_params(&req.query);
+                q.get("boot").cloned()
+            };
+            if !cfg.consume_bootstrap_nonce(boot_param.as_deref()) {
                 return HttpResponse::text(
                     "403 Forbidden",
                     "Missing, invalid, or already-consumed Singularity bootstrap nonce.",
                 );
             }
+            let mut csp_nonce_raw = [0u8; 16];
+            OsRng.fill_bytes(&mut csp_nonce_raw);
+            let csp_nonce = hex::encode(csp_nonce_raw);
+            let csp_header = format!(
+                "default-src 'self'; script-src 'self' 'nonce-{}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';",
+                csp_nonce
+            );
+            let session_cookie_hdr = format!(
+                "singularity_sid={}; HttpOnly; SameSite=Strict; Path=/",
+                cfg.session_cookie
+            );
             return HttpResponse::new(
                 "200 OK",
                 "text/html; charset=utf-8",
-                cfg.rendered_html.as_ref().clone(),
+                cfg.render_index_html_with_nonce(&csp_nonce),
             )
             .with_header("X-Frame-Options", "DENY")
-            .with_header(
-                "Content-Security-Policy",
-                "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';",
-            );
+            .with_header("Set-Cookie", session_cookie_hdr)
+            .with_header("Content-Security-Policy", csp_header);
         }
         "/api/logo.png" => {
             if req.method != "GET" {
@@ -6910,21 +7643,29 @@ fn dispatch_http_request(
             if req.method != "GET" {
                 return HttpResponse::text("405 Method Not Allowed", "Method Not Allowed");
             }
+            if !cfg.verify_token_or_session_cookie(req) {
+                return HttpResponse::text("401 Unauthorized", "Authentication required");
+            }
             return handle_favicon_request(req, shell_mutex);
         }
         "/api/extensions/icon" => {
             if req.method != "GET" {
                 return HttpResponse::text("405 Method Not Allowed", "Method Not Allowed");
             }
+            if !cfg.verify_token_or_session_cookie(req) {
+                return HttpResponse::text("401 Unauthorized", "Authentication required");
+            }
             let q = parse_query_params(&req.query);
             let ext_id = q.get("id").map(String::as_str).unwrap_or("");
+            if !extensions::is_valid_extension_dir_id(ext_id) {
+                return HttpResponse::text("400 Bad Request", "Invalid extension ID");
+            }
             let root = {
                 let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 shell.roaming.root_dir().to_path_buf()
             };
             if let Some((bytes, mime)) = extensions::read_extension_icon(&root, ext_id) {
                 return HttpResponse::new("200 OK", mime, bytes)
-                    .with_header("X-Content-Type-Options", "nosniff")
                     .with_header("Cache-Control", "private, max-age=86400")
                     .with_header(
                         "Content-Security-Policy",
@@ -6936,6 +7677,9 @@ fn dispatch_http_request(
         "/api/web_proxy" => {
             if req.method != "GET" {
                 return HttpResponse::text("405 Method Not Allowed", "Method Not Allowed");
+            }
+            if !cfg.verify_token_or_session_cookie(req) {
+                return HttpResponse::text("401 Unauthorized", "Authentication required");
             }
             return handle_web_proxy(req, shell_mutex);
         }
@@ -7014,7 +7758,10 @@ fn dispatch_http_request(
         if req.path.starts_with("/api/extensions/") {
             extensions::invalidate_extensions_cache();
         }
-        if req.path != "/api/profile/save_tabs" && req.path != "/api/preconnect" {
+        if req.path != "/api/profile/save_tabs"
+            && req.path != "/api/preconnect"
+            && req.path != "/api/clipboard/clear"
+        {
             bump_state_revision();
         }
     }
@@ -7032,6 +7779,14 @@ fn dispatch_http_request(
 
     match req.path.as_str() {
         "/api/state" => {
+            let validated_wid = match extract_validated_window_id(req) {
+                Ok(w) => w,
+                Err(resp) => return resp,
+            };
+            {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_vault_auto_lock_and_sync(&mut shell, cfg);
+            }
             let cur_rev = STATE_REVISION.load(Ordering::Acquire);
             if let Some(client_rev) = params.get("rev").and_then(|s| s.parse::<u64>().ok()) {
                 if client_rev == cur_rev {
@@ -7041,8 +7796,23 @@ fn dispatch_http_request(
                     );
                 }
             }
+            let (ext_root, ext_pinned) = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    shell.roaming.root_dir().to_path_buf(),
+                    shell.roaming.profile.pinned_extensions.clone(),
+                )
+            };
+            let installed_exts = extensions::list_extensions_cached(&ext_root, &ext_pinned);
+
+            let win_sess = validated_wid.as_deref().and_then(|wid| {
+                cfg.window_sessions
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(wid).cloned())
+            });
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
+            enforce_vault_auto_lock_and_sync(&mut shell, cfg);
             let ks = shell.core.mullvad_vpn.kill_switch();
             let mv_connected = shell.core.mullvad_vpn.is_tunnel_connected();
             let mv_real_tunnel = shell.core.mullvad_vpn.is_real_os_tunnel_active();
@@ -7053,21 +7823,6 @@ fn dispatch_http_request(
             for s in &shell.roaming.tokens.sessions {
                 *provider_counts.entry(s.provider.clone()).or_insert(0) += 1;
             }
-            let installed_exts = extensions::list_extensions_cached(
-                shell.roaming.root_dir(),
-                &shell.roaming.profile.pinned_extensions,
-            );
-            let win_sess = req
-                .headers
-                .get("x-singularity-window")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .and_then(|wid| {
-                    cfg.window_sessions
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(wid).cloned())
-                });
             let (
                 saved_tabs,
                 saved_tab_groups,
@@ -7181,50 +7936,56 @@ fn dispatch_http_request(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(lang) = body.get("language").and_then(|v| v.as_str()) {
-                if is_valid_language(lang) {
-                    shell.roaming.profile.language = lang.to_string();
+            let private_mode_update = body.get("private_browsing").and_then(|v| v.as_bool());
+            let out = {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(lang) = body.get("language").and_then(|v| v.as_str()) {
+                    if is_valid_language(lang) {
+                        shell.roaming.profile.language = lang.to_string();
+                    }
                 }
-            }
-            if let Some(eng) = body.get("engine").and_then(|v| v.as_str()) {
-                if !eng.trim().is_empty() {
-                    shell.roaming.profile.default_search_engine = eng.trim().to_string();
+                if let Some(eng) = body.get("engine").and_then(|v| v.as_str()) {
+                    if !eng.trim().is_empty() {
+                        shell.roaming.profile.default_search_engine = eng.trim().to_string();
+                    }
                 }
-            }
-            if let Some(theme) = body.get("theme_id").and_then(|v| v.as_str()) {
-                if is_valid_theme_id(theme) {
-                    shell.roaming.profile.theme_id = theme.to_string();
+                if let Some(theme) = body.get("theme_id").and_then(|v| v.as_str()) {
+                    if is_valid_theme_id(theme) {
+                        shell.roaming.profile.theme_id = theme.to_string();
+                    }
                 }
-            }
-            if let Some(tut) = body.get("tutorial_v1_completed").and_then(|v| v.as_bool()) {
-                shell.roaming.profile.tutorial_v1_completed = tut;
-            }
-            if let Some(rs) = body.get("restore_session").and_then(|v| v.as_bool()) {
-                shell.roaming.profile.restore_session = rs;
-            }
-            if let Some(pb) = body.get("private_browsing").and_then(|v| v.as_bool()) {
-                shell.private_browsing_active = pb;
-            }
-            if let Some(mode) = body.get("tab_unload_mode").and_then(|v| v.as_str()) {
-                if matches!(mode, "low" | "medium" | "hard" | "custom") {
-                    shell.roaming.profile.tab_unload_mode = mode.to_string();
+                if let Some(tut) = body.get("tutorial_v1_completed").and_then(|v| v.as_bool()) {
+                    shell.roaming.profile.tutorial_v1_completed = tut;
                 }
+                if let Some(rs) = body.get("restore_session").and_then(|v| v.as_bool()) {
+                    shell.roaming.profile.restore_session = rs;
+                }
+                if let Some(pb) = private_mode_update {
+                    shell.private_browsing_active = pb;
+                }
+                if let Some(mode) = body.get("tab_unload_mode").and_then(|v| v.as_str()) {
+                    if matches!(mode, "low" | "medium" | "hard" | "custom") {
+                        shell.roaming.profile.tab_unload_mode = mode.to_string();
+                    }
+                }
+                if let Some(mins) = body.get("tab_unload_custom_minutes").and_then(|v| v.as_u64()) {
+                    shell.roaming.profile.tab_unload_custom_minutes = mins.clamp(1, 43_200);
+                }
+                let eff_sec = shell.roaming.effective_tab_unload_seconds();
+                shell.core.tab_manager.set_freeze_timeout_seconds(eff_sec);
+                let _ = shell.roaming.save_profile();
+                serde_json::json!({
+                    "ok": true,
+                    "language": shell.roaming.profile.language,
+                    "theme_id": shell.roaming.profile.theme_id,
+                    "tab_unload_mode": shell.roaming.profile.tab_unload_mode,
+                    "tab_unload_custom_minutes": shell.roaming.profile.tab_unload_custom_minutes,
+                    "tab_unload_effective_seconds": eff_sec
+                })
+            };
+            if let Some(pb) = private_mode_update {
+                cfg.dispatch_private_mode(pb);
             }
-            if let Some(mins) = body.get("tab_unload_custom_minutes").and_then(|v| v.as_u64()) {
-                shell.roaming.profile.tab_unload_custom_minutes = mins.clamp(1, 43_200);
-            }
-            let eff_sec = shell.roaming.effective_tab_unload_seconds();
-            shell.core.tab_manager.set_freeze_timeout_seconds(eff_sec);
-            let _ = shell.roaming.save_profile();
-            let out = serde_json::json!({
-                "ok": true,
-                "language": shell.roaming.profile.language,
-                "theme_id": shell.roaming.profile.theme_id,
-                "tab_unload_mode": shell.roaming.profile.tab_unload_mode,
-                "tab_unload_custom_minutes": shell.roaming.profile.tab_unload_custom_minutes,
-                "tab_unload_effective_seconds": eff_sec
-            });
             HttpResponse::json("200 OK", &out)
         }
         "/api/import/browsers" => {
@@ -7395,16 +8156,16 @@ fn dispatch_http_request(
                     let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
 
                     extensions::invalidate_extensions_cache();
-                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    if !shell.roaming.profile.pinned_extensions.contains(&info.id) {
-                        shell.roaming.profile.pinned_extensions.push(info.id.clone());
-                        let _ = shell.roaming.save_profile();
-                    }
+                    let updated_pinned = {
+                        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        if !shell.roaming.profile.pinned_extensions.contains(&info.id) {
+                            shell.roaming.profile.pinned_extensions.push(info.id.clone());
+                            let _ = shell.roaming.save_profile();
+                        }
+                        shell.roaming.profile.pinned_extensions.clone()
+                    };
                     info.pinned = true;
-                    let all = extensions::list_extensions(
-                        shell.roaming.root_dir(),
-                        &shell.roaming.profile.pinned_extensions,
-                    );
+                    let all = extensions::list_extensions(&root, &updated_pinned);
                     HttpResponse::json(
                         "200 OK",
                         &serde_json::json!({
@@ -7429,6 +8190,14 @@ fn dispatch_http_request(
             };
             let path_str = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let explicit_id = body.get("id").and_then(|v| v.as_str());
+            if let Some(eid) = explicit_id {
+                if !extensions::is_valid_extension_dir_id(eid) {
+                    return HttpResponse::json(
+                        "400 Bad Request",
+                        &serde_json::json!({ "ok": false, "error": "Invalid extension ID." }),
+                    );
+                }
+            }
             let (root, pinned) = {
                 let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 (
@@ -7467,16 +8236,16 @@ fn dispatch_http_request(
                     let (dynamic, dyn_err): (bool, Option<String>) = (false, None);
 
                     extensions::invalidate_extensions_cache();
-                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    if !shell.roaming.profile.pinned_extensions.contains(&info.id) {
-                        shell.roaming.profile.pinned_extensions.push(info.id.clone());
-                        let _ = shell.roaming.save_profile();
-                    }
+                    let updated_pinned = {
+                        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        if !shell.roaming.profile.pinned_extensions.contains(&info.id) {
+                            shell.roaming.profile.pinned_extensions.push(info.id.clone());
+                            let _ = shell.roaming.save_profile();
+                        }
+                        shell.roaming.profile.pinned_extensions.clone()
+                    };
                     info.pinned = true;
-                    let all = extensions::list_extensions(
-                        shell.roaming.root_dir(),
-                        &shell.roaming.profile.pinned_extensions,
-                    );
+                    let all = extensions::list_extensions(&root, &updated_pinned);
                     HttpResponse::json(
                         "200 OK",
                         &serde_json::json!({
@@ -7500,6 +8269,12 @@ fn dispatch_http_request(
                 Err(r) => return r,
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !extensions::is_valid_extension_dir_id(id) {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "ok": false, "error": "Invalid extension ID." }),
+                );
+            }
             let (root, pinned) = {
                 let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 (
@@ -7567,6 +8342,12 @@ fn dispatch_http_request(
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            if !extensions::is_valid_extension_dir_id(id) {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "ok": false, "error": "Invalid extension ID." }),
+                );
+            }
             let (root, pinned) = {
                 let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 (
@@ -7640,19 +8421,22 @@ fn dispatch_http_request(
                     &serde_json::json!({ "ok": false, "error": "Invalid extension ID." }),
                 );
             }
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            if pinned {
-                if !shell.roaming.profile.pinned_extensions.iter().any(|p| p == id) {
-                    shell.roaming.profile.pinned_extensions.push(id.to_string());
+            let (root, updated_pinned) = {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                if pinned {
+                    if !shell.roaming.profile.pinned_extensions.iter().any(|p| p == id) {
+                        shell.roaming.profile.pinned_extensions.push(id.to_string());
+                    }
+                } else {
+                    shell.roaming.profile.pinned_extensions.retain(|p| p != id);
                 }
-            } else {
-                shell.roaming.profile.pinned_extensions.retain(|p| p != id);
-            }
-            let _ = shell.roaming.save_profile();
-            let all = extensions::list_extensions(
-                shell.roaming.root_dir(),
-                &shell.roaming.profile.pinned_extensions,
-            );
+                let _ = shell.roaming.save_profile();
+                (
+                    shell.roaming.root_dir().to_path_buf(),
+                    shell.roaming.profile.pinned_extensions.clone(),
+                )
+            };
+            let all = extensions::list_extensions(&root, &updated_pinned);
             HttpResponse::json(
                 "200 OK",
                 &serde_json::json!({ "ok": true, "installed": all }),
@@ -7664,6 +8448,12 @@ fn dispatch_http_request(
                 Err(r) => return r,
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !extensions::is_valid_extension_dir_id(id) {
+                return HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "ok": false, "error": "Invalid extension ID." }),
+                );
+            }
             let root = {
                 let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 shell.roaming.root_dir().to_path_buf()
@@ -7691,13 +8481,13 @@ fn dispatch_http_request(
             match extensions::remove_extension(&root, id) {
                 Ok(()) => {
                     extensions::invalidate_extensions_cache();
-                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    shell.roaming.profile.pinned_extensions.retain(|p| p != id);
-                    let _ = shell.roaming.save_profile();
-                    let all = extensions::list_extensions(
-                        shell.roaming.root_dir(),
-                        &shell.roaming.profile.pinned_extensions,
-                    );
+                    let updated_pinned = {
+                        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        shell.roaming.profile.pinned_extensions.retain(|p| p != id);
+                        let _ = shell.roaming.save_profile();
+                        shell.roaming.profile.pinned_extensions.clone()
+                    };
+                    let all = extensions::list_extensions(&root, &updated_pinned);
                     HttpResponse::json(
                         "200 OK",
                         &serde_json::json!({
@@ -7719,7 +8509,10 @@ fn dispatch_http_request(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let req_win_id = match extract_validated_window_id(req) {
+                Ok(w) => w,
+                Err(resp) => return resp,
+            };
             if let Some(tabs_val) = body.get("tabs") {
                 if let Ok(tabs) = serde_json::from_value::<Vec<SavedTabEntry>>(tabs_val.clone()) {
                     let clean_groups: Vec<SavedTabGroup> = body
@@ -7795,39 +8588,44 @@ fn dispatch_http_request(
                         .map(|i| i as usize)
                         .unwrap_or(0)
                         .min(clean_tabs.len().saturating_sub(1));
-                    let req_win_id = req
-                        .headers
-                        .get("x-singularity-window")
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
+                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(wid) = req_win_id {
-                        let (geom, all_live_sessions) = if let Ok(mut map) = cfg.window_sessions.lock() {
-                            let entry = map.entry(wid.clone()).or_default();
-                            entry.saved_tabs = clean_tabs.clone();
-                            entry.saved_tab_groups = clean_groups.clone();
-                            entry.active_tab_index = active_idx;
-                            let g = entry.geometry;
-                            let pid = std::process::id();
-                            let now_ts = crate::roaming_store::unix_now();
-                            let snap: Vec<crate::roaming_store::WindowSessionFile> = map
-                                .iter()
-                                .filter(|(_, s)| !s.saved_tabs.is_empty())
-                                .map(|(id, s)| crate::roaming_store::WindowSessionFile {
-                                    window_id: id.clone(),
-                                    pid,
-                                    updated_unix: now_ts,
-                                    active_tab_index: s.active_tab_index,
-                                    tabs: s.saved_tabs.clone(),
-                                    tab_groups: s.saved_tab_groups.clone(),
-                                    geometry: s.geometry,
-                                    closed_while_other_live: false,
-                                })
-                                .collect();
-                            (g, snap)
-                        } else {
-                            (WindowGeometry::default(), Vec::new())
-                        };
                         if !shell.private_browsing_active && shell.roaming.profile.restore_session {
+                            let (geom, all_live_sessions) = match cfg.window_sessions.lock() {
+                                Ok(mut map) => {
+                                    if !map.contains_key(&wid) && map.len() >= MAX_WINDOW_SESSIONS {
+                                        return HttpResponse::json(
+                                            "400 Bad Request",
+                                            &serde_json::json!({
+                                                "error": "Maximum tracked window sessions exceeded."
+                                            }),
+                                        );
+                                    }
+                                    let entry = map.entry(wid.clone()).or_default();
+                                    entry.saved_tabs = clean_tabs.clone();
+                                    entry.saved_tab_groups = clean_groups.clone();
+                                    entry.active_tab_index = active_idx;
+                                    let g = entry.geometry;
+                                    let pid = std::process::id();
+                                    let now_ts = crate::roaming_store::unix_now();
+                                    let snap: Vec<crate::roaming_store::WindowSessionFile> = map
+                                        .iter()
+                                        .filter(|(_, s)| !s.saved_tabs.is_empty())
+                                        .map(|(id, s)| crate::roaming_store::WindowSessionFile {
+                                            window_id: id.clone(),
+                                            pid,
+                                            updated_unix: now_ts,
+                                            active_tab_index: s.active_tab_index,
+                                            tabs: s.saved_tabs.clone(),
+                                            tab_groups: s.saved_tab_groups.clone(),
+                                            geometry: s.geometry,
+                                            closed_while_other_live: false,
+                                        })
+                                        .collect();
+                                    (g, snap)
+                                }
+                                Err(_) => (WindowGeometry::default(), Vec::new()),
+                            };
                             let _ = shell.roaming.save_window_session_for(
                                 &wid,
                                 &clean_tabs,
@@ -7840,14 +8638,15 @@ fn dispatch_http_request(
                             if !all_live_sessions.is_empty() {
                                 shell.roaming.save_crash_checkpoint(&all_live_sessions);
                             }
+                            if shell.roaming.window_id() == wid {
+                                shell.roaming.profile.saved_tabs = clean_tabs;
+                                shell.roaming.profile.saved_tab_groups = clean_groups;
+                                shell.roaming.profile.active_tab_index = active_idx;
+                                shell.roaming.schedule_save_profile();
+                            }
                         }
-                        if shell.roaming.window_id() == wid {
-                            shell.roaming.profile.saved_tabs = clean_tabs;
-                            shell.roaming.profile.saved_tab_groups = clean_groups;
-                            shell.roaming.profile.active_tab_index = active_idx;
-                            shell.roaming.schedule_save_profile();
-                        }
-                    } else {
+                    } else if !shell.private_browsing_active && shell.roaming.profile.restore_session
+                    {
                         shell.roaming.profile.saved_tabs = clean_tabs;
                         shell.roaming.profile.saved_tab_groups = clean_groups;
                         shell.roaming.profile.active_tab_index = active_idx;
@@ -8079,6 +8878,16 @@ fn dispatch_http_request(
                     &serde_json::json!({ "error": "Token value cannot be empty." }),
                 );
             }
+            let same_site = body
+                .get("same_site")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| matches!(s.as_str(), "strict" | "lax" | "none"))
+                .or_else(|| Some("lax".to_string()));
+            let host_only = body
+                .get("host_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let rec = EncryptedAuthTokenRecord {
                 id: format!("{}::{}::{}", provider, domain, name),
                 provider,
@@ -8088,6 +8897,8 @@ fn dispatch_http_request(
                 secret_value: secret,
                 http_only: true,
                 secure: true,
+                same_site,
+                host_only,
                 expires_unix: None,
                 updated_unix: unix_now(),
                 kind: "oauth_token".to_string(),
@@ -8240,7 +9051,11 @@ fn dispatch_http_request(
                 .to_string();
 
             let parsed_val = match vtype {
-                "Bool" => Some(SettingValue::Bool(val == "true")),
+                "Bool" => match val.as_str() {
+                    "true" => Some(SettingValue::Bool(true)),
+                    "false" => Some(SettingValue::Bool(false)),
+                    _ => None,
+                },
                 "Int" => val.parse::<i64>().ok().map(SettingValue::Int),
                 "Float" => val
                     .parse::<f64>()
@@ -8487,7 +9302,7 @@ fn dispatch_http_request(
         }
         "/api/vault/status" => {
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
+            enforce_vault_auto_lock_and_sync(&mut shell, cfg);
             let count = shell.vault.credentials().map(|c| c.len()).unwrap_or(0);
             let out = serde_json::json!({
                 "has_file": shell.roaming.has_encrypted_vault_on_disk(),
@@ -8502,61 +9317,198 @@ fn dispatch_http_request(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _vault_op = cfg.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            if let Some(retry_secs) = cfg
+                .vault_rate_limiter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .check_locked()
+            {
+                return HttpResponse::json(
+                    "429 Too Many Requests",
+                    &serde_json::json!({
+                        "error": format!(
+                            "Too many failed unlock attempts. Please wait {} seconds.",
+                            retry_secs
+                        ),
+                        "retry_after_secs": retry_secs
+                    }),
+                )
+                .with_header("Retry-After", retry_secs.to_string());
+            }
+
             let master = Zeroizing::new(
                 body.get("master")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
             );
-            if master.len() < 4 {
-                return HttpResponse::json(
-                    "400 Bad Request",
-                    &serde_json::json!({ "error": "Master password must be at least 4 characters long." }),
-                );
-            }
 
-            if shell.roaming.has_encrypted_vault_on_disk() {
-                match shell.roaming.read_vault_envelope_from_disk() {
-                    Ok(env_str) => match shell.vault.import_and_unlock_vault(&env_str, master.as_bytes()) {
-                        Ok(count) => {
-                            shell.set_verified_vault_master(master.as_bytes().to_vec());
-                            HttpResponse::json(
-                                "200 OK",
-                                &serde_json::json!({ "ok": true, "count": count }),
-                            )
+            // Snapshot vault path & KDF config under a short lock, then drop `shell_mutex`
+            // before disk I/O and Argon2id key derivation so the UI loop never freezes.
+            let (has_file, vault_path, kdf_cfg) = {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_vault_auto_lock_and_sync(&mut shell, cfg);
+                (
+                    shell.roaming.has_encrypted_vault_on_disk(),
+                    shell.roaming.vault_file_path(),
+                    extract_vault_kdf_config(&shell),
+                )
+            };
+
+            if has_file {
+                if master.chars().count() < 4 {
+                    return HttpResponse::json(
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "error": "Master password must be at least 4 characters long."
+                        }),
+                    );
+                }
+
+                let env_str = match std::fs::read_to_string(&vault_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return HttpResponse::json(
+                            "500 Internal Server Error",
+                            &serde_json::json!({
+                                "error": format!("Impossible de lire le coffre-fort: {}", e)
+                            }),
+                        );
+                    }
+                };
+
+                match EncryptedSingularityVaultEnvelope::unseal(&env_str, master.as_bytes()) {
+                    Ok(payload) => {
+                        let count = payload.credentials.len() + payload.passkeys.len();
+                        let passkeys_copy = payload.passkeys.clone();
+                        let mut candidate = SingularityVault::new_locked(kdf_cfg);
+                        if payload.passkeys.is_empty() {
+                            candidate.reset_unlocked_empty();
+                            for cred in payload.credentials {
+                                let _ = candidate.add_credential(cred);
+                            }
+                        } else if candidate
+                            .import_and_unlock_vault(&env_str, master.as_bytes())
+                            .is_err()
+                        {
+                            return HttpResponse::json(
+                                "500 Internal Server Error",
+                                &serde_json::json!({
+                                    "error": "Failed to load unlocked vault payload."
+                                }),
+                            );
                         }
-                        Err(_) => HttpResponse::json(
+
+                        cfg.vault_rate_limiter
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record_success();
+
+                        {
+                            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            shell.vault = candidate;
+                            shell.sync_runtime_from_settings();
+                            shell.set_verified_vault_master(master.as_bytes().to_vec());
+                        }
+                        if let Ok(mut cache) = cfg.vault_session_cache.lock() {
+                            *cache = Some(VaultSessionCache {
+                                master: Zeroizing::new(master.as_bytes().to_vec()),
+                                passkeys: passkeys_copy,
+                            });
+                        }
+                        bump_state_revision();
+                        HttpResponse::json(
+                            "200 OK",
+                            &serde_json::json!({ "ok": true, "count": count }),
+                        )
+                    }
+                    Err(_) => {
+                        let wait_secs = cfg
+                            .vault_rate_limiter
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record_failure();
+                        let mut resp = HttpResponse::json(
                             "401 Unauthorized",
-                            &serde_json::json!({ "error": "Incorrect master password (AEAD authentication failed)." }),
-                        ),
-                    },
-                    Err(e) => HttpResponse::json(
-                        "500 Internal Server Error",
-                        &serde_json::json!({ "error": e }),
-                    ),
+                            &serde_json::json!({
+                                "error": "Incorrect master password (AEAD authentication failed).",
+                                "retry_after_secs": wait_secs
+                            }),
+                        );
+                        if wait_secs > 0 {
+                            resp = resp.with_header("Retry-After", wait_secs.to_string());
+                        }
+                        resp
+                    }
                 }
             } else {
-                shell.vault.reset_unlocked_empty();
-                match shell.vault.export_encrypted_vault(master.as_bytes()) {
-                    Ok(sealed) => match shell.roaming.write_vault_envelope_to_disk(&sealed) {
-                        Ok(()) => {
-                            shell.set_verified_vault_master(master.as_bytes().to_vec());
-                            HttpResponse::json_bytes("200 OK", b"{\"ok\":true,\"created\":true}")
-                        }
-                        Err(e) => {
-                            shell.lock_vault();
-                            HttpResponse::json(
-                                "500 Internal Server Error",
-                                &serde_json::json!({ "error": e }),
-                            )
-                        }
-                    },
+                // Require at least 8 Unicode characters when creating a brand-new vault.
+                if master.chars().count() < 8 {
+                    return HttpResponse::json(
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "error": "Master password must be at least 8 characters long."
+                        }),
+                    );
+                }
+
+                let empty_payload = VaultPlaintextPayload::default();
+                let sealed = match EncryptedSingularityVaultEnvelope::seal(
+                    &empty_payload,
+                    master.as_bytes(),
+                    kdf_cfg,
+                ) {
+                    Ok(s) => s,
                     Err(e) => {
-                        shell.lock_vault();
-                        HttpResponse::json(
+                        return HttpResponse::json(
                             "500 Internal Server Error",
                             &serde_json::json!({ "error": e.to_string() }),
+                        );
+                    }
+                };
+
+                let write_res = {
+                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    if shell.roaming.has_encrypted_vault_on_disk() {
+                        Err("Vault already exists on disk; please unlock it.".to_string())
+                    } else {
+                        match shell.roaming.write_vault_envelope_to_disk(&sealed) {
+                            Ok(()) => {
+                                shell.vault.reset_unlocked_empty();
+                                shell.sync_runtime_from_settings();
+                                shell.set_verified_vault_master(master.as_bytes().to_vec());
+                                Ok(())
+                            }
+                            Err(e) => {
+                                shell.lock_vault();
+                                Err(e)
+                            }
+                        }
+                    }
+                };
+
+                match write_res {
+                    Ok(()) => {
+                        cfg.vault_rate_limiter
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record_success();
+                        if let Ok(mut cache) = cfg.vault_session_cache.lock() {
+                            *cache = Some(VaultSessionCache {
+                                master: Zeroizing::new(master.as_bytes().to_vec()),
+                                passkeys: Vec::new(),
+                            });
+                        }
+                        bump_state_revision();
+                        HttpResponse::json_bytes("200 OK", b"{\"ok\":true,\"created\":true}")
+                    }
+                    Err(e) => {
+                        cfg.clear_vault_session_cache();
+                        HttpResponse::json(
+                            "500 Internal Server Error",
+                            &serde_json::json!({ "error": e }),
                         )
                     }
                 }
@@ -8566,13 +9518,18 @@ fn dispatch_http_request(
             if let Err(r) = require_post() {
                 return r;
             }
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.lock_vault();
+            let _vault_op = cfg.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner());
+            {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.lock_vault();
+            }
+            cfg.clear_vault_session_cache();
+            bump_state_revision();
             HttpResponse::json_bytes("200 OK", b"{\"ok\":true}")
         }
         "/api/vault/list" => {
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
+            enforce_vault_auto_lock_and_sync(&mut shell, cfg);
             let now_sec = unix_now();
 
             let Ok(creds) = shell.vault.credentials() else {
@@ -8619,19 +9576,27 @@ fn dispatch_http_request(
                 Err(r) => return r,
             };
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
+            enforce_vault_auto_lock_and_sync(&mut shell, cfg);
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let found_secret = shell
-                .vault
-                .credentials()
-                .ok()
-                .and_then(|creds| creds.iter().find(|c| c.id == id).map(|c| c.password_secret.clone()));
+            let found_secret = shell.vault.credentials().ok().and_then(|creds| {
+                creds
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| Zeroizing::new(c.password_secret.clone()))
+            });
             if let Some(secret) = found_secret {
                 shell.touch_vault_activity();
-                return HttpResponse::json(
-                    "200 OK",
-                    &serde_json::json!({ "ok": true, "secret": secret }),
-                );
+                #[derive(Serialize)]
+                struct VaultSecretResp<'a> {
+                    ok: bool,
+                    secret: &'a str,
+                }
+                let json_bytes = serde_json::to_vec(&VaultSecretResp {
+                    ok: true,
+                    secret: secret.as_str(),
+                })
+                .unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
+                return HttpResponse::new("200 OK", "application/json; charset=utf-8", json_bytes);
             }
             HttpResponse::json_bytes("200 OK", b"{\"ok\":false}")
         }
@@ -8640,18 +9605,26 @@ fn dispatch_http_request(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
-            if shell.vault.is_locked() {
-                return HttpResponse::json(
-                    "401 Unauthorized",
-                    &serde_json::json!({ "error": "Vault is locked." }),
-                );
-            }
+            let _vault_op = cfg.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-            let origin = body.get("origin").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let user = body.get("user").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            let pass = body.get("pass").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let origin = body
+                .get("origin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let user = body
+                .get("user")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let pass = Zeroizing::new(
+                body.get("pass")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
             let totp = body
                 .get("totp")
                 .and_then(|v| v.as_str())
@@ -8667,21 +9640,78 @@ fn dispatch_http_request(
             }
 
             let id = generate_unique_cred_id();
-            if let Err(e) = shell.vault.add_credential(VaultCredentialEntry {
-                id: id.clone(),
-                origin_url: origin,
-                username: user,
-                password_secret: pass,
-                totp_secret_base32: totp,
-                totp_algorithm: TotpAlgorithm::Sha1,
-                totp_digits: 6,
-                totp_period_sec: 30,
-                notes: String::new(),
-            }) {
-                return HttpResponse::json("400 Bad Request", &serde_json::json!({ "error": e }));
-            }
+            let (creds_snapshot, kdf_cfg) = {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_vault_auto_lock_and_sync(&mut shell, cfg);
+                if shell.vault.is_locked() {
+                    return HttpResponse::json(
+                        "401 Unauthorized",
+                        &serde_json::json!({ "error": "Vault is locked." }),
+                    );
+                }
+                if let Err(e) = shell.vault.add_credential(VaultCredentialEntry {
+                    id: id.clone(),
+                    origin_url: origin,
+                    username: user,
+                    password_secret: (*pass).clone(),
+                    totp_secret_base32: totp,
+                    totp_algorithm: TotpAlgorithm::Sha1,
+                    totp_digits: 6,
+                    totp_period_sec: 30,
+                    notes: String::new(),
+                }) {
+                    return HttpResponse::json(
+                        "400 Bad Request",
+                        &serde_json::json!({ "error": e }),
+                    );
+                }
+                shell.touch_vault_activity();
+                let creds = shell
+                    .vault
+                    .credentials()
+                    .map(|c| c.to_vec())
+                    .unwrap_or_default();
+                let kdf = extract_vault_kdf_config(&shell);
+                (creds, kdf)
+            };
 
-            if let Err(e) = shell.persist_unlocked_vault_to_disk() {
+            // Run Argon2id sealing outside `shell_mutex` whenever cached session key is available.
+            let cached_session = cfg.vault_session_cache.lock().ok().and_then(|g| {
+                g.as_ref().map(|c| {
+                    (
+                        Zeroizing::new(c.master.as_slice().to_vec()),
+                        c.passkeys.clone(),
+                    )
+                })
+            });
+
+            let persist_res: Result<(), String> = if let Some((master, passkeys)) = cached_session {
+                let payload = VaultPlaintextPayload {
+                    credentials: creds_snapshot,
+                    passkeys,
+                };
+                match EncryptedSingularityVaultEnvelope::seal(&payload, master.as_slice(), kdf_cfg)
+                {
+                    Ok(sealed) => {
+                        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        if shell.vault.is_locked() {
+                            Err("Vault was locked before save completed.".to_string())
+                        } else {
+                            shell
+                                .roaming
+                                .write_vault_envelope_to_disk(&sealed)
+                                .map(|()| shell.touch_vault_activity())
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.persist_unlocked_vault_to_disk()
+            };
+
+            if let Err(e) = persist_res {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = shell.vault.remove_credential(&id);
                 return HttpResponse::json(
                     "500 Internal Server Error",
@@ -8695,17 +9725,78 @@ fn dispatch_http_request(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
-            if shell.vault.is_locked() {
-                return HttpResponse::json(
-                    "401 Unauthorized",
-                    &serde_json::json!({ "error": "Vault is locked." }),
-                );
-            }
-            let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let _ = shell.vault.remove_credential(id);
-            if let Err(e) = shell.persist_unlocked_vault_to_disk() {
+            let _vault_op = cfg.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let id = body
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let (removed_entry, creds_snapshot, kdf_cfg) = {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_vault_auto_lock_and_sync(&mut shell, cfg);
+                if shell.vault.is_locked() {
+                    return HttpResponse::json(
+                        "401 Unauthorized",
+                        &serde_json::json!({ "error": "Vault is locked." }),
+                    );
+                }
+                let removed = shell
+                    .vault
+                    .credentials()
+                    .ok()
+                    .and_then(|creds| creds.iter().find(|c| c.id == id).cloned());
+                let _ = shell.vault.remove_credential(&id);
+                shell.touch_vault_activity();
+                let creds = shell
+                    .vault
+                    .credentials()
+                    .map(|c| c.to_vec())
+                    .unwrap_or_default();
+                let kdf = extract_vault_kdf_config(&shell);
+                (removed, creds, kdf)
+            };
+
+            // Seal outside `shell_mutex` and restore the deleted entry in memory on any error.
+            let cached_session = cfg.vault_session_cache.lock().ok().and_then(|g| {
+                g.as_ref().map(|c| {
+                    (
+                        Zeroizing::new(c.master.as_slice().to_vec()),
+                        c.passkeys.clone(),
+                    )
+                })
+            });
+
+            let persist_res: Result<(), String> = if let Some((master, passkeys)) = cached_session {
+                let payload = VaultPlaintextPayload {
+                    credentials: creds_snapshot,
+                    passkeys,
+                };
+                match EncryptedSingularityVaultEnvelope::seal(&payload, master.as_slice(), kdf_cfg)
+                {
+                    Ok(sealed) => {
+                        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        if shell.vault.is_locked() {
+                            Err("Vault was locked before save completed.".to_string())
+                        } else {
+                            shell
+                                .roaming
+                                .write_vault_envelope_to_disk(&sealed)
+                                .map(|()| shell.touch_vault_activity())
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            } else {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.persist_unlocked_vault_to_disk()
+            };
+
+            if let Err(e) = persist_res {
+                if let Some(entry) = removed_entry {
+                    let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = shell.vault.add_credential(entry);
+                }
                 return HttpResponse::json(
                     "500 Internal Server Error",
                     &serde_json::json!({ "error": format!("Failed to save vault to disk: {}", e) }),
@@ -8735,22 +9826,79 @@ fn dispatch_http_request(
             if let Err(r) = require_post() {
                 return r;
             }
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            shell.enforce_vault_auto_lock();
-            match shell.export_verified_vault() {
-                Ok(exported) => HttpResponse::text("200 OK", &exported),
+            let _vault_op = cfg.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (creds_snapshot, kdf_cfg) = {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_vault_auto_lock_and_sync(&mut shell, cfg);
+                if shell.vault.is_locked() {
+                    return HttpResponse::text("400 Bad Request", "Vault is locked");
+                }
+                shell.touch_vault_activity();
+                let creds = shell
+                    .vault
+                    .credentials()
+                    .map(|c| c.to_vec())
+                    .unwrap_or_default();
+                let kdf = extract_vault_kdf_config(&shell);
+                (creds, kdf)
+            };
+
+            let cached_session = cfg.vault_session_cache.lock().ok().and_then(|g| {
+                g.as_ref().map(|c| {
+                    (
+                        Zeroizing::new(c.master.as_slice().to_vec()),
+                        c.passkeys.clone(),
+                    )
+                })
+            });
+
+            let export_res = if let Some((master, passkeys)) = cached_session {
+                let payload = VaultPlaintextPayload {
+                    credentials: creds_snapshot,
+                    passkeys,
+                };
+                EncryptedSingularityVaultEnvelope::seal(&payload, master.as_slice(), kdf_cfg)
+                    .map(Zeroizing::new)
+                    .map_err(|e| e.to_string())
+            } else {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.export_verified_vault().map(Zeroizing::new)
+            };
+
+            match export_res {
+                Ok(exported) => HttpResponse::new(
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    exported.as_bytes().to_vec(),
+                ),
                 Err(e) => HttpResponse::text("400 Bad Request", &e),
             }
+        }
+        "/api/clipboard/clear" => {
+            if let Err(r) = require_post() {
+                return r;
+            }
+            let cleared = clear_system_clipboard();
+            HttpResponse::json("200 OK", &serde_json::json!({ "ok": cleared }))
         }
         "/api/preconnect" => {
             let body = match require_post() {
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let Ok(scrubbed_url) = check_navigation_policy(url, shell_mutex) else {
+                return HttpResponse::json(
+                    "403 Forbidden",
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": "Preconnect blocked by navigation security policy."
+                    }),
+                );
+            };
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             let _ = shell.core.preconnect_pool.evaluate_link_intent(
-                url,
+                &scrubbed_url,
                 HoverIntentSignal::MouseOver {
                     dwell_ms: 80,
                     velocity_px_per_sec: 50.0,
@@ -8764,82 +9912,46 @@ fn dispatch_http_request(
                 Err(r) => return r,
             };
             let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if let Ok((host, _port)) = parse_http_url_authority(url) {
-                let allowed = {
-                    let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                    shell
-                        .core
-                        .mullvad_vpn
-                        .kill_switch()
-                        .authorize_outbound_packet(&host)
-                        .is_ok()
-                };
-                if allowed && is_safe_launch_url(url) {
-                    launch_native_chromium_window(url);
+            match check_navigation_policy(url, shell_mutex) {
+                Ok(scrubbed_url) => {
+                    if !is_safe_launch_url(&scrubbed_url) {
+                        return HttpResponse::json(
+                            "400 Bad Request",
+                            &serde_json::json!({
+                                "ok": false,
+                                "error": "Refused unsafe isolated window URL."
+                            }),
+                        );
+                    }
+                    launch_native_chromium_window(&scrubbed_url);
+                    HttpResponse::json_bytes("200 OK", b"{\"ok\":true}")
                 }
+                Err(reason) => HttpResponse::json(
+                    "403 Forbidden",
+                    &serde_json::json!({ "ok": false, "error": reason }),
+                ),
             }
-            HttpResponse::json_bytes("200 OK", b"{\"ok\":true}")
         }
         "/api/navigate_check" => {
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             let raw_url = params.get("url").cloned().unwrap_or_default();
             let scrubbed_url = UBlockNetworkEngine::scrub_tracking_query_params(&raw_url);
-            let (host, _port) = match parse_http_url_authority(&scrubbed_url) {
-                Ok(hp) => hp,
-                Err(reason) => {
-                    return HttpResponse::json(
-                        "200 OK",
-                        &serde_json::json!({
-                            "allowed": false,
-                            "reason": reason,
-                            "scrubbed_url": scrubbed_url,
-                        }),
-                    );
-                }
-            };
-
-            if let Err(ks_err) = shell
-                .core
-                .mullvad_vpn
-                .kill_switch()
-                .authorize_outbound_packet(&host)
-            {
-                return HttpResponse::json(
+            match check_navigation_policy(&raw_url, shell_mutex) {
+                Ok(allowed_url) => HttpResponse::json(
+                    "200 OK",
+                    &serde_json::json!({
+                        "allowed": true,
+                        "scrubbed_url": allowed_url,
+                    }),
+                ),
+                Err(reason) => HttpResponse::json(
                     "200 OK",
                     &serde_json::json!({
                         "allowed": false,
-                        "reason": ks_err.to_string(),
+                        "reason": reason,
                         "scrubbed_url": scrubbed_url,
                     }),
-                );
+                ),
             }
-
-            let decision = shell.core.adblocker.evaluate_request(
-                &scrubbed_url,
-                &host,
-                &host,
-                NetworkResourceType::MainFrameDocument,
-            );
-            if let FilterDecision::BlockedByDomainRule(rule)
-            | FilterDecision::BlockedByPatternRule(rule) = decision
-            {
-                return HttpResponse::json(
-                    "200 OK",
-                    &serde_json::json!({
-                        "allowed": false,
-                        "reason": format!("Ad/tracker domain blocked by Singularity Shield ({})", rule),
-                        "scrubbed_url": scrubbed_url,
-                    }),
-                );
-            }
-
-            HttpResponse::json(
-                "200 OK",
-                &serde_json::json!({
-                    "allowed": true,
-                    "scrubbed_url": scrubbed_url,
-                }),
-            )
         }
         "/api/updater/check" => match crate::updater::check_for_updates() {
             Ok(info) => {
@@ -8879,13 +9991,16 @@ fn handle_web_proxy(
 ) -> HttpResponse {
     const PROXY_SANDBOX_CSP: &str =
         "sandbox allow-scripts allow-forms allow-popups; base-uri https: http:;";
+    const PROXY_NON_HTML_CSP: &str =
+        "default-src 'none'; img-src 'self'; style-src 'none'; script-src 'none'; sandbox";
 
     let params = parse_query_params(&req.query);
     let raw_url = params
         .get("url")
         .cloned()
         .unwrap_or_else(|| "https://example.com".into());
-    let scrubbed_url = UBlockNetworkEngine::scrub_tracking_query_params(&raw_url);
+    let scrubbed_url =
+        strip_trailing_dot_from_url_host(&UBlockNetworkEngine::scrub_tracking_query_params(&raw_url));
 
     let (host, port) = match parse_http_url_authority(&scrubbed_url) {
         Ok(hp) => hp,
@@ -8920,7 +10035,7 @@ fn handle_web_proxy(
     };
 
     {
-        let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let decision = shell.core.adblocker.evaluate_request(
             &scrubbed_url,
             &host,
@@ -8942,15 +10057,55 @@ fn handle_web_proxy(
             )
             .with_header("Content-Security-Policy", PROXY_SANDBOX_CSP);
         }
-
-        if !shell.private_browsing_active {
-            shell.roaming.record_history(&host, &scrubbed_url);
-        }
+        // NOTE: Never mutate persistent browsing history on a `GET /api/web_proxy` request.
     }
 
-    let html = fetch_and_rewrite_external_page(&scrubbed_url, initial_ips, shell_mutex);
-    HttpResponse::new("200 OK", "text/html; charset=utf-8", html.into_bytes())
-        .with_header("Content-Security-Policy", PROXY_SANDBOX_CSP)
+    let (body_bytes, content_type, is_html) =
+        fetch_and_rewrite_external_page(&scrubbed_url, initial_ips, shell_mutex);
+    let csp = if is_html {
+        PROXY_SANDBOX_CSP
+    } else {
+        PROXY_NON_HTML_CSP
+    };
+    HttpResponse::new("200 OK", content_type, body_bytes)
+        .with_header("Content-Security-Policy", csp)
+}
+
+/// Strips trailing DNS root dots (e.g. `example.com.`) from the authority host of an HTTP(S) URL
+/// so `curl` requests and `--resolve` pinning always target the exact same normalized hostname.
+fn strip_trailing_dot_from_url_host(url: &str) -> String {
+    let trimmed = url.trim();
+    let Some(scheme_idx) = trimmed.find("://") else {
+        return trimmed.to_string();
+    };
+    let scheme_prefix = &trimmed[..scheme_idx + 3];
+    let after_scheme = &trimmed[scheme_idx + 3..];
+    let auth_end = after_scheme
+        .find(&['/', '?', '#'][..])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..auth_end];
+    let rest = &after_scheme[auth_end..];
+    if authority.is_empty() || authority.starts_with('[') || authority.contains('@') {
+        return trimmed.to_string();
+    }
+    let (host, port_part) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, Some(p)),
+        _ => (authority, None),
+    };
+    let normalized_host = host.trim_end_matches('.');
+    if normalized_host.len() == host.len() || normalized_host.is_empty() {
+        return trimmed.to_string();
+    }
+    match port_part {
+        Some(p) => format!("{}{}:{}{}", scheme_prefix, normalized_host, p, rest),
+        None => format!("{}{}{}", scheme_prefix, normalized_host, rest),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_allowed_public_ip(ip: IpAddr) -> bool {
+    !singularity_net_mullvad::killswitch::is_non_global_ip(ip)
+        && crate::winhttp_client::is_public_routable_ip(ip)
 }
 
 /// Spawns `curl` on non-Windows platforms. On Windows, Singularity uses native `winhttp.dll`
@@ -8960,11 +10115,65 @@ fn system_curl_command() -> Command {
     Command::new("curl")
 }
 
+/// Executes `curl` and streams `ChildStdout` with a strict byte ceiling (`max_total_bytes`).
+/// Kills the child process immediately if the stream exceeds `max_total_bytes`, preventing OOM
+/// from gzip bombs or unbounded chunked streams.
+#[cfg(not(target_os = "windows"))]
+fn run_curl_bounded(mut cmd: Command, max_total_bytes: usize) -> Option<Vec<u8>> {
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+
+    let cap = max_total_bytes.saturating_add(1);
+    let mut out = Vec::with_capacity(max_total_bytes.min(64 * 1024));
+    let mut chunk = [0u8; 16 * 1024];
+    let mut exceeded = false;
+
+    loop {
+        match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let remaining = cap.saturating_sub(out.len());
+                let take = n.min(remaining);
+                out.extend_from_slice(&chunk[..take]);
+                if out.len() > max_total_bytes {
+                    exceeded = true;
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                drop(stdout);
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    drop(stdout);
+    if exceeded {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+
+    let status = child.wait().ok()?;
+    if !status.success() || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 fn fetch_and_rewrite_external_page(
     url: &str,
     initial_ips: Vec<IpAddr>,
     shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
-) -> String {
+) -> (Vec<u8>, &'static str, bool) {
     let mut current_url = if url.contains("duckduckgo.com")
         && url.contains("q=")
         && !url.contains("html.duckduckgo.com")
@@ -8974,6 +10183,7 @@ fn fetch_and_rewrite_external_page(
     } else {
         url.to_string()
     };
+    current_url = strip_trailing_dot_from_url_host(&current_url);
 
     let uniform_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     let mut pinned_ips = if current_url == url {
@@ -8983,14 +10193,16 @@ fn fetch_and_rewrite_external_page(
     };
 
     for _hop in 0..=MAX_PROXY_REDIRECTS {
+        current_url = strip_trailing_dot_from_url_host(&current_url);
         let (host, port) = match parse_http_url_authority(&current_url) {
             Ok(hp) => hp,
             Err(reason) => {
-                return render_proxy_error_page(&current_url, "REDIRECT BLOCKED", reason);
+                let err_html = render_proxy_error_page(&current_url, "REDIRECT BLOCKED", reason);
+                return (err_html.into_bytes(), "text/html; charset=utf-8", true);
             }
         };
 
-        let _resolved_ips = match pinned_ips.take() {
+        let resolved_ips = match pinned_ips.take() {
             Some(ips) if !ips.is_empty() => ips,
             _ => {
                 // Drop `shell_mutex` BEFORE DNS resolution to avoid stalling the UI thread!
@@ -9001,11 +10213,12 @@ fn fetch_and_rewrite_external_page(
                 let ips = match ks.authorize_outbound_host_and_dns(&host, port) {
                     Ok(ips) => ips,
                     Err(e) => {
-                        return render_proxy_error_page(
+                        let err_html = render_proxy_error_page(
                             &current_url,
                             "SSRF / KILL-SWITCH REDIRECT BLOCKED",
                             &e.to_string(),
                         );
+                        return (err_html.into_bytes(), "text/html; charset=utf-8", true);
                     }
                 };
                 let decision = {
@@ -9020,39 +10233,44 @@ fn fetch_and_rewrite_external_page(
                 if let FilterDecision::BlockedByDomainRule(rule)
                 | FilterDecision::BlockedByPatternRule(rule) = decision
                 {
-                    return render_proxy_error_page(
+                    let err_html = render_proxy_error_page(
                         &current_url,
                         "SINGULARITY SHIELD — TRACKER BLOCKED",
                         &format!("Filter rule: {}", rule),
                     );
+                    return (err_html.into_bytes(), "text/html; charset=utf-8", true);
                 }
                 ips
             }
         };
 
         #[cfg(target_os = "windows")]
-        let (status_code, location, body_vec) = {
-            let Ok(resp) = crate::winhttp_client::winhttp_get_no_redirect(
+        let (status_code, location, raw_content_type, body_vec): (
+            u16,
+            Option<String>,
+            Option<String>,
+            Vec<u8>,
+        ) = {
+            let Ok(resp) = crate::winhttp_client::winhttp_get_no_redirect_pinned(
                 &current_url,
-                uniform_ua,
-                &[
-                    (
-                        "Accept",
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    ),
-                    ("Accept-Language", "en-US,en;q=0.9"),
-                ],
-                5_000,
-                10_000,
                 MAX_PROXY_BODY_BYTES,
+                uniform_ua,
+                10_000,
+                resolved_ips.first().copied(),
+                Some(is_allowed_public_ip),
             ) else {
                 break;
             };
-            (resp.status_code, resp.location, resp.body)
+            (resp.status_code, resp.location, None, resp.body)
         };
 
         #[cfg(not(target_os = "windows"))]
-        let (status_code, location, body_vec) = {
+        let (status_code, location, raw_content_type, body_vec): (
+            u16,
+            Option<String>,
+            Option<String>,
+            Vec<u8>,
+        ) = {
             let mut cmd = system_curl_command();
             cmd.args([
                 "-sS",
@@ -9068,7 +10286,6 @@ fn fetch_and_rewrite_external_page(
                 "6",
                 "--max-time",
                 "10",
-                "--compressed",
                 "-A",
                 uniform_ua,
                 "-H",
@@ -9077,13 +10294,14 @@ fn fetch_and_rewrite_external_page(
                 "Accept-Language: en-US,en;q=0.9",
             ]);
 
-            // Pin curl to the already-validated global IP to defeat TOCTOU DNS rebinding
+            // Pin curl to the already-validated global IP to defeat TOCTOU DNS rebinding.
+            // Both `current_url` and `--resolve` use the dot-stripped hostname.
             let bare_host = host
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .trim_end_matches('.');
             if !bare_host.is_empty() && bare_host.parse::<IpAddr>().is_err() {
-                if let Some(ip) = _resolved_ips.first() {
+                if let Some(ip) = resolved_ips.first() {
                     let ip_str = match ip {
                         IpAddr::V4(v4) => v4.to_string(),
                         IpAddr::V6(v6) => format!("[{}]", v6),
@@ -9094,17 +10312,13 @@ fn fetch_and_rewrite_external_page(
             }
             cmd.arg("--").arg(&current_url);
 
-            let Ok(out) = cmd.output() else {
+            let Some(raw_stdout) = run_curl_bounded(cmd, MAX_PROXY_BODY_BYTES + 32 * 1024) else {
                 break;
             };
-            if !out.status.success() || out.stdout.is_empty() {
-                break;
-            }
-
-            let Some((code, loc, body_slice)) = parse_curl_http_response(&out.stdout) else {
+            let Some((code, loc, ct, body_slice)) = parse_curl_http_response(&raw_stdout) else {
                 break;
             };
-            (code, loc, body_slice.to_vec())
+            (code, loc, ct, body_slice.to_vec())
         };
 
         if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
@@ -9112,17 +10326,27 @@ fn fetch_and_rewrite_external_page(
                 break;
             };
             let Some(next_url) = resolve_redirect_url(&current_url, &loc) else {
-                return render_proxy_error_page(
+                let err_html = render_proxy_error_page(
                     &current_url,
                     "INVALID REDIRECT",
                     "The redirect target uses a disallowed scheme or invalid syntax.",
                 );
+                return (err_html.into_bytes(), "text/html; charset=utf-8", true);
             };
-            current_url = UBlockNetworkEngine::scrub_tracking_query_params(&next_url);
+            current_url = strip_trailing_dot_from_url_host(
+                &UBlockNetworkEngine::scrub_tracking_query_params(&next_url),
+            );
             continue;
         }
 
         let capped = &body_vec[..body_vec.len().min(MAX_PROXY_BODY_BYTES)];
+        let (safe_ct, is_html) =
+            classify_safe_proxy_content_type(raw_content_type.as_deref(), capped);
+
+        if !is_html {
+            return (capped.to_vec(), safe_ct, false);
+        }
+
         let raw_html = String::from_utf8_lossy(capped).into_owned();
         let origin_base = escape_html_str(&extract_origin_base(&current_url));
 
@@ -9145,22 +10369,123 @@ fn fetch_and_rewrite_external_page(
             rewritten.push_str(&raw_html[..insert_pos]);
             rewritten.push_str(&base_injection);
             rewritten.push_str(&raw_html[insert_pos..]);
-            return rewritten;
+            return (rewritten.into_bytes(), safe_ct, true);
         }
-        return format!("{}{}", base_injection, raw_html);
+        return (
+            format!("{}{}", base_injection, raw_html).into_bytes(),
+            safe_ct,
+            true,
+        );
     }
 
-    render_proxy_error_page(
+    let err_html = render_proxy_error_page(
         &current_url,
         "ISOLATED CONNECTION REQUIRED",
         "The remote site restricts proxy access or exceeded the redirect limit.",
-    )
+    );
+    (err_html.into_bytes(), "text/html; charset=utf-8", true)
+}
+
+/// Validates and maps an upstream `Content-Type` (plus byte sniffing fallback) to a safe
+/// allowlisted MIME type and `is_html` flag, preventing non-HTML payloads from being coerced
+/// into `text/html` and blocking active SVG/XML/JS payloads.
+fn classify_safe_proxy_content_type(raw_ct: Option<&str>, body: &[u8]) -> (&'static str, bool) {
+    let media = raw_ct
+        .and_then(|s| s.split(';').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref m) = media {
+        return match m.as_str() {
+            "text/html" | "application/xhtml+xml" => {
+                if detect_image_magic_mime(body).is_some() || body.starts_with(b"%PDF-") {
+                    ("application/octet-stream", false)
+                } else {
+                    ("text/html; charset=utf-8", true)
+                }
+            }
+            "text/plain" => ("text/plain; charset=utf-8", false),
+            "text/css" => ("text/css; charset=utf-8", false),
+            "application/json" => ("application/json; charset=utf-8", false),
+            s if s.ends_with("+json") => ("application/json; charset=utf-8", false),
+            "image/png" => match detect_image_magic_mime(body) {
+                Some("image/png") => ("image/png", false),
+                _ => ("application/octet-stream", false),
+            },
+            "image/jpeg" | "image/jpg" => match detect_image_magic_mime(body) {
+                Some("image/jpeg") => ("image/jpeg", false),
+                _ => ("application/octet-stream", false),
+            },
+            "image/gif" => match detect_image_magic_mime(body) {
+                Some("image/gif") => ("image/gif", false),
+                _ => ("application/octet-stream", false),
+            },
+            "image/webp" => match detect_image_magic_mime(body) {
+                Some("image/webp") => ("image/webp", false),
+                _ => ("application/octet-stream", false),
+            },
+            "image/x-icon" | "image/vnd.microsoft.icon" => match detect_image_magic_mime(body) {
+                Some("image/x-icon") => ("image/x-icon", false),
+                _ => ("application/octet-stream", false),
+            },
+            "image/svg+xml" => {
+                if std::str::from_utf8(body).map(is_safe_svg).unwrap_or(false) {
+                    ("image/svg+xml", false)
+                } else {
+                    ("text/plain; charset=utf-8", false)
+                }
+            }
+            "application/pdf" if body.starts_with(b"%PDF-") => ("application/pdf", false),
+            "application/xml" | "text/xml" => ("text/plain; charset=utf-8", false),
+            _ => ("application/octet-stream", false),
+        };
+    }
+
+    if let Some(img_mime) = detect_image_magic_mime(body) {
+        return (img_mime, false);
+    }
+    if body.starts_with(b"%PDF-") {
+        return ("application/pdf", false);
+    }
+    if let Ok(txt) = std::str::from_utf8(body) {
+        let trimmed = txt.trim_start_matches('\u{feff}').trim_start();
+        if trimmed.len() >= 4 && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"<svg") {
+            return if is_safe_svg(txt) {
+                ("image/svg+xml", false)
+            } else {
+                ("text/plain; charset=utf-8", false)
+            };
+        }
+        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && serde_json::from_slice::<serde_json::Value>(body).is_ok()
+        {
+            return ("application/json; charset=utf-8", false);
+        }
+        let probe_len = trimmed.len().min(2048);
+        let mut probe_end = probe_len;
+        while probe_end > 0 && !trimmed.is_char_boundary(probe_end) {
+            probe_end -= 1;
+        }
+        let probe = &trimmed[..probe_end];
+        if find_ascii_case_insensitive(probe, "<!doctype html").is_some()
+            || find_ascii_case_insensitive(probe, "<html").is_some()
+            || find_ascii_case_insensitive(probe, "<head").is_some()
+            || find_ascii_case_insensitive(probe, "<body").is_some()
+            || find_ascii_case_insensitive(probe, "<title").is_some()
+        {
+            return ("text/html; charset=utf-8", true);
+        }
+        return ("text/plain; charset=utf-8", false);
+    }
+    ("application/octet-stream", false)
 }
 
 /// Parses `curl -i` output (skipping intermediate `1xx` / proxy `CONNECT` headers)
-/// into `(status_code, optional Location header, body_slice)`.
+/// into `(status_code, optional Location header, optional Content-Type header, body_slice)`.
 #[cfg(not(target_os = "windows"))]
-fn parse_curl_http_response(raw: &[u8]) -> Option<(u16, Option<String>, &[u8])> {
+fn parse_curl_http_response(
+    raw: &[u8],
+) -> Option<(u16, Option<String>, Option<String>, &[u8])> {
     let mut slice = raw;
     loop {
         let sep = slice.windows(4).position(|w| w == b"\r\n\r\n")?;
@@ -9185,14 +10510,18 @@ fn parse_curl_http_response(raw: &[u8]) -> Option<(u16, Option<String>, &[u8])> 
         }
 
         let mut location = None;
+        let mut content_type = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("location") {
+                let key = k.trim();
+                if key.eq_ignore_ascii_case("location") {
                     location = Some(v.trim().to_string());
+                } else if key.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(v.trim().to_string());
                 }
             }
         }
-        return Some((code, location, body));
+        return Some((code, location, content_type, body));
     }
 }
 
@@ -9264,6 +10593,7 @@ fn render_proxy_error_page(url: &str, title: &str, detail: &str) -> String {
 <head>
 <meta charset="utf-8">
 <style>
+  *, *::before, *::after {{ box-sizing: border-box; }}
   body {{
     margin: 0; padding: 48px 24px; background: #000000; color: #f5f3ee;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -9307,8 +10637,8 @@ fn is_valid_hex_color(s: &str) -> bool {
     b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
 }
 
-fn detect_favicon_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() < 4 || bytes.len() > 131_072 {
+fn detect_image_magic_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 4 {
         return None;
     }
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -9327,13 +10657,471 @@ fn detect_favicon_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
-    if let Ok(txt) = std::str::from_utf8(bytes) {
-        let trimmed = txt.trim_start_matches('\u{feff}').trim_start();
-        if (trimmed.starts_with("<svg") || trimmed.starts_with("<?xml"))
-            && find_ascii_case_insensitive(trimmed, "<svg").is_some()
-            && find_ascii_case_insensitive(trimmed, "<script").is_none()
-            && find_ascii_case_insensitive(trimmed, "foreignobject").is_none()
+    None
+}
+
+fn decode_html_entities_for_scan(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'#' {
+                let is_hex = matches!(bytes[i + 2], b'x' | b'X');
+                let start = if is_hex { i + 3 } else { i + 2 };
+                let mut end = start;
+                while end < bytes.len() && end - start < 7 {
+                    let b = bytes[end];
+                    let ok = if is_hex {
+                        b.is_ascii_hexdigit()
+                    } else {
+                        b.is_ascii_digit()
+                    };
+                    if !ok {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end > start {
+                    let digits = &input[start..end];
+                    let radix = if is_hex { 16 } else { 10 };
+                    if let Ok(code) = u32::from_str_radix(digits, radix) {
+                        if code != 0 {
+                            if let Some(ch) = char::from_u32(code) {
+                                out.push(ch);
+                                i = if end < bytes.len() && bytes[end] == b';' {
+                                    end + 1
+                                } else {
+                                    end
+                                };
+                                continue;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let max_end = (i + 12).min(bytes.len());
+                if let Some(semi_rel) = bytes[i + 1..max_end].iter().position(|&b| b == b';') {
+                    let name = &input[i + 1..i + 1 + semi_rel];
+                    let mapped = if name.eq_ignore_ascii_case("colon") {
+                        Some(':')
+                    } else if name.eq_ignore_ascii_case("tab") {
+                        Some('\t')
+                    } else if name.eq_ignore_ascii_case("newline") {
+                        Some('\n')
+                    } else if name.eq_ignore_ascii_case("lt") {
+                        Some('<')
+                    } else if name.eq_ignore_ascii_case("gt") {
+                        Some('>')
+                    } else if name.eq_ignore_ascii_case("quot") {
+                        Some('"')
+                    } else if name.eq_ignore_ascii_case("apos") {
+                        Some('\'')
+                    } else if name.eq_ignore_ascii_case("amp") {
+                        Some('&')
+                    } else {
+                        None
+                    };
+                    if let Some(ch) = mapped {
+                        out.push(ch);
+                        i = i + 1 + semi_rel + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn compact_ascii_lower(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii() {
+            let b = ch as u8;
+            if b > 0x20 && b != 0x7f {
+                out.push((b as char).to_ascii_lowercase());
+            }
+        } else if !ch.is_control() && !ch.is_whitespace() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn contains_forbidden_svg_uri(raw_val: &str, is_xmlns_attr: bool) -> bool {
+    if raw_val.contains('<') {
+        return true;
+    }
+    let decoded_once = decode_html_entities_for_scan(raw_val);
+    let decoded_twice = decode_html_entities_for_scan(&decoded_once);
+    let compact = compact_ascii_lower(&decoded_twice);
+
+    if compact.contains("javascript:")
+        || compact.contains("vbscript:")
+        || compact.contains("livescript:")
+        || compact.contains("data:")
+        || compact.contains("file:")
+        || compact.contains("blob:")
+        || compact.contains('<')
+        || compact.contains('\\')
+    {
+        return true;
+    }
+
+    if is_xmlns_attr {
+        let allowed_ns = compact == "http://www.w3.org/2000/svg"
+            || compact == "http://www.w3.org/1999/xlink"
+            || compact == "http://www.w3.org/xml/1998/namespace"
+            || compact == "http://www.w3.org/2000/xmlns/"
+            || compact == "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            || compact == "http://purl.org/dc/elements/1.1/"
+            || compact == "http://creativecommons.org/ns#"
+            || compact == "http://www.inkscape.org/namespaces/inkscape"
+            || compact == "http://sodipodi.sourceforge.net/dtd/sodipodi-0.dtd"
+            || compact == "http://www.bohemiancoding.com/sketch/ns"
+            || compact == "https://vecta.io/nano"
+            || compact.starts_with("http://ns.adobe.com/")
+            || compact.starts_with("http://www.serif.com/");
+        return !allowed_ns;
+    }
+
+    compact.contains("http:") || compact.contains("https:") || compact.contains("//")
+}
+
+fn is_safe_svg_css(raw_css: &str) -> bool {
+    let decoded = decode_html_entities_for_scan(&decode_html_entities_for_scan(raw_css));
+    // Reject CSS backslash escapes used to obfuscate `@import`, `expression(`, or `javascript:`
+    if decoded.contains('\\') || decoded.contains('<') {
+        return false;
+    }
+    // Strip CSS `/* ... */` comments; reject unclosed comments
+    let mut no_comments = String::with_capacity(decoded.len());
+    let bytes = decoded.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if let Some(end_rel) = bytes[i + 2..].windows(2).position(|w| w == b"*/") {
+                i = i + 2 + end_rel + 2;
+                continue;
+            }
+            return false;
+        }
+        let ch = decoded[i..].chars().next().unwrap();
+        no_comments.push(ch);
+        i += ch.len_utf8();
+    }
+
+    let compact = compact_ascii_lower(&no_comments);
+    if compact.contains("@import")
+        || compact.contains("expression(")
+        || compact.contains("javascript:")
+        || compact.contains("vbscript:")
+        || compact.contains("data:")
+        || compact.contains("behavior:")
+        || compact.contains("-moz-binding")
+        || compact.contains("http:")
+        || compact.contains("https:")
+        || compact.contains("//")
+    {
+        return false;
+    }
+
+    // Only permit internal `#fragment` references inside `url(...)`
+    let mut rest = compact.as_str();
+    while let Some(pos) = rest.find("url(") {
+        let after = &rest[pos + 4..];
+        let trimmed = after.trim_start_matches(&['"', '\''][..]);
+        if !trimmed.starts_with('#') {
+            return false;
+        }
+        rest = after;
+    }
+    true
+}
+
+/// Strict SVG active-content validator rejecting DTD/ENTITY/CDATA/XSLT, `<script>` / `<*:script>`,
+/// `<foreignObject>`, SMIL animation elements (`<set>`, `<animate*>`, `<discard>`, `<mpath>`),
+/// embedded active elements, all `on*` event handler attributes (including namespaced `ev:onload`),
+/// dangerous URIs (`javascript:`, `vbscript:`, `data:`, external URLs), and unsafe CSS.
+fn is_safe_svg(svg: &str) -> bool {
+    if svg.is_empty() || svg.len() > MAX_PROXY_BODY_BYTES || svg.contains('\0') {
+        return false;
+    }
+    let trimmed = svg.trim_start_matches('\u{feff}').trim_start();
+    let starts_svg = trimmed.len() >= 4 && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"<svg");
+    let starts_xml = trimmed.len() >= 5 && trimmed.as_bytes()[..5].eq_ignore_ascii_case(b"<?xml");
+    if !starts_svg && !starts_xml {
+        return false;
+    }
+
+    // Reject DTD, entity expansion, CDATA script smuggling, and XSLT processing instructions
+    if find_ascii_case_insensitive(trimmed, "<!doctype").is_some()
+        || find_ascii_case_insensitive(trimmed, "<!entity").is_some()
+        || find_ascii_case_insensitive(trimmed, "<![cdata[").is_some()
+        || find_ascii_case_insensitive(trimmed, "<?xml-stylesheet").is_some()
+    {
+        return false;
+    }
+
+    let is_forbidden_tag = |local: &str| -> bool {
+        matches!(
+            local,
+            "script"
+                | "foreignobject"
+                | "iframe"
+                | "object"
+                | "embed"
+                | "applet"
+                | "frame"
+                | "frameset"
+                | "meta"
+                | "base"
+                | "link"
+                | "handler"
+                | "listener"
+                | "set"
+                | "animate"
+                | "animatemotion"
+                | "animatetransform"
+                | "animatecolor"
+                | "discard"
+                | "mpath"
+                | "feimage"
+                | "a"
+                | "audio"
+                | "video"
+                | "canvas"
+                | "form"
+                | "input"
+                | "button"
+                | "textarea"
+                | "select"
+        )
+    };
+
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    let mut saw_svg_root = false;
+
+    while i < bytes.len() {
+        let Some(lt_rel) = bytes[i..].iter().position(|&b| b == b'<') else {
+            break;
+        };
+        i += lt_rel;
+        if i + 1 >= bytes.len() {
+            return false;
+        }
+
+        // XML comment `<!-- ... -->`
+        if bytes[i..].starts_with(b"<!--") {
+            let Some(end_rel) = bytes[i + 4..].windows(3).position(|w| w == b"-->") else {
+                return false;
+            };
+            i = i + 4 + end_rel + 3;
+            continue;
+        }
+
+        // Processing instruction `<?xml ... ?>` only
+        if bytes[i + 1] == b'?' {
+            let Some(end_rel) = bytes[i + 2..].windows(2).position(|w| w == b"?>") else {
+                return false;
+            };
+            let pi_body = &trimmed[i + 2..i + 2 + end_rel];
+            let pi_name = pi_body
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or("");
+            if !pi_name.eq_ignore_ascii_case("xml") {
+                return false;
+            }
+            i = i + 2 + end_rel + 2;
+            continue;
+        }
+
+        // Any other `<!...>` declaration (DOCTYPE, ENTITY, CDATA, etc.) is rejected
+        if bytes[i + 1] == b'!' {
+            return false;
+        }
+
+        // Closing tag `</...>`
+        if bytes[i + 1] == b'/' {
+            let Some(gt_rel) = bytes[i + 2..].iter().position(|&b| b == b'>') else {
+                return false;
+            };
+            let close_name = trimmed[i + 2..i + 2 + gt_rel].trim();
+            let local = close_name
+                .rsplit_once(':')
+                .map(|(_, l)| l)
+                .unwrap_or(close_name)
+                .to_ascii_lowercase();
+            if is_forbidden_tag(&local) {
+                return false;
+            }
+            i = i + 2 + gt_rel + 1;
+            continue;
+        }
+
+        // Opening tag `<tag ...>`
+        let tag_start = i + 1;
+        let mut p = tag_start;
+        while p < bytes.len()
+            && !bytes[p].is_ascii_whitespace()
+            && bytes[p] != b'>'
+            && bytes[p] != b'/'
         {
+            p += 1;
+        }
+        if p == tag_start || p >= bytes.len() {
+            return false;
+        }
+        let raw_tag = &trimmed[tag_start..p];
+        let local_tag = raw_tag
+            .rsplit_once(':')
+            .map(|(_, l)| l)
+            .unwrap_or(raw_tag)
+            .to_ascii_lowercase();
+        if is_forbidden_tag(&local_tag) {
+            return false;
+        }
+        if local_tag == "svg" {
+            saw_svg_root = true;
+        }
+
+        let mut self_closing = false;
+        loop {
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if p >= bytes.len() {
+                return false;
+            }
+            if bytes[p] == b'>' {
+                p += 1;
+                break;
+            }
+            if bytes[p] == b'/' {
+                if p + 1 < bytes.len() && bytes[p + 1] == b'>' {
+                    self_closing = true;
+                    p += 2;
+                    break;
+                }
+                return false;
+            }
+
+            let attr_start = p;
+            while p < bytes.len()
+                && !bytes[p].is_ascii_whitespace()
+                && !matches!(bytes[p], b'=' | b'>' | b'/')
+            {
+                p += 1;
+            }
+            if p == attr_start {
+                return false;
+            }
+            let attr_raw = &trimmed[attr_start..p];
+            let attr_lower = attr_raw.to_ascii_lowercase();
+            let local_attr = attr_lower
+                .rsplit_once(':')
+                .map(|(_, l)| l)
+                .unwrap_or(&attr_lower);
+
+            // Reject all `on*` event handlers (including namespaced `ev:onload`) and active attrs
+            if local_attr.starts_with("on")
+                || attr_lower.starts_with("on")
+                || matches!(local_attr, "srcdoc" | "formaction")
+            {
+                return false;
+            }
+
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            let attr_val = if p < bytes.len() && bytes[p] == b'=' {
+                p += 1;
+                while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                    p += 1;
+                }
+                if p >= bytes.len() {
+                    return false;
+                }
+                if bytes[p] == b'"' || bytes[p] == b'\'' {
+                    let quote = bytes[p];
+                    p += 1;
+                    let val_start = p;
+                    while p < bytes.len() && bytes[p] != quote {
+                        p += 1;
+                    }
+                    if p >= bytes.len() {
+                        return false;
+                    }
+                    let v = &trimmed[val_start..p];
+                    p += 1;
+                    v
+                } else {
+                    let val_start = p;
+                    while p < bytes.len()
+                        && !bytes[p].is_ascii_whitespace()
+                        && !matches!(bytes[p], b'>' | b'/')
+                    {
+                        p += 1;
+                    }
+                    &trimmed[val_start..p]
+                }
+            } else {
+                ""
+            };
+
+            let is_xmlns = attr_lower == "xmlns" || attr_lower.starts_with("xmlns:");
+            if contains_forbidden_svg_uri(attr_val, is_xmlns) {
+                return false;
+            }
+            if local_attr == "style" && !is_safe_svg_css(attr_val) {
+                return false;
+            }
+        }
+
+        i = p;
+
+        if local_tag == "style" && !self_closing {
+            let Some(close_rel) = find_ascii_case_insensitive(&trimmed[i..], "</") else {
+                return false;
+            };
+            let css_body = &trimmed[i..i + close_rel];
+            if !is_safe_svg_css(css_body) {
+                return false;
+            }
+            let close_start = i + close_rel;
+            let Some(gt_rel) = bytes[close_start + 2..].iter().position(|&b| b == b'>') else {
+                return false;
+            };
+            let close_tag = trimmed[close_start + 2..close_start + 2 + gt_rel].trim();
+            let close_local = close_tag
+                .rsplit_once(':')
+                .map(|(_, l)| l)
+                .unwrap_or(close_tag);
+            if !close_local.eq_ignore_ascii_case("style") {
+                return false;
+            }
+            i = close_start + 2 + gt_rel + 1;
+        }
+    }
+
+    saw_svg_root
+}
+
+fn detect_favicon_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 4 || bytes.len() > 131_072 {
+        return None;
+    }
+    if let Some(mime) = detect_image_magic_mime(bytes) {
+        return Some(mime);
+    }
+    if let Ok(txt) = std::str::from_utf8(bytes) {
+        if is_safe_svg(txt) {
             return Some("image/svg+xml");
         }
     }
@@ -9389,9 +11177,10 @@ fn fetch_favicon_bytes_safe(
 ) -> Option<(Vec<u8>, &'static str)> {
     const MAX_FAVICON_BYTES: usize = 131_072;
     let uniform_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-    let mut current_url = start_url.to_string();
+    let mut current_url = strip_trailing_dot_from_url_host(start_url);
 
     for _hop in 0..=3 {
+        current_url = strip_trailing_dot_from_url_host(&current_url);
         let (host, port) = parse_http_url_authority(&current_url).ok()?;
         // Lock `shell_mutex` ONLY for fast in-memory adblocker + Arc<KillSwitch> clone,
         // then DROP it BEFORE blocking DNS so slow DNS never freezes the UI thread!
@@ -9411,22 +11200,19 @@ fn fetch_favicon_bytes_safe(
             }
             shell.core.mullvad_vpn.kill_switch().clone()
         };
-        let _resolved_ips = kill_switch
+        let resolved_ips = kill_switch
             .authorize_outbound_host_and_dns(&host, port)
             .ok()?;
 
         #[cfg(target_os = "windows")]
         let (status_code, location, body_vec) = {
-            let resp = crate::winhttp_client::winhttp_get_no_redirect(
+            let resp = crate::winhttp_client::winhttp_get_no_redirect_pinned(
                 &current_url,
-                uniform_ua,
-                &[(
-                    "Accept",
-                    "image/avif,image/webp,image/png,image/svg+xml,image/x-icon,image/*;q=0.8,*/*;q=0.5",
-                )],
-                1_500,
-                2_500,
                 MAX_FAVICON_BYTES,
+                uniform_ua,
+                2_500,
+                resolved_ips.first().copied(),
+                Some(is_allowed_public_ip),
             )
             .ok()?;
             (resp.status_code, resp.location, resp.body)
@@ -9449,7 +11235,6 @@ fn fetch_favicon_bytes_safe(
                 "2",
                 "--max-time",
                 "4",
-                "--compressed",
                 "-A",
                 uniform_ua,
                 "-H",
@@ -9460,7 +11245,7 @@ fn fetch_favicon_bytes_safe(
                 .trim_end_matches(']')
                 .trim_end_matches('.');
             if !bare_host.is_empty() && bare_host.parse::<IpAddr>().is_err() {
-                if let Some(ip) = _resolved_ips.first() {
+                if let Some(ip) = resolved_ips.first() {
                     let ip_str = match ip {
                         IpAddr::V4(v4) => v4.to_string(),
                         IpAddr::V6(v6) => format!("[{}]", v6),
@@ -9471,17 +11256,14 @@ fn fetch_favicon_bytes_safe(
             }
             cmd.arg("--").arg(&current_url);
 
-            let out = cmd.output().ok()?;
-            if !out.status.success() || out.stdout.is_empty() {
-                return None;
-            }
-            let (code, loc, body_slice) = parse_curl_http_response(&out.stdout)?;
+            let raw_stdout = run_curl_bounded(cmd, MAX_FAVICON_BYTES + 16 * 1024)?;
+            let (code, loc, _ct, body_slice) = parse_curl_http_response(&raw_stdout)?;
             (code, loc, body_slice.to_vec())
         };
 
         if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
             let loc = location?;
-            current_url = resolve_redirect_url(&current_url, &loc)?;
+            current_url = strip_trailing_dot_from_url_host(&resolve_redirect_url(&current_url, &loc)?);
             continue;
         }
         if status_code != 200 || body_vec.is_empty() || body_vec.len() > MAX_FAVICON_BYTES {
@@ -9530,10 +11312,28 @@ fn cache_favicon_in_ram(key: &str, bytes: &[u8], mime: &'static str) {
     }
 }
 
+fn favicon_cache_key(url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let key_full = hex::encode(hasher.finalize());
+    key_full[..32].to_string()
+}
+
+fn is_fresh_favicon_miss(miss_path: &Path) -> bool {
+    if let Ok(meta) = std::fs::metadata(miss_path) {
+        if let Ok(modified) = meta.modified() {
+            return modified.elapsed().map(|d| d.as_secs() < 1800).unwrap_or(false);
+        }
+    }
+    false
+}
+
 fn handle_favicon_request(
     req: &ParsedHttpRequest,
     shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
 ) -> HttpResponse {
+    const FAVICON_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
     let q = parse_query_params(&req.query);
     let host_raw = q
         .get("host")
@@ -9543,7 +11343,7 @@ fn handle_favicon_request(
 
     let mut candidates: Vec<String> = Vec::new();
     if !icon_raw.is_empty() && icon_raw.len() <= 512 && parse_http_url_authority(&icon_raw).is_ok() {
-        candidates.push(icon_raw.clone());
+        candidates.push(strip_trailing_dot_from_url_host(&icon_raw));
     }
     if is_valid_favicon_host(&host_raw) {
         let root_ico = format!("https://{}/favicon.ico", host_raw);
@@ -9555,62 +11355,75 @@ fn handle_favicon_request(
         return HttpResponse::text("400 Bad Request", "Invalid favicon target");
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(candidates[0].as_bytes());
-    let key_full = hex::encode(hasher.finalize());
-    let key = &key_full[..32];
-
-    // Fast path 1: zero-disk, zero-lock-on-shell RAM cache hit (microseconds across 38+ tabs!)
-    if let Ok(ram) = favicon_ram_cache().lock() {
-        if let Some((bytes, ct)) = ram.get(key) {
-            return HttpResponse::new("200 OK", ct, bytes.clone())
-                .with_header("Cache-Control", "private, max-age=86400")
-                .with_header(
-                    "Content-Security-Policy",
-                    "default-src 'none'; style-src 'unsafe-inline'; sandbox",
-                );
-        }
-    }
-
-    let favicons_dir = {
+    let (is_private, favicons_dir) = {
         let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        shell.roaming.favicons_dir()
+        (shell.private_browsing_active, shell.roaming.favicons_dir())
     };
-    let _ = std::fs::create_dir_all(&favicons_dir);
 
-    let bin_path = favicons_dir.join(format!("{}.bin", key));
-    let mime_path = favicons_dir.join(format!("{}.mime", key));
-    let miss_path = favicons_dir.join(format!("{}.miss", key));
-
-    if let (Ok(bytes), Ok(mime_str)) = (std::fs::read(&bin_path), std::fs::read_to_string(&mime_path))
-    {
-        if let Some(verified_mime) = detect_favicon_mime(&bytes) {
-            let ct = match mime_str.trim() {
-                "image/png" => "image/png",
-                "image/x-icon" => "image/x-icon",
-                "image/gif" => "image/gif",
-                "image/jpeg" => "image/jpeg",
-                "image/webp" => "image/webp",
-                "image/svg+xml" => "image/svg+xml",
-                _ => verified_mime,
-            };
-            cache_favicon_in_ram(key, &bytes, ct);
-            return HttpResponse::new("200 OK", ct, bytes)
-                .with_header("Cache-Control", "private, max-age=86400")
-                .with_header(
-                    "Content-Security-Policy",
-                    "default-src 'none'; style-src 'unsafe-inline'; sandbox",
-                );
-        }
-    }
-
-    if let Ok(meta) = std::fs::metadata(&miss_path) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().map(|d| d.as_secs() < 1800).unwrap_or(false) {
-                return HttpResponse::text("404 Not Found", "Favicon unavailable")
-                    .with_header("Cache-Control", "private, max-age=600");
+    // Private browsing mode: NEVER touch disk (`favicons/`) or shared RAM cache.
+    if is_private {
+        let Some(_slot_guard) = try_acquire_favicon_fetch_slot() else {
+            return HttpResponse::text("503 Service Unavailable", "Favicon fetcher busy")
+                .with_header("Cache-Control", "no-store");
+        };
+        for cand in &candidates {
+            if let Some((bytes, mime)) = fetch_favicon_bytes_safe(cand, shell_mutex) {
+                return HttpResponse::new("200 OK", mime, bytes)
+                    .with_header("Cache-Control", "no-store")
+                    .with_header("Content-Security-Policy", FAVICON_CSP);
             }
         }
+        return HttpResponse::text("404 Not Found", "Favicon not found")
+            .with_header("Cache-Control", "no-store");
+    }
+
+    let cand_keys: Vec<(&String, String)> = candidates
+        .iter()
+        .map(|c| (c, favicon_cache_key(c)))
+        .collect();
+
+    // Fast path 1: zero-disk, zero-lock-on-shell RAM cache hit keyed per candidate URL
+    if let Ok(ram) = favicon_ram_cache().lock() {
+        for (_, key) in &cand_keys {
+            if let Some((bytes, ct)) = ram.get(key) {
+                return HttpResponse::new("200 OK", ct, bytes.clone())
+                    .with_header("Cache-Control", "private, max-age=86400")
+                    .with_header("Content-Security-Policy", FAVICON_CSP);
+            }
+        }
+    }
+
+    // Fast path 2: disk cache lookup keyed strictly by each candidate's own URL hash
+    for (_, key) in &cand_keys {
+        let bin_path = favicons_dir.join(format!("{}.bin", key));
+        let mime_path = favicons_dir.join(format!("{}.mime", key));
+        if let (Ok(bytes), Ok(mime_str)) =
+            (std::fs::read(&bin_path), std::fs::read_to_string(&mime_path))
+        {
+            if let Some(verified_mime) = detect_favicon_mime(&bytes) {
+                let ct = match mime_str.trim() {
+                    "image/png" => "image/png",
+                    "image/x-icon" => "image/x-icon",
+                    "image/gif" => "image/gif",
+                    "image/jpeg" => "image/jpeg",
+                    "image/webp" => "image/webp",
+                    "image/svg+xml" => "image/svg+xml",
+                    _ => verified_mime,
+                };
+                cache_favicon_in_ram(key, &bytes, ct);
+                return HttpResponse::new("200 OK", ct, bytes)
+                    .with_header("Cache-Control", "private, max-age=86400")
+                    .with_header("Content-Security-Policy", FAVICON_CSP);
+            }
+        }
+    }
+
+    if cand_keys
+        .iter()
+        .all(|(_, key)| is_fresh_favicon_miss(&favicons_dir.join(format!("{}.miss", key))))
+    {
+        return HttpResponse::text("404 Not Found", "Favicon unavailable")
+            .with_header("Cache-Control", "private, max-age=600");
     }
 
     let Some(_slot_guard) = try_acquire_favicon_fetch_slot() else {
@@ -9618,23 +11431,46 @@ fn handle_favicon_request(
             .with_header("Cache-Control", "no-store");
     };
 
-    for cand in &candidates {
+    for (cand, key) in &cand_keys {
+        let miss_path = favicons_dir.join(format!("{}.miss", key));
+        if is_fresh_favicon_miss(&miss_path) {
+            continue;
+        }
         if let Some((bytes, mime)) = fetch_favicon_bytes_safe(cand, shell_mutex) {
-            prune_favicon_cache_if_needed(&favicons_dir);
-            let _ = std::fs::write(&bin_path, &bytes);
-            let _ = std::fs::write(&mime_path, mime);
-            let _ = std::fs::remove_file(&miss_path);
-            cache_favicon_in_ram(key, &bytes, mime);
+            let now_private = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.private_browsing_active
+            };
+            if !now_private {
+                let _ = std::fs::create_dir_all(&favicons_dir);
+                prune_favicon_cache_if_needed(&favicons_dir);
+                let bin_path = favicons_dir.join(format!("{}.bin", key));
+                let mime_path = favicons_dir.join(format!("{}.mime", key));
+                let _ = std::fs::write(&bin_path, &bytes);
+                let _ = std::fs::write(&mime_path, mime);
+                let _ = std::fs::remove_file(&miss_path);
+                cache_favicon_in_ram(key, &bytes, mime);
+            }
+            let cache_ctrl = if now_private {
+                "no-store"
+            } else {
+                "private, max-age=86400"
+            };
             return HttpResponse::new("200 OK", mime, bytes)
-                .with_header("Cache-Control", "private, max-age=86400")
-                .with_header(
-                    "Content-Security-Policy",
-                    "default-src 'none'; style-src 'unsafe-inline'; sandbox",
-                );
+                .with_header("Cache-Control", cache_ctrl)
+                .with_header("Content-Security-Policy", FAVICON_CSP);
+        } else {
+            let now_private = {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                shell.private_browsing_active
+            };
+            if !now_private {
+                let _ = std::fs::create_dir_all(&favicons_dir);
+                let _ = std::fs::write(&miss_path, b"0");
+            }
         }
     }
 
-    let _ = std::fs::write(&miss_path, b"0");
     HttpResponse::text("404 Not Found", "Favicon not found")
         .with_header("Cache-Control", "private, max-age=600")
 }
@@ -9653,10 +11489,10 @@ fn write_http_response(
     } else {
         "Connection: close\r\n"
     };
-    let mut header = String::with_capacity(256 + resp.extra_headers.len() * 48);
+    let mut header = Zeroizing::new(String::with_capacity(256 + resp.extra_headers.len() * 48));
     use std::fmt::Write as _;
     let _ = write!(
-        header,
+        &mut *header,
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
         resp.status,
         resp.content_type,
@@ -9675,11 +11511,16 @@ fn write_http_response(
     }
     header.push_str("\r\n");
 
-    // Single contiguous write avoids Nagle / Delayed-ACK 200ms stalls on Windows loopback!
-    let mut wire = Vec::with_capacity(header.len() + resp.body.len());
+    // Single contiguous write avoids Nagle / Delayed-ACK 200ms stalls on Windows loopback,
+    // and zeroizes the complete wire buffer immediately after writing so vault/token secrets
+    // do not linger in allocator memory.
+    let mut wire = Zeroizing::new(Vec::with_capacity(header.len() + resp.body.len()));
     wire.extend_from_slice(header.as_bytes());
     wire.extend_from_slice(&resp.body);
-    stream.write_all(&wire)
+    let write_res = stream.write_all(wire.as_slice());
+    wire.zeroize();
+    header.zeroize();
+    write_res
 }
 
 fn parse_query_params(q: &str) -> HashMap<String, String> {
@@ -9796,20 +11637,25 @@ pub fn parse_http_url_authority(url: &str) -> Result<(String, u16), &'static str
         None => (authority, default_port),
     };
 
-    if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+    let normalized_host = host.trim_end_matches('.');
+    if normalized_host.is_empty()
+        || !normalized_host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
         return Err("Hostname contains disallowed characters.");
     }
 
-    Ok((host.to_ascii_lowercase(), port))
+    Ok((normalized_host.to_ascii_lowercase(), port))
 }
 
 fn extract_origin_base(url: &str) -> String {
     if let Some(scheme_idx) = url.find("://") {
         let after_scheme = &url[scheme_idx + 3..];
-        if let Some(slash_idx) = after_scheme.find('/') {
-            return url[..scheme_idx + 3 + slash_idx + 1].to_string();
-        }
-        return format!("{}/", url);
+        let auth_end = after_scheme
+            .find(&['/', '?', '#'][..])
+            .unwrap_or(after_scheme.len());
+        return format!("{}/", &url[..scheme_idx + 3 + auth_end]);
     }
     url.to_string()
 }
@@ -10001,5 +11847,204 @@ mod tests {
         );
         same_origin.headers.insert("sec-fetch-site".into(), "same-origin".into());
         assert_eq!(dispatch_http_request(&same_origin, &cfg, &shell).status, "200 OK");
+
+        // 7. Bootstrap response uses CSP nonce without `'unsafe-inline'` in script-src and sets HttpOnly cookie
+        let csp = ok_resp
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-security-policy"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(csp.contains("script-src 'self' 'nonce-"));
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+        let set_cookie = ok_resp
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(set_cookie.contains("singularity_sid="));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn test_svg_sanitizer_blocks_active_payloads_and_allows_clean_svg() {
+        let clean = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs><linearGradient id="g"><stop offset="0" stop-color="#fff"/></linearGradient></defs>
+  <style>.c { fill: url(#g); }</style>
+  <circle class="c" cx="16" cy="16" r="14"/>
+</svg>"##;
+        assert!(is_safe_svg(clean));
+
+        let malicious_cases = [
+            r#"<svg onload="alert(1)"></svg>"#,
+            r#"<svg ev:onload="alert(1)"></svg>"#,
+            r#"<svg><script>alert(1)</script></svg>"#,
+            r#"<svg xmlns:x="http://www.w3.org/2000/svg"><x:script>alert(1)</x:script></svg>"#,
+            r#"<svg><foreignObject><body onload="alert(1)"/></foreignObject></svg>"#,
+            r#"<svg><set attributeName="href" to="javascript:alert(1)"/></svg>"#,
+            r#"<svg><animate onbegin="alert(1)"/></svg>"#,
+            r#"<svg><a xlink:href="&#x6a;avascript:alert(1)">x</a></svg>"#,
+            r#"<svg><image href="javascript:alert(1)"/></svg>"#,
+            r#"<svg><style>@import url("https://evil.test/x.css");</style></svg>"#,
+            r#"<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg>&xxe;</svg>"#,
+            r#"<svg><![CDATA[<script>alert(1)</script>]]></svg>"#,
+        ];
+        for payload in malicious_cases {
+            assert!(!is_safe_svg(payload), "Expected SVG payload to be rejected: {}", payload);
+        }
+    }
+
+    #[test]
+    fn test_origin_base_fqdn_normalization_and_reserved_names() {
+        assert_eq!(
+            extract_origin_base("https://example.com?redirect=https://evil.com/path"),
+            "https://example.com/"
+        );
+        assert_eq!(
+            extract_origin_base("https://example.com#frag/with/slash"),
+            "https://example.com/"
+        );
+        assert_eq!(
+            extract_origin_base("https://example.com/a/b/c?x=1"),
+            "https://example.com/"
+        );
+        assert_eq!(
+            strip_trailing_dot_from_url_host("https://example.com.:8443/path?a=1"),
+            "https://example.com:8443/path?a=1"
+        );
+        assert_eq!(
+            parse_http_url_authority("https://Example.COM./test"),
+            Ok(("example.com".to_string(), 443))
+        );
+        assert!(parse_http_url_authority("https://./test").is_err());
+
+        assert!(is_windows_reserved_device_name("CON"));
+        assert!(is_windows_reserved_device_name("nul.txt"));
+        assert!(is_windows_reserved_device_name("COM9.pdf"));
+        assert!(is_windows_reserved_device_name("lpt1.tar.gz"));
+        assert!(!is_windows_reserved_device_name("console.txt"));
+        assert!(!is_windows_reserved_device_name("report.pdf"));
+
+        assert_eq!(
+            classify_safe_proxy_content_type(Some("application/json; charset=utf-8"), b"{\"a\":1}"),
+            ("application/json; charset=utf-8", false)
+        );
+        assert_eq!(
+            classify_safe_proxy_content_type(Some("text/plain"), b"hello"),
+            ("text/plain; charset=utf-8", false)
+        );
+        assert_eq!(
+            classify_safe_proxy_content_type(
+                Some("image/svg+xml"),
+                b"<svg onload=alert(1)></svg>"
+            ),
+            ("text/plain; charset=utf-8", false)
+        );
+        assert_eq!(
+            classify_safe_proxy_content_type(Some("text/html"), b"<html><body>ok</body></html>"),
+            ("text/html; charset=utf-8", true)
+        );
+    }
+
+    #[test]
+    fn test_auth_on_proxy_favicon_icon_window_id_and_strict_bool() {
+        let shell = Arc::new(Mutex::new(
+            SingularityBrowserShell::launch().expect("Launch shell"),
+        ));
+        let cfg = ServerConfig::new(54323);
+
+        // Unauthenticated requests to proxy, favicon, and extension icon must get 401
+        for path in ["/api/web_proxy", "/api/favicon", "/api/extensions/icon"] {
+            let unauth = make_req("GET", path, "", "127.0.0.1:54323", None, None, "");
+            assert_eq!(
+                dispatch_http_request(&unauth, &cfg, &shell).status,
+                "401 Unauthorized",
+                "Expected 401 on unauthenticated {}",
+                path
+            );
+        }
+
+        // Session cookie authenticates /api/favicon and /api/extensions/icon
+        let mut with_cookie = make_req(
+            "GET",
+            "/api/extensions/icon",
+            "id=../escape",
+            "127.0.0.1:54323",
+            None,
+            None,
+            "",
+        );
+        with_cookie
+            .headers
+            .insert("cookie".into(), format!("singularity_sid={}", cfg.session_cookie));
+        assert_eq!(
+            dispatch_http_request(&with_cookie, &cfg, &shell).status,
+            "400 Bad Request"
+        );
+
+        // Invalid X-Singularity-Window header must be rejected with 400
+        let mut bad_wid = make_req(
+            "POST",
+            "/api/profile/save_tabs",
+            "",
+            "127.0.0.1:54323",
+            Some(&cfg.ipc_token),
+            None,
+            r#"{"tabs":[],"active_index":0}"#,
+        );
+        bad_wid
+            .headers
+            .insert("x-singularity-window".into(), "../../evil".into());
+        assert_eq!(
+            dispatch_http_request(&bad_wid, &cfg, &shell).status,
+            "400 Bad Request"
+        );
+
+        // Invalid boolean value in /api/settings/set must be rejected with 400
+        let bad_bool = make_req(
+            "POST",
+            "/api/settings/set",
+            "",
+            "127.0.0.1:54323",
+            Some(&cfg.ipc_token),
+            None,
+            r#"{"key":"security.site_isolation.strict_origin_keyed_processes","type":"Bool","val":"maybe"}"#,
+        );
+        assert_eq!(
+            dispatch_http_request(&bad_bool, &cfg, &shell).status,
+            "400 Bad Request"
+        );
+
+        // GET /api/clipboard/clear must be rejected with 405 (POST-only authenticated route)
+        let get_clip = make_req(
+            "GET",
+            "/api/clipboard/clear",
+            "",
+            "127.0.0.1:54323",
+            Some(&cfg.ipc_token),
+            None,
+            "",
+        );
+        assert_eq!(
+            dispatch_http_request(&get_clip, &cfg, &shell).status,
+            "405 Method Not Allowed"
+        );
+
+        // Vault unlock rate limiter applies exponential backoff starting at 3rd failure
+        let mut rl = VaultUnlockRateLimiter::default();
+        assert_eq!(rl.record_failure(), 0);
+        assert_eq!(rl.record_failure(), 0);
+        assert!(rl.record_failure() >= 2);
+        assert!(rl.check_locked().is_some());
+        rl.record_success();
+        assert!(rl.check_locked().is_none());
+
+        // CSP nonce injection adds nonce to <script> tags without corrupting JS body
+        let html = "<html><head><script>const s = '<script>';</script></head></html>";
+        let injected = inject_csp_nonce(html, "abc123");
+        assert!(injected.contains("<script nonce=\"abc123\">const s = '<script>';</script>"));
     }
 }

@@ -1,7 +1,7 @@
 //! Singularity OLED Pure Black (`#000000`) 200Hz+ Native UI Shell Orchestrator.
 
 use crate::cursor::CustomCursorEngine;
-use crate::roaming_store::{unix_now, RoamingSingularityStore};
+use crate::roaming_store::{RoamingSingularityStore, SavedTabEntry, TabHandoffPayload};
 use crate::theme::SingularityThemeManifest;
 use crate::vim::VimModalEngine;
 use singularity_core::SingularityCoreOrchestrator;
@@ -9,9 +9,11 @@ use singularity_media::{DirectStreamRecorder, OledMediaPlayer, TenBandParametric
 use singularity_settings_registry::{
     schema::{SettingCategory, SettingValue},
     search::VirtualizedViewport,
+    storage::TomlSettingsSnapshot,
 };
 use singularity_vault::{Argon2idConfig, SingularityVault};
 use std::sync::Arc;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 /// Interactive Argon2id parameters (19 MiB OWASP recommended profile for fast desktop unlock + strong GPU resistance).
@@ -41,7 +43,8 @@ pub struct SingularityBrowserShell {
     pub private_browsing_active: bool,
     /// Verified master password kept strictly in zeroized Rust memory (never cached in JS).
     verified_vault_master: Option<Zeroizing<Vec<u8>>>,
-    vault_last_activity_unix: u64,
+    /// Monotonic clock timestamp immune to wall-clock / NTP jumps.
+    vault_last_activity: Instant,
     pub vault_auto_lock_secs: u64,
 }
 
@@ -63,34 +66,63 @@ impl SingularityBrowserShell {
         force_new_window: bool,
     ) -> Result<Self, String> {
         let mut core = SingularityCoreOrchestrator::boot()?;
-        let roaming = RoamingSingularityStore::open_default_with_launch_args(
+        let mut roaming = RoamingSingularityStore::open_default_with_launch_args(
             detach_handoff_id,
             restore_session_id,
             force_new_window,
         )?;
 
         // Restore persisted user overrides across the 2,165 settings registry from `%APPDATA%\.singularity\settings.toml`
+        // and inspect any explicit `mullvad.killswitch.*` entries so they are never clobbered by default `false`.
+        let mut toml_strict_override: Option<bool> = None;
+        let mut toml_block_lan_override: Option<bool> = None;
         if let Some(saved_toml) = roaming.load_settings_toml() {
+            if let Ok(snap) = TomlSettingsSnapshot::from_toml_str(&saved_toml) {
+                for key in [
+                    "mullvad.killswitch.strict_socket_drop",
+                    "mullvad.killswitch.strict_fail_closed",
+                ] {
+                    if let Some(SettingValue::Bool(b)) = snap.overrides.get(key) {
+                        toml_strict_override = Some(*b);
+                    }
+                }
+                for key in [
+                    "mullvad.killswitch.block_lan_traffic",
+                    "mullvad.killswitch.block_lan_rfc1918",
+                ] {
+                    if let Some(SettingValue::Bool(b)) = snap.overrides.get(key) {
+                        toml_block_lan_override = Some(*b);
+                    }
+                }
+            }
             let _ = core.settings.import_toml(&saved_toml);
         }
 
         // Configure Mullvad Kill-Switch for real end users:
         // By default, users without a Mullvad subscription browse freely with Singularity Shields active.
-        // If the user enabled strict kill-switch or auto-connect with a saved encrypted Mullvad account, restore it.
+        // Preserve strict kill-switch activation from EITHER `roaming.profile.strict_mullvad_killswitch`
+        // OR explicit `mullvad.killswitch.*` overrides in `settings.toml` (never overwrite an enabled
+        // `settings.toml` kill-switch with the profile's default `false`).
+        let effective_strict =
+            roaming.profile.strict_mullvad_killswitch || toml_strict_override.unwrap_or(false);
+        let effective_block_lan = toml_block_lan_override.unwrap_or(effective_strict);
         core.mullvad_vpn
             .kill_switch()
-            .set_strict_enabled(roaming.profile.strict_mullvad_killswitch);
+            .set_strict_enabled(effective_strict);
         core.mullvad_vpn
             .kill_switch()
-            .set_block_lan_rfc1918(roaming.profile.strict_mullvad_killswitch);
+            .set_block_lan_rfc1918(effective_block_lan);
+        roaming.profile.strict_mullvad_killswitch = effective_strict;
 
         // Wire live hot-reload hook so kill-switch changes in the 2,165 Settings Registry apply immediately
         let ks_arc = Arc::clone(core.mullvad_vpn.kill_switch());
         core.settings.register_hot_reload_hook(Arc::new(move |evt| {
             if let SettingValue::Bool(b) = evt.new_value {
                 match evt.key.as_str() {
-                    "mullvad.killswitch.strict_fail_closed" => ks_arc.set_strict_enabled(b),
-                    "mullvad.killswitch.block_lan_rfc1918" => ks_arc.set_block_lan_rfc1918(b),
+                    "mullvad.killswitch.strict_socket_drop"
+                    | "mullvad.killswitch.strict_fail_closed" => ks_arc.set_strict_enabled(b),
+                    "mullvad.killswitch.block_lan_traffic"
+                    | "mullvad.killswitch.block_lan_rfc1918" => ks_arc.set_block_lan_rfc1918(b),
                     _ => {}
                 }
             }
@@ -116,8 +148,13 @@ impl SingularityBrowserShell {
         // Always start locked until the user authenticates or creates a master password
         let vault = SingularityVault::new_locked(DESKTOP_VAULT_KDF);
 
+        let initial_tab_title = if roaming.profile.language.eq_ignore_ascii_case("fr") {
+            "Singularity • Nouvel onglet"
+        } else {
+            "Singularity • New Tab"
+        };
         core.tab_manager.open_tab(
-            "Singularity • Nouvel onglet",
+            initial_tab_title,
             "singularity://newtab",
             "singularity.internal",
             &core.chromium_bridge,
@@ -138,15 +175,83 @@ impl SingularityBrowserShell {
             settings_scroll_offset_px: 0,
             private_browsing_active: false,
             verified_vault_master: None,
-            vault_last_activity_unix: unix_now(),
+            vault_last_activity: Instant::now(),
             vault_auto_lock_secs: DEFAULT_VAULT_AUTO_LOCK_SECS,
         };
         shell.sync_runtime_from_settings();
         Ok(shell)
     }
 
-    /// Synchronizes live subsystem settings (media EQ boost, tab freezer timeout, vault KDF, auto-lock)
-    /// from the 2,165 Settings Registry so UI changes take immediate runtime effect.
+    /// Enqueues validated positional URLs passed on the CLI (e.g. Linux `.desktop` `%U` or OS
+    /// default-browser invocation) so the browser opens and focuses them immediately on launch.
+    pub fn enqueue_cli_launch_urls(&mut self, urls: &[String]) {
+        let mut valid_urls: Vec<String> = Vec::new();
+        for raw in urls.iter().take(32) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.len() > 8192
+                || trimmed.chars().any(|c| c.is_control())
+            {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            let is_http = (lower.starts_with("https://") && trimmed.len() > 8)
+                || (lower.starts_with("http://") && trimmed.len() > 7);
+            let is_safe_settings = lower == "singularity://settings"
+                || (lower.starts_with("singularity://settings/")
+                    && trimmed.len() <= 64
+                    && trimmed["singularity://settings/".len()..]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+            if (is_http || is_safe_settings) && !valid_urls.iter().any(|u| u == trimmed) {
+                valid_urls.push(trimmed.to_string());
+            }
+        }
+        if valid_urls.is_empty() {
+            return;
+        }
+        if !self.roaming.profile.restore_session && self.roaming.startup_handoff.is_none() {
+            self.roaming.profile.saved_tabs.clear();
+            self.roaming.profile.saved_tab_groups.clear();
+            self.roaming.profile.active_tab_index = 0;
+        }
+        let first_idx = self.roaming.profile.saved_tabs.len();
+        for url in &valid_urls {
+            let title = url
+                .split("://")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .filter(|host| !host.is_empty())
+                .unwrap_or(url.as_str())
+                .to_string();
+            self.roaming.profile.saved_tabs.push(SavedTabEntry {
+                title,
+                url: url.clone(),
+                media_time_sec: None,
+                scroll_y: None,
+                group_id: None,
+                favicon_url: None,
+            });
+        }
+        self.roaming.profile.active_tab_index = first_idx;
+        if !self.roaming.profile.restore_session && self.roaming.startup_handoff.is_none() {
+            if let Some(first) = self.roaming.profile.saved_tabs.get(first_idx) {
+                self.roaming.startup_handoff = Some(TabHandoffPayload {
+                    url: first.url.clone(),
+                    title: first.title.clone(),
+                    favicon_url: None,
+                    media_time_sec: None,
+                    scroll_y: None,
+                    pos_x: None,
+                    pos_y: None,
+                });
+            }
+        }
+    }
+
+    /// Synchronizes live subsystem settings (media EQ boost, tab freezer timeout, vault KDF, auto-lock,
+    /// and Mullvad kill-switch profile persistence) from the 2,165 Settings Registry so UI changes
+    /// take immediate runtime effect and survive restarts coherently.
     pub fn sync_runtime_from_settings(&mut self) {
         if let Some(boost) = self
             .core
@@ -201,25 +306,29 @@ impl SingularityBrowserShell {
                 self.vault_auto_lock_secs = (mins as u64).saturating_mul(60);
             }
         }
+        let ks_strict = self.core.mullvad_vpn.kill_switch().is_strict_enabled();
+        if self.roaming.profile.strict_mullvad_killswitch != ks_strict {
+            self.roaming.profile.strict_mullvad_killswitch = ks_strict;
+            let _ = self.roaming.save_profile();
+        }
     }
 
-    /// Locks the vault automatically if inactivity exceeds `vault_auto_lock_secs`.
+    /// Locks the vault automatically if monotonic inactivity exceeds `vault_auto_lock_secs`.
     pub fn enforce_vault_auto_lock(&mut self) {
         if !self.vault.is_locked() && self.vault_auto_lock_secs > 0 {
-            let now = unix_now();
-            if now.saturating_sub(self.vault_last_activity_unix) >= self.vault_auto_lock_secs {
+            if self.vault_last_activity.elapsed().as_secs() >= self.vault_auto_lock_secs {
                 self.lock_vault();
             }
         }
     }
 
     pub fn touch_vault_activity(&mut self) {
-        self.vault_last_activity_unix = unix_now();
+        self.vault_last_activity = Instant::now();
     }
 
     pub fn set_verified_vault_master(&mut self, master: Vec<u8>) {
         self.verified_vault_master = Some(Zeroizing::new(master));
-        self.vault_last_activity_unix = unix_now();
+        self.vault_last_activity = Instant::now();
     }
 
     pub fn lock_vault(&mut self) {
@@ -238,7 +347,7 @@ impl SingularityBrowserShell {
             .export_encrypted_vault(master.as_slice())
             .map_err(|e| e.to_string())?;
         self.roaming.write_vault_envelope_to_disk(&sealed)?;
-        self.vault_last_activity_unix = unix_now();
+        self.vault_last_activity = Instant::now();
         Ok(())
     }
 
@@ -248,7 +357,7 @@ impl SingularityBrowserShell {
             .verified_vault_master
             .as_ref()
             .ok_or_else(|| "Vault is locked".to_string())?;
-        self.vault_last_activity_unix = unix_now();
+        self.vault_last_activity = Instant::now();
         self.vault
             .export_encrypted_vault(master.as_slice())
             .map_err(|e| e.to_string())

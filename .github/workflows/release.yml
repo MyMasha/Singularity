@@ -7,20 +7,54 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (e.g. v2.0.8)"
+        description: "Release tag to build and publish assets for (required when publishing, e.g. v2.0.8)"
         required: false
-        default: "v2.0.8"
+        default: ""
       publish:
         description: "Whether to publish assets to GitHub Releases (set false for CI verification dry-runs)"
         type: boolean
         required: false
         default: true
+      allow_clobber:
+        description: "Allow overwriting existing assets on an already-published release (default: false)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  prepare-signing-key:
+    runs-on: ubuntu-latest
+    outputs:
+      pubkey_hex: ${{ steps.derive.outputs.pubkey_hex }}
+    steps:
+      - name: Derive Ed25519 release signing public key (hex)
+        id: derive
+        env:
+          SIGNING_KEY_PEM: ${{ secrets.SINGULARITY_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${SIGNING_KEY_PEM}" ]; then
+            echo "pubkey_hex=" >> "${GITHUB_OUTPUT}"
+            echo "[INFO] SINGULARITY_RELEASE_SIGNING_KEY not configured; building without embedded Ed25519 public key."
+            exit 0
+          fi
+          umask 077
+          trap 'rm -f /tmp/ed25519_key.pem' EXIT
+          rm -f /tmp/ed25519_key.pem
+          printf '%s\n' "${SIGNING_KEY_PEM}" > /tmp/ed25519_key.pem
+          PUBKEY_HEX="$(openssl pkey -in /tmp/ed25519_key.pem -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          shred -u /tmp/ed25519_key.pem 2>/dev/null || rm -f /tmp/ed25519_key.pem
+          if [[ ! "${PUBKEY_HEX}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "[ERROR] Failed to derive valid 64-hex Ed25519 public key from SINGULARITY_RELEASE_SIGNING_KEY." >&2
+            exit 1
+          fi
+          echo "pubkey_hex=${PUBKEY_HEX}" >> "${GITHUB_OUTPUT}"
+          echo "[OK] Derived Ed25519 release public key (${PUBKEY_HEX})."
+
   build-linux:
+    needs: [prepare-signing-key]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -40,6 +74,7 @@ jobs:
       - name: Build static Linux x86_64 release binary
         env:
           RUSTFLAGS: "-C target-feature=+crt-static --remap-path-prefix=${{ github.workspace }}=/src"
+          SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX: ${{ needs.prepare-signing-key.outputs.pubkey_hex }}
         run: cargo build --release --locked --target x86_64-unknown-linux-musl --bin singularity
 
       - name: Package Linux distributions (Debian, Ubuntu, Mint, Bazzite)
@@ -57,6 +92,7 @@ jobs:
           path: release-artifacts/*
 
   build-windows:
+    needs: [prepare-signing-key]
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -95,10 +131,11 @@ jobs:
       - name: Run workspace tests on Windows
         run: cargo test --workspace --locked
 
-      - name: Build Pure Chromium (CEF) Windows browser and self-contained installer
+      - name: Build Pure Chromium (CEF) Windows browser and installer stub
         shell: pwsh
         env:
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/src"
+          SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX: ${{ needs.prepare-signing-key.outputs.pubkey_hex }}
         run: |
           cargo build --release --locked --bin singularity
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -111,10 +148,19 @@ jobs:
           cargo build --release --locked --bin Singularity-Setup
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Seal and sign SGX1 SFX Windows installer overlay
+        shell: pwsh
+        env:
+          SINGULARITY_RELEASE_SIGNING_KEY: ${{ secrets.SINGULARITY_RELEASE_SIGNING_KEY }}
+          SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX: ${{ needs.prepare-signing-key.outputs.pubkey_hex }}
+        run: |
           New-Item -ItemType Directory -Force -Path release-artifacts | Out-Null
           python scripts/package-windows-cef.py --attach-sfx target\release\Singularity-Setup.exe dist\singularity-bundle.zip release-artifacts\Singularity-setup.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Verify SFX integrity and run real Windows CEF end-to-end smoke tests
+        shell: pwsh
+        run: |
           & release-artifacts\Singularity-setup.exe --verify-only
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -222,6 +268,9 @@ jobs:
             singularity-linux-x86_64 > SHA256SUMS.txt
           cat SHA256SUMS.txt
           if [ -n "${SIGNING_KEY_PEM}" ]; then
+            umask 077
+            trap 'rm -f /tmp/ed25519_key.pem' EXIT
+            rm -f /tmp/ed25519_key.pem
             printf '%s\n' "${SIGNING_KEY_PEM}" > /tmp/ed25519_key.pem
             chmod 600 /tmp/ed25519_key.pem
             openssl pkeyutl -sign -inkey /tmp/ed25519_key.pem -rawin -in SHA256SUMS.txt | base64 -w0 > SHA256SUMS.txt.sig
@@ -234,22 +283,33 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           INPUT_TAG: ${{ inputs.tag }}
+          ALLOW_CLOBBER: ${{ inputs.allow_clobber }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             TARGET_TAG="${GITHUB_REF_NAME}"
           elif [ -n "${INPUT_TAG}" ]; then
             TARGET_TAG="${INPUT_TAG}"
           else
-            TARGET_TAG="v2.0.8"
+            echo "[ERROR] Missing release tag: trigger via a vX.Y.Z git tag push or provide the 'tag' workflow_dispatch input." >&2
+            exit 1
           fi
-          if ! gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release create "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes
+          if [[ ! "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?$ ]]; then
+            echo "[ERROR] Invalid release tag '${TARGET_TAG}' (must match ^v[0-9]+\\.[0-9]+\\.[0-9]+([.-][0-9A-Za-z]+)?$)." >&2
+            exit 1
           fi
+
+          RELEASE_EXISTS="false"
+          if gh release view --repo "${GITHUB_REPOSITORY}" -- "${TARGET_TAG}" >/dev/null 2>&1; then
+            RELEASE_EXISTS="true"
+          else
+            gh release create --repo "${GITHUB_REPOSITORY}" --title "Singularity Browser ${TARGET_TAG}" --generate-notes -- "${TARGET_TAG}"
+          fi
+
           ASSETS=(
             "artifacts/Singularity-setup.exe#Singularity-setup.exe"
             "artifacts/Singularity-Debian.deb#Singularity.(Debian)"
             "artifacts/Singularity-Ubuntu.deb#Singularity.(Ubuntu)"
-            "artifacts/Singularity-Bazzite.rpm#Singularity.(Bazzit)"
+            "artifacts/Singularity-Bazzite.rpm#Singularity.(Bazzite)"
             "artifacts/Singularity-Mint.deb#Singularity.(Mint)"
             "artifacts/singularity.exe"
             "artifacts/singularity-linux-x86_64"
@@ -258,4 +318,9 @@ jobs:
           if [ -f artifacts/SHA256SUMS.txt.sig ]; then
             ASSETS+=(artifacts/SHA256SUMS.txt.sig)
           fi
-          gh release upload "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${ASSETS[@]}"
+
+          if [ "${RELEASE_EXISTS}" = "true" ] && [ "${ALLOW_CLOBBER}" = "true" ]; then
+            gh release upload --repo "${GITHUB_REPOSITORY}" --clobber -- "${TARGET_TAG}" "${ASSETS[@]}"
+          else
+            gh release upload --repo "${GITHUB_REPOSITORY}" -- "${TARGET_TAG}" "${ASSETS[@]}"
+          fi

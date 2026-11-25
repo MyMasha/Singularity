@@ -3,9 +3,14 @@
 use serde::{Deserialize, Serialize};
 
 pub const OLED_PURE_BLACK: &str = "#000000";
-pub const OBSIDIAN_BORDER: &str = "#141414";
-pub const ACCRETION_VIOLET: &str = "#6E00FF";
-pub const ACCRETION_CYAN: &str = "#00F0FF";
+pub const OLED_ELEVATED_SURFACE: &str = "#0C0D12";
+pub const OLED_BAR_BACKGROUND: &str = "#0B0C10";
+pub const OBSIDIAN_BORDER: &str = "#1A1B20";
+pub const ACCRETION_GOLD: &str = "#F0B254";
+pub const ACCRETION_GOLD_BRIGHT: &str = "#FFDF9E";
+pub const ACCRETION_VIOLET: &str = "#B975FF";
+pub const ACCRETION_CYAN: &str = "#38D9F5";
+pub const TOP_BAR_HEIGHT_PX: u32 = 46;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabBarPlacement {
@@ -39,16 +44,16 @@ impl Default for SingularityThemeManifest {
         Self {
             theme_name: "Singularity Event Horizon OLED".into(),
             background_oled_hex: OLED_PURE_BLACK.into(),
-            surface_elevated_hex: "#070709".into(),
+            surface_elevated_hex: OLED_ELEVATED_SURFACE.into(),
             border_obsidian_hex: OBSIDIAN_BORDER.into(),
             accent_violet_hex: ACCRETION_VIOLET.into(),
             accent_cyan_hex: ACCRETION_CYAN.into(),
-            text_primary_hex: "#F4F4F6".into(),
-            text_muted_hex: "#7A7A85".into(),
-            ui_font_family: "Geist Sans".into(),
-            mono_font_family: "JetBrains Mono".into(),
-            target_refresh_rate_hz: 240,
-            tab_bar_placement: TabBarPlacement::VerticalLeftCollapsible,
+            text_primary_hex: "#F5F3EE".into(),
+            text_muted_hex: "#5C5E65".into(),
+            ui_font_family: "-apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI Variable Display\", \"Segoe UI\", system-ui, sans-serif".into(),
+            mono_font_family: "\"SF Mono\", \"Cascadia Code\", \"Consolas\", ui-monospace, monospace".into(),
+            target_refresh_rate_hz: 60,
+            tab_bar_placement: TabBarPlacement::TopCompact,
             black_hole_schwarzschild_radius: 1.0,
             black_hole_kerr_spin: 0.94,
         }

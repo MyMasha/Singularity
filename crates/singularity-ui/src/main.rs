@@ -86,9 +86,47 @@ fn main() {
     let verify_only = args.iter().any(|a| a == "--verify-only");
     let force_new_window = args.iter().any(|a| a == "--new-window");
 
-    // Install Rust panic + native Windows SEH unhandled-exception crash detectors with automatic
-    // copyable error report popup before booting the browser engine (skipped in headless CI modes).
-    if !smoke_test_cef && !verify_only {
+    // 2b. `--verify-only`: validate engine boot without consuming/deleting any handoff,
+    //     restore-session, planned-restart, or dead-window session files!
+    if verify_only {
+        match SingularityBrowserShell::launch_with_launch_args(None, None, true) {
+            Ok(shell) => {
+                println!(
+                    "Singularity v{} Engine: OK ({} settings wired, roaming dir: {})",
+                    env!("CARGO_PKG_VERSION"),
+                    shell.core.settings.len(),
+                    shell.roaming.root_dir().display()
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed to boot Singularity Browser Engine: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // 3. Self-healing Pure Chromium (CEF) runtime check on Windows BEFORE consuming any
+    //    handoff/session files: if `libcef.dll` is missing and we bootstrap & return, all
+    //    pending session/handoff files remain intact for the subsequent relaunch.
+    #[cfg(target_os = "windows")]
+    {
+        if !singularity_ui::updater::has_local_cef_runtime() {
+            if smoke_test_cef {
+                eprintln!("Smoke test failed: missing local CEF runtime alongside singularity.exe");
+                std::process::exit(1);
+            }
+            if let Err(err) = singularity_ui::updater::bootstrap_missing_cef_runtime() {
+                singularity_ui::updater::show_missing_cef_error_dialog(&err);
+            }
+            return;
+        }
+        singularity_ui::updater::configure_local_cef_dll_directory();
+    }
+
+    // Install Rust panic + native Windows SEH unhandled-exception crash detectors before booting
+    // the browser engine (skipped in headless smoke/verify CI modes).
+    if !smoke_test_cef {
         singularity_ui::crash_guard::install_crash_handlers(
             &singularity_ui::resolve_roaming_singularity_dir(),
         );
@@ -102,8 +140,9 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--restore-session")
         .map(|w| w[1].clone());
+    let launch_urls = extract_positional_launch_urls(&args);
 
-    let shell = match SingularityBrowserShell::launch_with_launch_args(
+    let mut shell = match SingularityBrowserShell::launch_with_launch_args(
         detach_handoff_id.as_deref(),
         restore_session_id.as_deref(),
         force_new_window,
@@ -118,33 +157,8 @@ fn main() {
         }
     };
 
-    if std::env::args().any(|a| a == "--verify-only") {
-        println!(
-            "Singularity v{} Engine: OK ({} settings wired, roaming dir: {})",
-            env!("CARGO_PKG_VERSION"),
-            shell.core.settings.len(),
-            shell.roaming.root_dir().display()
-        );
-        return;
-    }
-
-    // 3. Self-healing Pure Chromium (CEF) runtime check on Windows:
-    //    If a user upgraded in-place from v1.0.x (Edge WebView2) via the in-app updater or ran
-    //    standalone `singularity.exe` without `libcef.dll`, automatically download & verify
-    //    `Singularity-setup.exe` and silently install the CEF runtime beside `singularity.exe`.
-    #[cfg(target_os = "windows")]
-    {
-        if !singularity_ui::updater::has_local_cef_runtime() {
-            if smoke_test_cef {
-                eprintln!("Smoke test failed: missing local CEF runtime alongside singularity.exe");
-                std::process::exit(1);
-            }
-            if let Err(err) = singularity_ui::updater::bootstrap_missing_cef_runtime() {
-                singularity_ui::updater::show_missing_cef_error_dialog(&err);
-            }
-            return;
-        }
-        singularity_ui::updater::configure_local_cef_dll_directory();
+    if !launch_urls.is_empty() {
+        shell.enqueue_cli_launch_urls(&launch_urls);
     }
 
     if smoke_test_cef {
@@ -184,4 +198,59 @@ fn main() {
     if let Err(err) = run_interactive_browser_app(shell) {
         eprintln!("Singularity runtime error: {}", err);
     }
+}
+
+/// Parses positional URL arguments (`http://`, `https://`, or safe `singularity://settings*`)
+/// passed on the CLI (such as Linux `.desktop` `%U` invocations or OS default-browser links),
+/// skipping flags and flag values.
+fn extract_positional_launch_urls(args: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--wait-pid",
+        "--detach-handoff",
+        "--restore-session",
+        "--smoke-log",
+        "--smoke-cef-log",
+        "--smoke-profile",
+        "--type",
+    ];
+    let mut urls = Vec::new();
+    let mut after_double_dash = false;
+    let mut i = 1usize;
+    while i < args.len() {
+        let arg = args[i].trim();
+        if !after_double_dash {
+            if arg == "--" {
+                after_double_dash = true;
+                i += 1;
+                continue;
+            }
+            if VALUE_FLAGS.contains(&arg) {
+                i += 2;
+                continue;
+            }
+            if arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        if !arg.is_empty() && arg.len() <= 8192 && !arg.chars().any(|c| c.is_control()) {
+            let lower = arg.to_ascii_lowercase();
+            let is_http = (lower.starts_with("https://") && arg.len() > 8)
+                || (lower.starts_with("http://") && arg.len() > 7);
+            let is_safe_settings = lower == "singularity://settings"
+                || (lower.starts_with("singularity://settings/")
+                    && arg.len() <= 64
+                    && arg["singularity://settings/".len()..]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+            if (is_http || is_safe_settings) && !urls.iter().any(|u| u == arg) {
+                urls.push(arg.to_string());
+                if urls.len() >= 32 {
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    urls
 }
