@@ -728,7 +728,7 @@ mod tests {
         assert!(!server_src.contains("Command::new(\"curl.exe\")"));
         assert!(server_src.contains("LOAD_LIBRARY_SEARCH_SYSTEM32"));
         assert!(server_src.contains("Fullscreen::Borderless(None)"));
-        assert!(server_src.contains("fullscreenchange"));
+        assert!(server_src.contains("CefCallbackEvent::FullscreenChanged"));
         assert!(server_src.contains("consume_bootstrap_nonce"));
 
         let updater_src = include_str!("updater.rs");
@@ -789,11 +789,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.9");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.10");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.9"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1186,7 +1186,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.9"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1353,7 +1353,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.9"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.10"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1438,7 +1438,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.9"));
+        assert!(txt.contains("v2.0.10"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1472,7 +1472,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.9"));
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
     }
 
     #[test]
@@ -1547,7 +1547,7 @@ mod tests {
         // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.9"}"#,
+            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.10"}"#,
         )
         .expect("write running.lock");
         let sessions_dir = tmp_dir.join("sessions");
@@ -1613,7 +1613,7 @@ mod tests {
         // even after the new process truncates `cef.log`!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.9"}"#,
+            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.10"}"#,
         )
         .expect("write dead lock");
         std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
@@ -1776,7 +1776,7 @@ mod tests {
         assert!(server_src.contains("fn perform_tab_zoom"));
         assert!(server_src.contains("MouseButton::Other(xbtn)"));
         assert!(server_src.contains("VK_XBUTTON1"));
-        assert!(server_src.contains("e.button === 3"));
+        assert!(server_src.contains("VK_XBUTTON2"));
         assert!(server_src.contains("/api/bookmarks/import-file"));
         assert!(server_src.contains("/api/bookmarks/export-html"));
 
@@ -1945,8 +1945,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.9");
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.9"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.10");
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -2054,9 +2054,9 @@ mod tests {
         assert!(prog_json.get("percent").is_some());
         assert!(prog_json.get("speed_bps").is_some());
 
-        // 6. Verify v2.0.9 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.9");
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.9"));
+        // 6. Verify v2.0.10 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.10");
+        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
         assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
         assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
         assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));
@@ -2087,6 +2087,36 @@ mod tests {
         assert!(cef_src.contains("enable-unsafe-extension-debugging"));
         assert!(cef_src.contains("Extensions.loadUnpacked"));
         assert!(cef_src.contains("Extensions.uninstall"));
+    }
+
+    #[test]
+    fn test_windows_updater_and_cef_renderer_stability_invariants() {
+        // 1. Official Win32 WINHTTP_OPTION_CONNECTION_INFO must be 93 (not invalid 120),
+        //    otherwise every Windows update check / download fails with ERROR_WINHTTP_INVALID_OPTION.
+        assert_eq!(winhttp_client::WINHTTP_OPTION_CONNECTION_INFO, 93);
+
+        // 2. Windows MSVC binary must reserve an 8 MiB stack so CEF renderer subprocesses do not
+        //    hit STATUS_STACK_OVERFLOW (`status=2, code=-36861, Crashpad_NotConnectedToHandler`).
+        let build_src = include_str!("../build.rs");
+        assert!(build_src.contains("/STACK:0x800000"));
+        assert!(build_src.contains("/DEPENDENTLOADFLAG:0x800"));
+
+        // 3. CEF Alloy runtime must disable RenderDocument alongside BackForwardCache (cef#4348)
+        //    and guard frame validity before accessing frame URLs or executing JS in renderer.
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("BackForwardCache,RenderDocument,"));
+        assert!(cef_src.contains("if frame.is_valid() == 0"));
+
+        // 4. Web tabs and extension popups must not inject dead JS scripts referencing removed window.ipc,
+        //    and RenderProcessTerminated must ignore closed tabs and support single-shot tab reload.
+        let server_src = include_str!("server.rs");
+        assert!(!server_src.contains("CONTENT_LINK_INTENT_SCRIPT"));
+        assert!(!server_src.contains("EXT_POPUP_INIT_SCRIPT"));
+        assert!(server_src.contains("tab_crash_recoveries"));
+
+        // 5. WebGL renderSolarOrEclipse uses a structured single-return variable (zero ANGLE HLSL X4000).
+        assert!(SINGULARITY_UI_HTML.contains("vec3 result = vec3(0.0);"));
+        assert!(SINGULARITY_UI_HTML.contains("return result;"));
     }
 }
 

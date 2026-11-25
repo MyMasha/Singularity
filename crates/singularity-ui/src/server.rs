@@ -1033,6 +1033,7 @@ fn run_windows_frameless_browser(
         tab_scroll_ys: HashMap<u64, u32>,
         tab_bg_intents: HashMap<u64, BgLinkIntent>,
         last_favicon_at: HashMap<u64, std::time::Instant>,
+        tab_crash_recoveries: HashMap<u64, u8>,
         layout_cache: WebViewLayoutCache,
         active_tab_id: u64,
         web_visible: bool,
@@ -2483,251 +2484,10 @@ fn run_windows_frameless_browser(
         }
     }
 
-    const EXT_POPUP_INIT_SCRIPT: &str = r##"(function(){
-  const popupHookToken = Symbol();
-  if (!popupHookToken) return;
-  document.addEventListener("keydown", function(e) {
-    if (e && e.isTrusted !== false && e.key === "Escape") {
-      try {
-        window.ipc && window.ipc.postMessage(JSON.stringify({ k: "close_ext_popup" }));
-      } catch (_) {}
-    }
-  }, true);
-})();"##;
-
-    const CONTENT_LINK_INTENT_SCRIPT: &str = r##"(function(){
-  const hookToken = Symbol();
-  if (!hookToken) return;
-  const postIpc = (window.ipc && typeof window.ipc.postMessage === "function")
-    ? window.ipc.postMessage.bind(window.ipc)
-    : null;
-  if (!postIpc) return;
-  function findAnchor(e) {
-    if (typeof e.composedPath === "function") {
-      for (const n of e.composedPath()) {
-        if (n && n.tagName === "A" && n.href) return n;
-      }
-    }
-    return e.target && e.target.closest ? e.target.closest("a[href]") : null;
-  }
-  function cleanTitle(s) {
-    return String(s || "").replace(/\s+/g, " ").trim().slice(0, 120);
-  }
-  function extractTitle(a) {
-    let t = cleanTitle(a.getAttribute("title") || a.getAttribute("aria-label") || a.innerText);
-    if (!t || a.id === "thumbnail" || /^\d{1,2}:\d{2}(?::\d{2})?(?:\s|$)/.test(t)) {
-      const card = a.closest(
-        "ytd-rich-item-renderer,ytd-video-renderer,ytd-compact-video-renderer,ytd-grid-video-renderer,ytd-playlist-video-renderer,yt-lockup-view-model,article,[role='article']"
-      );
-      if (card) {
-        const el = card.querySelector("#video-title,a#video-title-link,h3,h2,a[title]");
-        if (el) {
-          t = cleanTitle(el.getAttribute("title") || el.getAttribute("aria-label") || el.innerText);
-        }
-      }
-    }
-    return t;
-  }
-  function report(kind, e) {
-    if (!e || e.isTrusted === false) return;
-    const a = findAnchor(e);
-    if (!a || !/^https?:\/\//i.test(a.href)) return;
-    try {
-      postIpc(JSON.stringify({ k: kind, u: a.href, t: extractTitle(a) }));
-    } catch (_) {}
-  }
-  document.addEventListener("mousedown", function(e) {
-    if (!e || e.isTrusted === false) return;
-    if (e.button === 3) {
-      sendShortcut("web_back", 0, e);
-      return;
-    }
-    if (e.button === 4) {
-      sendShortcut("web_forward", 0, e);
-      return;
-    }
-    if (e.button === 1 || (e.button === 0 && (e.ctrlKey || e.metaKey))) report("bg_click", e);
-  }, true);
-  document.addEventListener("mouseup", function(e) {
-    if (e && e.isTrusted !== false && (e.button === 3 || e.button === 4)) {
-      try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
-    }
-  }, true);
-  document.addEventListener("auxclick", function(e) {
-    if (!e || e.isTrusted === false) return;
-    if (e.button === 3 || e.button === 4) {
-      try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
-      return;
-    }
-    if (e.button === 1) report("bg_click", e);
-  }, true);
-  document.addEventListener("wheel", function(e) {
-    if (!e || e.isTrusted === false) return;
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.deltaY !== 0) {
-      sendShortcut(e.deltaY < 0 ? "zoom_in" : "zoom_out", 0, e);
-    }
-  }, { capture: true, passive: false });
-  document.addEventListener("contextmenu", function(e) {
-    report("context_link", e);
-  }, true);
-
-  function sendShortcut(action, idx, e) {
-    try {
-      e.preventDefault();
-      e.stopPropagation();
-    } catch (_) {}
-    try {
-      const msg = idx ? { k: "shortcut", a: action, n: idx } : { k: "shortcut", a: action };
-      postIpc(JSON.stringify(msg));
-    } catch (_) {}
-  }
-  document.addEventListener("keydown", function(e) {
-    if (!e || e.isTrusted === false) return;
-    const ctrl = (e.ctrlKey || e.metaKey) && !e.altKey;
-    const alt = e.altKey && !e.ctrlKey && !e.metaKey;
-    const k = String(e.key || "").toLowerCase();
-    const code = String(e.code || "");
-    if (!e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && (code === "F11" || e.key === "F11")) {
-      sendShortcut("toggle_fullscreen", 0, e);
-    } else if (ctrl && e.shiftKey && (k === "t" || code === "KeyT")) {
-      sendShortcut("reopen_closed_tab", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "t" || code === "KeyT")) {
-      sendShortcut("new_tab", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "n" || code === "KeyN")) {
-      sendShortcut("new_window", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "w" || code === "F4")) {
-      sendShortcut("close_active_tab", 0, e);
-    } else if (ctrl && e.shiftKey && (k === "tab" || code === "Tab")) {
-      sendShortcut("prev_tab", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "tab" || code === "Tab" || code === "PageDown")) {
-      sendShortcut("next_tab", 0, e);
-    } else if (ctrl && !e.shiftKey && code === "PageUp") {
-      sendShortcut("prev_tab", 0, e);
-    } else if ((ctrl && !e.shiftKey && (k === "l" || code === "KeyL")) || (alt && !e.shiftKey && (k === "d" || code === "KeyD")) || (!e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && code === "F6")) {
-      sendShortcut("focus_omnibar", 0, e);
-    } else if ((ctrl && !e.shiftKey && (k === "r" || code === "KeyR")) || (!e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && code === "F5")) {
-      sendShortcut("reload_tab", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "d" || code === "KeyD")) {
-      sendShortcut("toggle_bookmark", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "h" || code === "KeyH")) {
-      sendShortcut("open_history", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === ",")) {
-      sendShortcut("open_settings", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "+" || k === "=" || code === "Equal" || code === "NumpadAdd")) {
-      sendShortcut("zoom_in", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "-" || code === "Minus" || code === "NumpadSubtract")) {
-      sendShortcut("zoom_out", 0, e);
-    } else if (ctrl && !e.shiftKey && (k === "0" || code === "Digit0" || code === "Numpad0")) {
-      sendShortcut("zoom_reset", 0, e);
-    } else if (ctrl && !e.shiftKey && /^[1-9]$/.test(k)) {
-      sendShortcut("jump_tab", parseInt(k, 10), e);
-    } else if (ctrl && !e.shiftKey && /^Digit[1-9]$/.test(code)) {
-      sendShortcut("jump_tab", parseInt(code.slice(5), 10), e);
-    } else if ((alt && !e.shiftKey && e.key === "ArrowLeft") || e.key === "BrowserBack" || code === "BrowserBack") {
-      sendShortcut("web_back", 0, e);
-    } else if ((alt && !e.shiftKey && e.key === "ArrowRight") || e.key === "BrowserForward" || code === "BrowserForward") {
-      sendShortcut("web_forward", 0, e);
-    } else if (
-      !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && !e.repeat
-      && (code === "Space" || e.key === " ")
-      && window.top === window
-      && /(^|\.)youtube\.com$/i.test(String(location.hostname || ""))
-    ) {
-      const ae = document.activeElement;
-      const tag = ae && ae.tagName ? ae.tagName.toUpperCase() : "";
-      const isInteractive = !!(ae && (
-        tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON" || tag === "A" ||
-        ae.isContentEditable ||
-        (ae.closest && ae.closest("input,textarea,select,button,a,[contenteditable='true'],[contenteditable=''],[role='textbox'],[role='button'],[role='slider'],#movie_player,.html5-video-player"))
-      ));
-      if (!isInteractive) {
-        const player = document.getElementById("movie_player") || document.querySelector(".html5-video-player");
-        const video = player ? player.querySelector("video") : document.querySelector("video");
-        if (player && video && isFinite(video.duration) && video.duration > 0) {
-          const rect = player.getBoundingClientRect();
-          if (rect.width > 120 && rect.height > 80) {
-            try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
-            if (typeof window.__singularityUnlockStartPaused === "function") {
-              try { window.__singularityUnlockStartPaused(); } catch (_) {}
-            }
-            try { player.focus({ preventScroll: true }); } catch (_) {}
-            if (video.paused) {
-              if (typeof player.playVideo === "function") { try { player.playVideo(); } catch (_) {} }
-              if (video.paused) { try { const p = video.play(); if (p && p.catch) p.catch(function(){}); } catch (_) {} }
-            } else {
-              if (typeof player.pauseVideo === "function") { try { player.pauseVideo(); } catch (_) {} }
-              if (!video.paused) { try { video.pause(); } catch (_) {} }
-            }
-          }
-        }
-      }
-    }
-  }, true);
-
-  if (window.top !== window) return;
-
-  // HTML5 fullscreenchange & favicon updates are enforced natively via CEF DisplayHandler callbacks
-  // (never accepted over untrusted web ContentIpc).
-
-
-  let lastSentSec = -1;
-  let lastSentScroll = -1;
-  let lastSentUrl = "";
-  function isAdPlaying() {
-    return !!document.querySelector(".html5-video-player.ad-showing, .html5-video-player.ad-interrupting");
-  }
-  function findPrimaryMedia() {
-    const vids = document.querySelectorAll("video, audio");
-    if (vids.length === 0) return null;
-    if (vids.length === 1) {
-      const m = vids[0];
-      return (m && isFinite(m.duration) && m.duration >= 15 && isFinite(m.currentTime) && m.currentTime >= 1) ? m : null;
-    }
-    let best = null;
-    let bestScore = -1;
-    for (let i = 0; i < vids.length; i++) {
-      const m = vids[i];
-      if (!m || !isFinite(m.duration) || m.duration < 15) continue;
-      if (!isFinite(m.currentTime) || m.currentTime < 1) continue;
-      const area = (m.videoWidth || 320) * (m.videoHeight || 180);
-      const score = (m.paused ? 0 : 1e9) + area + m.duration;
-      if (score > bestScore) {
-        bestScore = score;
-        best = m;
-      }
-    }
-    return best;
-  }
-  function reportMediaProgress(force) {
-    if (window.__singularityStartPausedLock) return;
-    if (!force && document.hidden) return;
-    const href = String(location.href || "");
-    if (!/^https?:\/\//i.test(href)) return;
-    let sec = 0;
-    if (!isAdPlaying()) {
-      const m = findPrimaryMedia();
-      if (m) sec = Math.floor(m.currentTime);
-    }
-    const sy = Math.max(0, Math.floor(window.scrollY || document.documentElement.scrollTop || 0));
-    const urlChanged = href !== lastSentUrl;
-    const secChanged = sec >= 2 && (force || urlChanged || Math.abs(sec - lastSentSec) >= 4);
-    const scrollChanged = sy >= 80 && (force || Math.abs(sy - lastSentScroll) >= 280);
-    if (!secChanged && !scrollChanged) return;
-    lastSentUrl = href;
-    if (sec >= 2) lastSentSec = sec;
-    lastSentScroll = sy;
-    try {
-      postIpc(JSON.stringify({ k: "media_state", s: sec, sy: sy }));
-    } catch (_) {}
-  }
-  setInterval(function() { reportMediaProgress(false); }, 6000);
-  document.addEventListener("pause", function() { reportMediaProgress(true); }, true);
-  document.addEventListener("seeked", function() { reportMediaProgress(true); }, true);
-  document.addEventListener("visibilitychange", function() {
-    if (document.visibilityState === "hidden") reportMediaProgress(true);
-  }, true);
-  window.addEventListener("pagehide", function() { reportMediaProgress(true); }, true);
-})();"##;
+    // Extension popup Escape dismissal, web keyboard shortcuts, and mouse back/forward buttons
+    // are handled natively in the trusted browser process (`SingularityKeyboardHandler` +
+    // `MouseButton::Other` / `VK_XBUTTON1`/`VK_XBUTTON2`), so no dead JS bridge script is injected
+    // into untrusted web frames or extension popups on `on_context_created`.
 
     const TOGGLE_ACTIVE_MEDIA_SCRIPT: &str = r##"(function(){
   try {
@@ -3335,6 +3095,7 @@ fn run_windows_frameless_browser(
             tab_scroll_ys: HashMap::new(),
             tab_bg_intents: HashMap::new(),
             last_favicon_at: HashMap::new(),
+            tab_crash_recoveries: HashMap::new(),
             layout_cache: WebViewLayoutCache::default(),
             active_tab_id: 1,
             web_visible: false,
@@ -3685,7 +3446,7 @@ fn run_windows_frameless_browser(
             false,
             tab_id,
             bind_port,
-            Some(CONTENT_LINK_INTENT_SCRIPT),
+            None,
             resume_script.as_deref(),
             req_ctx,
             sink,
@@ -5204,6 +4965,14 @@ fn run_windows_frameless_browser(
                             "Singularity CEF RenderProcessTerminated (is_ui={}, tab={}, status={}, code={}, err={})",
                             is_ui, tab_id, status, error_code, error_string
                         );
+                        // Ignore late teardown notifications for web tabs that were already closed.
+                        let live_tab = is_ui
+                            || windows
+                                .get(&wid)
+                                .is_some_and(|st| st.tab_browsers.contains_key(&tab_id));
+                        if !live_tab {
+                            return;
+                        }
                         if let Some(ref mut sm) = smoke_tracker {
                             let msg = format!(
                                 "RenderProcessTerminated(is_ui={}, status={}, code={}, err={})",
@@ -5266,6 +5035,21 @@ fn run_windows_frameless_browser(
                                     st.ui_browser.load_url(&fresh_url);
                                     st.layout_cache.invalidate_ui();
                                     st.sync_layout();
+                                }
+                            }
+                        } else if let Some(st) = windows.get_mut(&wid) {
+                            // Single-shot automatic recovery for a crashed live web tab so the tab
+                            // does not stay stuck on a blank dead renderer surface.
+                            let attempts = st.tab_crash_recoveries.entry(tab_id).or_insert(0);
+                            if *attempts < 1 {
+                                *attempts += 1;
+                                let last_url = st.tab_last_urls.get(&tab_id).cloned().unwrap_or_default();
+                                if let Some(tab_b) = st.tab_browsers.get(&tab_id) {
+                                    if last_url.starts_with("https://") || last_url.starts_with("http://") {
+                                        tab_b.load_url(&last_url);
+                                    } else {
+                                        tab_b.reload();
+                                    }
                                 }
                             }
                         }
@@ -5495,6 +5279,9 @@ fn run_windows_frameless_browser(
                                 .and_then(read_live_http_url)
                                 .unwrap_or(url);
                             st.tab_last_urls.insert(tab_id, final_url.clone());
+                            if (200..400).contains(&http_status) {
+                                st.tab_crash_recoveries.remove(&tab_id);
+                            }
                             let is_private = shared_shell
                                 .lock()
                                 .map(|s| s.private_browsing_active)
@@ -6423,6 +6210,7 @@ fn run_windows_frameless_browser(
                                     st.tab_scroll_ys.remove(&tab_id);
                                     st.tab_bg_intents.remove(&tab_id);
                                     st.last_favicon_at.remove(&tab_id);
+                                    st.tab_crash_recoveries.remove(&tab_id);
                                     st.tab_drm_pinned.remove(&tab_id);
                                     st.tab_drm_opted_out.remove(&tab_id);
                                     emit_ui_sync(
@@ -6802,7 +6590,7 @@ fn run_windows_frameless_browser(
                                     true,
                                     0,
                                     bind_port,
-                                    Some(EXT_POPUP_INIT_SCRIPT),
+                                    None,
                                     None,
                                     None,
                                     pop_sink,
@@ -7336,6 +7124,7 @@ fn run_windows_frameless_browser(
                                         st.tab_scroll_ys.remove(&tab_id);
                                         st.tab_bg_intents.remove(&tab_id);
                                         st.last_favicon_at.remove(&tab_id);
+                                        st.tab_crash_recoveries.remove(&tab_id);
                                         st.tab_drm_pinned.remove(&tab_id);
                                         st.tab_drm_opted_out.remove(&tab_id);
                                         emit_ui_sync(

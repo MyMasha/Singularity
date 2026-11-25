@@ -2481,7 +2481,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.9</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.10</div>
         </div>
       </aside>
 
@@ -9176,6 +9176,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           corona += u_colHot * diamond + u_colGlow * exp(-dOut * 5.8) * 1.15;
         }
 
+        vec3 result = vec3(0.0);
         if (disc > 0.0) {
           float tHit = -b - sqrt(disc);
           vec3 hitP = ro + rd * tHit;
@@ -9186,29 +9187,30 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
             float rim = pow(1.0 - ndv, 5.5);
             vec3 moonNoise = texture2D(u_noise, vec2(atan(n.z, n.x) * 0.45, asin(clamp(n.y, -1.0, 1.0)) * 0.8)).rgb;
             vec3 earthshine = vec3(0.022, 0.008, 0.012) * (0.6 + 0.6 * moonNoise.r);
-            return earthshine + u_colGlow * rim * 1.65;
+            result = earthshine + u_colGlow * rim * 1.65;
+          } else {
+            float lon = atan(n.z, n.x) + u_time * 0.065;
+            float lat = asin(clamp(n.y, -1.0, 1.0));
+            vec2 suv1 = vec2(lon * 0.318309, lat * 0.63662 + u_time * 0.010);
+            vec2 suv2 = vec2(lon * 0.79577 - u_time * 0.024, lat * 1.48 - u_time * 0.015);
+            vec3 s1 = texture2D(u_noise, suv1).rgb;
+            vec3 s2 = texture2D(u_noise, suv2).rgb;
+            float gran = s1.r * 0.48 + s2.g * 0.34 + s2.b * 0.18;
+            float spots = smoothstep(0.22, 0.35, s1.r * 0.62 + s1.b * 0.38);
+            float activeFlares = smoothstep(0.66, 0.92, s1.b * 0.56 + s2.r * 0.44);
+            float limbDark = pow(ndv, 0.44);
+            float chromoRim = pow(1.0 - ndv, 3.0);
+
+            vec3 surf = mix(u_colOuter, u_colMid, clamp(gran * 1.30 * spots, 0.0, 1.0));
+            surf = mix(surf, u_colHot, clamp(limbDark * (0.42 + 0.58 * gran) + activeFlares * 0.88, 0.0, 1.0));
+            surf += u_colGlow * chromoRim * 1.35;
+            result = surf * 1.24;
           }
-
-          float lon = atan(n.z, n.x) + u_time * 0.065;
-          float lat = asin(clamp(n.y, -1.0, 1.0));
-          vec2 suv1 = vec2(lon * 0.318309, lat * 0.63662 + u_time * 0.010);
-          vec2 suv2 = vec2(lon * 0.79577 - u_time * 0.024, lat * 1.48 - u_time * 0.015);
-          vec3 s1 = texture2D(u_noise, suv1).rgb;
-          vec3 s2 = texture2D(u_noise, suv2).rgb;
-          float gran = s1.r * 0.48 + s2.g * 0.34 + s2.b * 0.18;
-          float spots = smoothstep(0.22, 0.35, s1.r * 0.62 + s1.b * 0.38);
-          float activeFlares = smoothstep(0.66, 0.92, s1.b * 0.56 + s2.r * 0.44);
-          float limbDark = pow(ndv, 0.44);
-          float chromoRim = pow(1.0 - ndv, 3.0);
-
-          vec3 surf = mix(u_colOuter, u_colMid, clamp(gran * 1.30 * spots, 0.0, 1.0));
-          surf = mix(surf, u_colHot, clamp(limbDark * (0.42 + 0.58 * gran) + activeFlares * 0.88, 0.0, 1.0));
-          surf += u_colGlow * chromoRim * 1.35;
-          return surf * 1.24;
+        } else {
+          vec3 sky = renderStarfield(rd, 0.0) * 0.78 + u_bgTint * exp(-length(uv) * 1.25);
+          result = sky + corona;
         }
-
-        vec3 sky = renderStarfield(rd, 0.0) * 0.78 + u_bgTint * exp(-length(uv) * 1.25);
-        return sky + corona;
+        return result;
       }
 
       void main() {

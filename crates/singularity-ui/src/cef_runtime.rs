@@ -618,8 +618,18 @@ wrap_v8_handler! {
             if !payload.is_empty() && payload.len() <= 262_144 {
                 if let Some(ctx) = v8_context_get_current_context() {
                     if let Some(frame) = ctx.frame() {
+                        if frame.is_valid() == 0 {
+                            if let Some(ret) = retval {
+                                *ret = v8_value_create_undefined();
+                            }
+                            return 1;
+                        }
                         let is_main = frame.is_main() != 0;
-                        let frame_url = cef_str_userfree(frame.url());
+                        let frame_url = if is_main {
+                            cef_str_userfree(frame.url())
+                        } else {
+                            String::new()
+                        };
                         let authorized = is_main
                             && frame
                                 .browser()
@@ -716,8 +726,11 @@ wrap_render_process_handler! {
             let (Some(browser), Some(frame), Some(context)) = (browser, frame, context) else {
                 return;
             };
+            // Never touch detached/speculative frames (prevents CEF renderer crashes on navigation races).
+            if frame.is_valid() == 0 {
+                return;
+            }
             let is_main = frame.is_main() != 0;
-            let frame_url = cef_str_userfree(frame.url());
             let cfg = RENDERER_CONFIGS.with(|map| {
                 map.borrow()
                     .get(&browser.identifier())
@@ -728,26 +741,29 @@ wrap_render_process_handler! {
             // SECURITY (N4 #4): Expose `window.ipc.postMessage(payload)` EXCLUSIVELY to the main
             // frame of the local Singularity UI shell on exact origin `http://127.0.0.1:<ui_port>`.
             // NEVER expose `window.ipc` to web pages (`!cfg.is_ui`) or any iframe!
-            if cfg.is_ui && is_main && is_exact_local_ui_origin(&frame_url, cfg.ui_port) {
-                if let Some(global) = context.global() {
-                    if let Some(mut ipc_obj) = v8_value_create_object(None, None) {
-                        let mut handler = SingularityIpcV8Handler::new();
-                        let fn_name = CefString::from("postMessage");
-                        if let Some(mut post_fn) =
-                            v8_value_create_function(Some(&fn_name), Some(&mut handler))
-                        {
-                            let _ = ipc_obj.set_value_bykey(
-                                Some(&fn_name),
-                                Some(&mut post_fn),
+            if cfg.is_ui && is_main {
+                let frame_url = cef_str_userfree(frame.url());
+                if is_exact_local_ui_origin(&frame_url, cfg.ui_port) {
+                    if let Some(global) = context.global() {
+                        if let Some(mut ipc_obj) = v8_value_create_object(None, None) {
+                            let mut handler = SingularityIpcV8Handler::new();
+                            let fn_name = CefString::from("postMessage");
+                            if let Some(mut post_fn) =
+                                v8_value_create_function(Some(&fn_name), Some(&mut handler))
+                            {
+                                let _ = ipc_obj.set_value_bykey(
+                                    Some(&fn_name),
+                                    Some(&mut post_fn),
+                                    V8Propertyattribute::default(),
+                                );
+                            }
+                            let ipc_key = CefString::from("ipc");
+                            let _ = global.set_value_bykey(
+                                Some(&ipc_key),
+                                Some(&mut ipc_obj),
                                 V8Propertyattribute::default(),
                             );
                         }
-                        let ipc_key = CefString::from("ipc");
-                        let _ = global.set_value_bykey(
-                            Some(&ipc_key),
-                            Some(&mut ipc_obj),
-                            V8Propertyattribute::default(),
-                        );
                     }
                 }
             }
@@ -849,7 +865,10 @@ wrap_app! {
             let kv_switches = [
                 (
                     "disable-features",
-                    "BackForwardCache,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls",
+                    // Disable `RenderDocument` alongside `BackForwardCache` to prevent CEF 150
+                    // Alloy speculative-frame `Timeout of new browser info response (has_rfh=0)`
+                    // renderer stalls (upstream chromiumembedded/cef#4348).
+                    "BackForwardCache,RenderDocument,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls",
                 ),
                 ("enable-features", "PlatformHEVCDecoderSupport"),
                 ("disable-blink-features", "AutomationControlled"),

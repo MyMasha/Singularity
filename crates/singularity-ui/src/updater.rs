@@ -432,7 +432,10 @@ pub fn check_for_updates() -> Result<UpdateCheckInfo, String> {
             Some(tok) => fetch_rel(Some(tok)).or_else(|_| fetch_rel(None)),
             None => fetch_rel(None),
         }
-        .map_err(|_| "Unable to check for updates (offline or GitHub API unreachable).".to_string())?
+        .map_err(|err| {
+            eprintln!("[singularity-updater] Update check failed: {}", err);
+            "Unable to check for updates (offline or GitHub API unreachable).".to_string()
+        })?
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -1660,7 +1663,7 @@ mod tests {
             "https://objects.githubusercontent.com/github-production-release-asset/foo",
             "https://release-assets.githubusercontent.com/bar",
             "https://github-releases.githubusercontent.com/baz",
-            "HTTPS://GITHUB.COM/MyMasha/Singularity/releases/download/v2.0.9/SHA256SUMS.txt",
+            "HTTPS://GITHUB.COM/MyMasha/Singularity/releases/download/v2.0.10/SHA256SUMS.txt",
         ] {
             assert!(is_allowed_update_https_url(ok), "should allow {}", ok);
         }

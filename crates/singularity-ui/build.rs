@@ -132,8 +132,8 @@ fn embed_windows_exe_resources() {
          {icon_line}\
          1 24 \"{manifest_escaped}\"\r\n\
          1 VERSIONINFO\r\n\
-         FILEVERSION 2,0,9,0\r\n\
-         PRODUCTVERSION 2,0,9,0\r\n\
+         FILEVERSION 2,0,10,0\r\n\
+         PRODUCTVERSION 2,0,10,0\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -146,11 +146,11 @@ fn embed_windows_exe_resources() {
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Singularity\\0\"\r\n\
                VALUE \"FileDescription\", \"Singularity Browser (Pure Chromium CEF)\\0\"\r\n\
-               VALUE \"FileVersion\", \"2.0.9.0\\0\"\r\n\
+               VALUE \"FileVersion\", \"2.0.10.0\\0\"\r\n\
                VALUE \"InternalName\", \"singularity\\0\"\r\n\
                VALUE \"OriginalFilename\", \"singularity.exe\\0\"\r\n\
                VALUE \"ProductName\", \"Singularity\\0\"\r\n\
-               VALUE \"ProductVersion\", \"2.0.9.0\\0\"\r\n\
+               VALUE \"ProductVersion\", \"2.0.10.0\\0\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\
@@ -170,6 +170,10 @@ fn embed_windows_exe_resources() {
         println!("cargo:rustc-link-lib=dylib=delayimp");
         // Restrict implicit OS DLL search to System32 (LOAD_LIBRARY_SEARCH_SYSTEM32) to prevent DLL hijacking.
         println!("cargo:rustc-link-arg-bin=singularity=/DEPENDENTLOADFLAG:0x800");
+        // Reserve an 8 MiB main-thread stack (matching official Chrome on Windows; lazily committed
+        // on demand so idle RAM stays 0) so `singularity.exe --type=renderer` never overflows the
+        // default 1 MiB MSVC stack on deep Blink/V8/DOM pages (`Crashpad_NotConnectedToHandler`).
+        println!("cargo:rustc-link-arg-bin=singularity=/STACK:0x800000");
 
         let res_path = out_path.join("singularity_res.res");
         let obj_path = out_path.join("singularity_res.o");

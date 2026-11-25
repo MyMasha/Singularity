@@ -218,8 +218,11 @@ pub fn is_remote_ip_allowed(
     true
 }
 
+/// Official Win32 `WINHTTP_OPTION_CONNECTION_INFO` option ID (`winhttp.h` = 93).
+pub(crate) const WINHTTP_OPTION_CONNECTION_INFO: u32 = 93;
+
 /// Exact Win32 `SOCKADDR_STORAGE` layout (128 bytes, 8-byte aligned) used by
-/// `WINHTTP_CONNECTION_INFO` (`WINHTTP_OPTION_CONNECTION_INFO = 120`).
+/// `WINHTTP_CONNECTION_INFO` (`WINHTTP_OPTION_CONNECTION_INFO = 93`).
 #[allow(dead_code)]
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
@@ -228,9 +231,10 @@ pub(crate) struct Win32SockAddrStorage {
     pub data: [u8; 126],
 }
 
-/// Exact Win32 `WINHTTP_CONNECTION_INFO` layout (264 bytes on both x86 and x64 MSVC ABI).
+/// Exact Win32 `WINHTTP_CONNECTION_INFO` layout (264 bytes on 64-bit MSVC ABI; 260 bytes packed(4) on x86).
 #[allow(dead_code)]
-#[repr(C)]
+#[cfg_attr(target_arch = "x86", repr(C, packed(4)))]
+#[cfg_attr(not(target_arch = "x86"), repr(C))]
 #[derive(Clone, Copy)]
 pub(crate) struct Win32WinHttpConnectionInfo {
     pub cb_size: u32,
@@ -322,6 +326,7 @@ mod win32_impl {
         is_public_routable_ip, is_remote_ip_allowed, is_same_origin, normalize_ip_addr,
         parse_http_url_parts, parse_win32_sockaddr_storage_ip, resolve_http_redirect,
         Win32SockAddrStorage, Win32WinHttpConnectionInfo, WinHttpResponse,
+        WINHTTP_OPTION_CONNECTION_INFO,
     };
     use rand_core::{OsRng, RngCore};
     use std::ffi::c_void;
@@ -337,7 +342,6 @@ mod win32_impl {
     const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
     const WINHTTP_OPTION_REDIRECT_POLICY_NEVER: u32 = 0;
     const WINHTTP_OPTION_DECOMPRESSION: u32 = 118;
-    const WINHTTP_OPTION_CONNECTION_INFO: u32 = 120;
     const WINHTTP_DECOMPRESSION_FLAG_ALL: u32 = 0x0000_0003;
     const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: u32 = 0x0000_0800;
     const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: u32 = 0x0000_2000;
@@ -347,6 +351,11 @@ mod win32_impl {
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x2000_0000;
     const WINHTTP_ADDREQ_FLAG_REPLACE: u32 = 0x8000_0000;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLastError() -> u32;
+    }
 
     #[link(name = "winhttp")]
     extern "system" {
@@ -483,7 +492,11 @@ mod win32_impl {
             )
         };
         if ok == 0 {
-            return Err("DNS rebinding protection: WinHttpQueryOption(WINHTTP_OPTION_CONNECTION_INFO) failed".into());
+            let err_code = unsafe { GetLastError() };
+            return Err(format!(
+                "DNS rebinding protection: WinHttpQueryOption(WINHTTP_OPTION_CONNECTION_INFO) failed (win32={})",
+                err_code
+            ));
         }
         parse_win32_sockaddr_storage_ip(&info.remote_address)
             .ok_or_else(|| "DNS rebinding protection: unsupported remote SOCKADDR family".to_string())
@@ -761,10 +774,12 @@ mod win32_impl {
             )
         };
         if sent == 0 {
-            return Err("WinHttpSendRequest failed".into());
+            let err_code = unsafe { GetLastError() };
+            return Err(format!("WinHttpSendRequest failed (win32={})", err_code));
         }
         if unsafe { WinHttpReceiveResponse(h_request, core::ptr::null_mut()) } == 0 {
-            return Err("WinHttpReceiveResponse failed".into());
+            let err_code = unsafe { GetLastError() };
+            return Err(format!("WinHttpReceiveResponse failed (win32={})", err_code));
         }
 
         // Anti-DNS-rebinding TOCTOU verification: inspect the ACTUAL connected remote IP from
@@ -1149,6 +1164,7 @@ mod tests {
 
     #[test]
     fn test_public_ip_and_win32_connection_info_dns_rebinding_guard() {
+        assert_eq!(WINHTTP_OPTION_CONNECTION_INFO, 93);
         assert_eq!(core::mem::size_of::<Win32SockAddrStorage>(), 128);
         assert_eq!(core::mem::align_of::<Win32SockAddrStorage>(), 8);
         assert_eq!(core::mem::size_of::<Win32WinHttpConnectionInfo>(), 264);
