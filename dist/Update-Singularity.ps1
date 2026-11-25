@@ -12,10 +12,10 @@ $ErrorActionPreference = "Stop"
 
 # Optional pinned 64-hex-character Ed25519 release signing public key (can also be provided via
 # -ReleasePubKeyHex or the SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX environment variable).
-$DefaultReleasePubKeyHex = ""
+$DefaultReleasePubKeyHex = "3af87c325effee5f8f23e1ba7d9b8c5e7cebda70388718e87cf308237e70c155"
 $Repo = "MyMasha/Singularity"
 $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-$Ua = "Singularity-Updater/2.0.8"
+$Ua = "Singularity-Updater/2.0.9"
 $AllowedDownloadHosts = @(
     "github.com",
     "api.github.com",

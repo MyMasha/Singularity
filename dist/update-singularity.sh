@@ -8,11 +8,11 @@ REPO="MyMasha/Singularity"
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET_BIN="${INSTALL_DIR}/singularity-linux-x86_64"
 TOKEN="${SINGULARITY_GITHUB_TOKEN:-}"
-UA="Singularity-Updater/2.0.8"
+UA="Singularity-Updater/2.0.9"
 
 # Optional pinned 64-hex-character Ed25519 release signing public key (can be configured via
 # SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX). Required by default in production.
-DEFAULT_RELEASE_SIGNING_PUBKEY_HEX=""
+DEFAULT_RELEASE_SIGNING_PUBKEY_HEX="3af87c325effee5f8f23e1ba7d9b8c5e7cebda70388718e87cf308237e70c155"
 RELEASE_SIGNING_PUBKEY_HEX="${SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX:-$DEFAULT_RELEASE_SIGNING_PUBKEY_HEX}"
 ALLOW_UNSIGNED="${SINGULARITY_ALLOW_UNSIGNED:-0}"
 

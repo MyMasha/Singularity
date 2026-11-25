@@ -73,7 +73,8 @@ pub const UNINSTALL_ALLOWED_EXACT_FILES: &[&str] = &[
 /// `SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX` is not injected at compile time via `option_env!`.
 /// Release builds (`#[cfg(not(debug_assertions))]`) FAIL CLOSED if neither source provides a
 /// valid 64-hex Ed25519 verifying key.
-pub const RELEASE_SIGNING_PUBKEY_HEX: &str = "";
+pub const RELEASE_SIGNING_PUBKEY_HEX: &str =
+    "3af87c325effee5f8f23e1ba7d9b8c5e7cebda70388718e87cf308237e70c155";
 
 /// Validates that `pubkey_hex` is a well-formed 64-hex-character Ed25519 verifying key.
 pub fn is_valid_ed25519_pubkey_hex(pubkey_hex: &str) -> bool {
