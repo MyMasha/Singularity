@@ -477,6 +477,28 @@ pub fn is_valid_theme_id(id: &str) -> bool {
     )
 }
 
+fn default_startup_mode() -> String {
+    "restore".to_string()
+}
+fn default_bookmarks_bar_visibility() -> String {
+    "new_tab_only".to_string()
+}
+fn default_tab_bar_placement() -> String {
+    "top_compact".to_string()
+}
+fn default_sidebar_width_px() -> u32 {
+    248
+}
+fn default_ui_density() -> String {
+    "normal".to_string()
+}
+fn default_corner_radius_px() -> u8 {
+    10
+}
+fn default_zoom_percent() -> u16 {
+    100
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
     pub onboarding_completed: bool,
@@ -487,6 +509,12 @@ pub struct UserProfile {
     #[serde(default = "default_theme_id")]
     pub theme_id: String,
     pub default_search_engine: String,
+    #[serde(default)]
+    pub private_search_engine: Option<String>,
+    #[serde(default = "default_startup_mode")]
+    pub startup_mode: String,
+    #[serde(default)]
+    pub startup_custom_urls: Vec<String>,
     #[serde(default = "default_restore_session")]
     pub restore_session: bool,
     #[serde(default)]
@@ -497,6 +525,34 @@ pub struct UserProfile {
     pub tab_unload_mode: String,
     #[serde(default = "default_tab_unload_custom_minutes")]
     pub tab_unload_custom_minutes: u64,
+    #[serde(default = "default_bookmarks_bar_visibility")]
+    pub bookmarks_bar_visibility: String,
+    #[serde(default = "default_tab_bar_placement")]
+    pub tab_bar_placement: String,
+    #[serde(default = "default_sidebar_width_px")]
+    pub sidebar_width_px: u32,
+    #[serde(default = "default_ui_density")]
+    pub ui_density: String,
+    #[serde(default = "default_corner_radius_px")]
+    pub corner_radius_px: u8,
+    #[serde(default)]
+    pub download_dir: Option<String>,
+    #[serde(default)]
+    pub ask_where_to_save: bool,
+    #[serde(default)]
+    pub auto_open_safe_extensions: Vec<String>,
+    #[serde(default = "default_zoom_percent")]
+    pub default_zoom_percent: u16,
+    #[serde(default)]
+    pub text_only_zoom: bool,
+    #[serde(default)]
+    pub muted_origins: Vec<String>,
+    #[serde(default)]
+    pub pinned_tab_urls: Vec<String>,
+    #[serde(default)]
+    pub extension_blocked_sites: Vec<String>,
+    #[serde(default)]
+    pub developer_mode: bool,
     #[serde(default)]
     pub pinned_extensions: Vec<String>,
     pub strict_mullvad_killswitch: bool,
@@ -519,11 +575,28 @@ impl Default for UserProfile {
             language: default_language(),
             theme_id: default_theme_id(),
             default_search_engine: "ddg".to_string(),
+            private_search_engine: Some("ddg".to_string()),
+            startup_mode: default_startup_mode(),
+            startup_custom_urls: Vec::new(),
             restore_session: true,
             session_restore_v2_migrated: true,
             active_tab_index: 0,
             tab_unload_mode: default_tab_unload_mode(),
             tab_unload_custom_minutes: default_tab_unload_custom_minutes(),
+            bookmarks_bar_visibility: default_bookmarks_bar_visibility(),
+            tab_bar_placement: default_tab_bar_placement(),
+            sidebar_width_px: default_sidebar_width_px(),
+            ui_density: default_ui_density(),
+            corner_radius_px: default_corner_radius_px(),
+            download_dir: None,
+            ask_where_to_save: false,
+            auto_open_safe_extensions: Vec::new(),
+            default_zoom_percent: default_zoom_percent(),
+            text_only_zoom: false,
+            muted_origins: Vec::new(),
+            pinned_tab_urls: Vec::new(),
+            extension_blocked_sites: Vec::new(),
+            developer_mode: false,
             pinned_extensions: Vec::new(),
             strict_mullvad_killswitch: false,
             mullvad_auto_connect: false,

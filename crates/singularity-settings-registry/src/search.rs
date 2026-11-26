@@ -97,6 +97,30 @@ pub fn compute_virtualized_viewport<'a>(
     row_height_px: usize,
     overscan_rows: usize,
 ) -> VirtualizedViewport<'a> {
+    compute_virtualized_viewport_filtered(
+        entries,
+        category_filter,
+        query,
+        false,
+        scroll_offset_px,
+        viewport_height_px,
+        row_height_px,
+        overscan_rows,
+    )
+}
+
+/// Computes an O(1) virtualized slice of matching settings with optional `modified_only` filtering.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_virtualized_viewport_filtered<'a>(
+    entries: &'a [SettingEntry],
+    category_filter: Option<SettingCategory>,
+    query: &str,
+    modified_only: bool,
+    scroll_offset_px: usize,
+    viewport_height_px: usize,
+    row_height_px: usize,
+    overscan_rows: usize,
+) -> VirtualizedViewport<'a> {
     let row_h = row_height_px.clamp(24, 256);
     let safe_viewport_h = viewport_height_px.min(100_000);
     let safe_overscan = overscan_rows.min(64);
@@ -105,6 +129,7 @@ pub fn compute_virtualized_viewport<'a>(
     let mut matched: Vec<FuzzyMatch<'a>> = entries
         .iter()
         .filter(|e| category_filter.map_or(true, |cat| e.category == cat))
+        .filter(|e| !modified_only || e.is_modified())
         .filter_map(|e| score_fuzzy_query(e, &query_lower).map(|score| FuzzyMatch { entry: e, score }))
         .collect();
 

@@ -126,7 +126,96 @@ fn save_crash_report_to_disk(roaming_root: &Path, report: &CrashReport) {
     let _ = std::fs::write(dir.join(format!("{}.txt", report.id)), &txt);
     if let Ok(json) = serde_json::to_vec_pretty(report) {
         let _ = std::fs::write(dir.join("last_crash.json"), &json);
+        let _ = std::fs::write(dir.join(format!("{}.json", report.id)), &json);
     }
+}
+
+/// Lists all persisted crash reports in `%APPDATA%\.singularity\crashes`, newest first.
+pub fn list_crash_reports(roaming_root: &Path) -> Vec<CrashReport> {
+    let dir = crashes_dir(roaming_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json") || name == "last_crash.json" {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(rep) = serde_json::from_slice::<CrashReport>(&bytes) {
+                reports.push(rep);
+            }
+        }
+    }
+    if reports.is_empty() {
+        if let Ok(bytes) = std::fs::read(dir.join("last_crash.json")) {
+            if let Ok(rep) = serde_json::from_slice::<CrashReport>(&bytes) {
+                reports.push(rep);
+            }
+        }
+    }
+    reports.sort_by(|a, b| b.timestamp_unix.cmp(&a.timestamp_unix));
+    reports
+}
+
+/// Deletes a single crash report by ID (`crash-...`) safely without path traversal.
+pub fn delete_crash_report(roaming_root: &Path, id: &str) -> bool {
+    let clean = id.trim();
+    if clean.is_empty()
+        || !clean
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    let dir = crashes_dir(roaming_root);
+    let r1 = std::fs::remove_file(dir.join(format!("{clean}.json"))).is_ok();
+    let r2 = std::fs::remove_file(dir.join(format!("{clean}.txt"))).is_ok();
+    r1 || r2
+}
+
+/// Purges all stored crash reports and clears `last_crash.*`.
+pub fn purge_all_crash_reports(roaming_root: &Path) -> usize {
+    let dir = crashes_dir(roaming_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Strips OS username and absolute home directory paths from a diagnostic text block.
+pub fn anonymize_crash_text(raw: &str) -> String {
+    let mut out = raw.to_string();
+    for env_key in ["USERPROFILE", "HOME", "USERNAME", "USER"] {
+        if let Ok(val) = std::env::var(env_key) {
+            if val.len() >= 3 {
+                out = out.replace(&val, "<REDACTED>");
+            }
+        }
+    }
+    out
+}
+
+/// Detects whether two or more crashes occurred within `window_secs` (default 60s) to trigger
+/// the selective `singularity://session-restore` anti-crash-loop screen.
+pub fn is_crash_loop_detected(roaming_root: &Path, now_unix: u64, window_secs: u64) -> bool {
+    let reports = list_crash_reports(roaming_root);
+    let recent = reports
+        .iter()
+        .filter(|r| now_unix.saturating_sub(r.timestamp_unix) <= window_secs)
+        .count();
+    recent >= 2
 }
 
 fn build_report(roaming_root: &Path, kind: &str, summary: &str, details: &str) -> CrashReport {

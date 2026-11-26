@@ -1,0 +1,15 @@
+[package]
+name = "singularity-translate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "100% offline language detection (20+ languages) and local DOM batch translation engine with Ed25519-verified offline language packs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["zeroize", "rand_core"] }
+hex = "0.4"
+thiserror = "2.0"

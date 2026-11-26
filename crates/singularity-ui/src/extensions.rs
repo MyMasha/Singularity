@@ -24,6 +24,177 @@ const MAX_CRX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB compressed package cap
 const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB total uncompressed cap
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteAccessMode {
+    OnClick,
+    OnSpecificSites,
+    #[default]
+    OnAllSites,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtensionCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub suggested_key: Option<String>,
+    #[serde(default)]
+    pub custom_key: Option<String>,
+    #[serde(default)]
+    pub global: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionActionState {
+    #[serde(default)]
+    pub badge_text: String,
+    #[serde(default = "default_badge_bg")]
+    pub badge_bg_color: String,
+    #[serde(default = "default_badge_fg")]
+    pub badge_text_color: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default = "default_true_ext")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dynamic_icon_data_url: Option<String>,
+}
+
+fn default_badge_bg() -> String {
+    "#7C3AED".to_string()
+}
+
+fn default_badge_fg() -> String {
+    "#FFFFFF".to_string()
+}
+
+fn default_true_ext() -> bool {
+    true
+}
+
+impl Default for ExtensionActionState {
+    fn default() -> Self {
+        Self {
+            badge_text: String::new(),
+            badge_bg_color: default_badge_bg(),
+            badge_text_color: default_badge_fg(),
+            title: String::new(),
+            enabled: true,
+            dynamic_icon_data_url: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebAccessibleResourceRule {
+    #[serde(default)]
+    pub resources: Vec<String>,
+    #[serde(default)]
+    pub matches: Vec<String>,
+    #[serde(default)]
+    pub use_dynamic_url: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtensionSecurityPolicy {
+    #[serde(default)]
+    pub extension_pages_csp: Option<String>,
+    #[serde(default)]
+    pub sandbox_csp: Option<String>,
+    #[serde(default)]
+    pub web_accessible_resources: Vec<WebAccessibleResourceRule>,
+}
+
+impl ExtensionSecurityPolicy {
+    /// Checks whether a relative resource path may be loaded by a web origin.
+    pub fn is_web_accessible(&self, rel_path: &str, origin: &str) -> bool {
+        let norm_path = rel_path.trim_start_matches('/');
+        for rule in &self.web_accessible_resources {
+            let res_match = rule.resources.iter().any(|pat| wildcard_match_ext(pat, norm_path));
+            if !res_match {
+                continue;
+            }
+            if rule.matches.is_empty()
+                || rule.matches.iter().any(|m| {
+                    m == "<all_urls>"
+                        || m == "*://*/*"
+                        || m == "https://*/*"
+                        || wildcard_match_ext(m, origin)
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionErrorEntry {
+    pub timestamp_ms: u64,
+    pub level: String,
+    pub message: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub stack: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionWarning {
+    pub permission: String,
+    pub severity: String,
+    pub label_en: String,
+    pub label_fr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedExtensionReview {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub manifest_version: u64,
+    pub permissions: Vec<String>,
+    pub host_permissions: Vec<String>,
+    pub warnings: Vec<PermissionWarning>,
+    pub staged_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionUpdateAvailable {
+    pub id: String,
+    pub version: String,
+    pub codebase_url: String,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMessagingHost {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub path: String,
+    #[serde(rename = "type", default = "default_stdio_type")]
+    pub transport_type: String,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_stdio_type() -> String {
+    "stdio".to_string()
+}
+
+impl NativeMessagingHost {
+    pub fn allows_extension(&self, extension_id: &str) -> bool {
+        let target = format!("chrome-extension://{}/", extension_id.to_ascii_lowercase());
+        self.allowed_origins
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(&target))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChromeExtensionInfo {
     pub id: String,
@@ -36,11 +207,23 @@ pub struct ChromeExtensionInfo {
     pub manifest_version: u64,
     pub popup_path: Option<String>,
     pub options_path: Option<String>,
+    pub side_panel_path: Option<String>,
     pub permissions: Vec<String>,
     pub host_permissions: Vec<String>,
     pub install_path: String,
     pub source_path: Option<String>,
     pub runtime_id: Option<String>,
+    pub site_access_mode: SiteAccessMode,
+    pub allowed_sites: Vec<String>,
+    pub allow_in_incognito: bool,
+    pub allow_file_urls: bool,
+    pub allow_user_scripts: bool,
+    pub commands: Vec<ExtensionCommand>,
+    pub url_overrides: std::collections::BTreeMap<String, String>,
+    pub update_url: Option<String>,
+    pub error_count: usize,
+    pub security_policy: ExtensionSecurityPolicy,
+    pub action_state: ExtensionActionState,
 }
 
 /// Out-of-band Singularity metadata stored in `%APPDATA%\.singularity\extensions_meta\<dir_id>.json`
@@ -49,6 +232,28 @@ pub struct ChromeExtensionInfo {
 pub struct ExtensionMeta {
     pub source_path: Option<String>,
     pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub site_access_mode: SiteAccessMode,
+    #[serde(default)]
+    pub allowed_sites: Vec<String>,
+    #[serde(default)]
+    pub allow_in_incognito: bool,
+    #[serde(default)]
+    pub allow_file_urls: bool,
+    #[serde(default)]
+    pub allow_user_scripts: bool,
+    #[serde(default)]
+    pub custom_shortcuts: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub pin_order: Option<u32>,
+    #[serde(default)]
+    pub update_url: Option<String>,
+    #[serde(default)]
+    pub last_updated_ms: Option<u64>,
+    #[serde(default)]
+    pub errors: Vec<ExtensionErrorEntry>,
+    #[serde(default)]
+    pub action_state: ExtensionActionState,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -644,9 +849,148 @@ fn parse_extension_dir_with_meta_and_lang(
         }
     }
 
+    let side_panel_path = manifest
+        .get("side_panel")
+        .and_then(|s| s.get("default_path"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            manifest
+                .get("sidebar_action")
+                .and_then(|s| s.get("default_panel"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string());
+
+    let mut commands = Vec::new();
+    if let Some(cmd_obj) = manifest.get("commands").and_then(|v| v.as_object()) {
+        for (cmd_name, cmd_val) in cmd_obj {
+            let desc = cmd_val
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let suggested = cmd_val.get("suggested_key").and_then(|sk| {
+                sk.get("default")
+                    .or_else(|| sk.get("windows"))
+                    .or_else(|| sk.get("linux"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+            let custom_key = meta.custom_shortcuts.get(cmd_name).cloned();
+            let global = cmd_val
+                .get("global")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            commands.push(ExtensionCommand {
+                name: cmd_name.clone(),
+                description: desc,
+                suggested_key: suggested,
+                custom_key,
+                global,
+            });
+        }
+    }
+
+    let mut url_overrides = std::collections::BTreeMap::new();
+    if let Some(ov) = manifest
+        .get("chrome_url_overrides")
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in ov {
+            if let Some(s) = v.as_str() {
+                url_overrides.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let update_url = manifest
+        .get("update_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| meta.update_url.clone());
+
+    let mut security_policy = ExtensionSecurityPolicy::default();
+    if let Some(csp) = manifest.get("content_security_policy") {
+        if let Some(s) = csp.as_str() {
+            security_policy.extension_pages_csp = Some(s.to_string());
+        } else if let Some(obj) = csp.as_object() {
+            security_policy.extension_pages_csp = obj
+                .get("extension_pages")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            security_policy.sandbox_csp = obj
+                .get("sandbox")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    if let Some(war) = manifest
+        .get("web_accessible_resources")
+        .and_then(|v| v.as_array())
+    {
+        let mut mv2_resources = Vec::new();
+        for item in war {
+            if let Some(s) = item.as_str() {
+                mv2_resources.push(s.to_string());
+            } else if let Some(obj) = item.as_object() {
+                let resources = obj
+                    .get("resources")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let matches = obj
+                    .get("matches")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let use_dynamic_url = obj
+                    .get("use_dynamic_url")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                security_policy
+                    .web_accessible_resources
+                    .push(WebAccessibleResourceRule {
+                        resources,
+                        matches,
+                        use_dynamic_url,
+                    });
+            }
+        }
+        if !mv2_resources.is_empty() {
+            security_policy
+                .web_accessible_resources
+                .push(WebAccessibleResourceRule {
+                    resources: mv2_resources,
+                    matches: vec!["<all_urls>".to_string()],
+                    use_dynamic_url: false,
+                });
+        }
+    }
+
     let has_icon = pick_manifest_icon_rel_path(&manifest)
         .and_then(|rel| resolve_safe_child_path(ext_dir, &rel))
         .is_some_and(|p| p.is_file());
+
+    let error_count = meta.errors.len();
+    let mut action_state = meta.action_state;
+    if action_state.title.is_empty() {
+        action_state.title = manifest
+            .get("action")
+            .or_else(|| manifest.get("browser_action"))
+            .or_else(|| manifest.get("page_action"))
+            .and_then(|a| a.get("default_title"))
+            .and_then(|v| v.as_str())
+            .map(|s| resolve_i18n_string(ext_dir, s, preferred_lang, default_locale))
+            .unwrap_or_else(|| name.clone());
+    }
 
     Some(ChromeExtensionInfo {
         id: id.to_string(),
@@ -659,11 +1003,23 @@ fn parse_extension_dir_with_meta_and_lang(
         manifest_version,
         popup_path,
         options_path,
+        side_panel_path,
         permissions,
         host_permissions,
         install_path: ext_dir.to_string_lossy().to_string(),
         source_path: meta.source_path,
         runtime_id: meta.runtime_id,
+        site_access_mode: meta.site_access_mode,
+        allowed_sites: meta.allowed_sites,
+        allow_in_incognito: meta.allow_in_incognito,
+        allow_file_urls: meta.allow_file_urls,
+        allow_user_scripts: meta.allow_user_scripts,
+        commands,
+        url_overrides,
+        update_url,
+        error_count,
+        security_policy,
+        action_state,
     })
 }
 
@@ -2983,6 +3339,436 @@ pub fn scan_installed_browsers_extensions() -> Vec<DetectedExternalExtension> {
     }
     found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     found
+}
+
+fn wildcard_match_ext(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Extracts a 32-char Edge Add-ons store ID (`a`..=`p`) from either a raw ID or a
+/// `microsoftedge.microsoft.com/addons/detail/.../<id>` URL.
+pub fn parse_edge_addons_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if is_chrome_store_id(trimmed) {
+        return Some(trimmed.to_ascii_lowercase());
+    }
+    if !trimmed.to_ascii_lowercase().contains("microsoftedge.microsoft.com") {
+        return None;
+    }
+    parse_chrome_web_store_id(trimmed)
+}
+
+/// Generates localized EN/FR permission audit warnings before confirming extension installation.
+pub fn describe_extension_permissions(
+    permissions: &[String],
+    host_permissions: &[String],
+) -> Vec<PermissionWarning> {
+    let mut warnings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let all: Vec<&String> = permissions.iter().chain(host_permissions.iter()).collect();
+    for perm in all {
+        let p = perm.trim();
+        if !seen.insert(p.to_string()) {
+            continue;
+        }
+        let (severity, en, fr) = match p {
+            "<all_urls>" | "*://*/*" | "http://*/*" | "https://*/*" => (
+                "high",
+                "Read and change all your data on all websites",
+                "Lire et modifier toutes vos donnees sur tous les sites web",
+            ),
+            "tabs" => (
+                "medium",
+                "Read your browsing history and open tabs",
+                "Lire votre historique de navigation et vos onglets ouverts",
+            ),
+            "history" => (
+                "medium",
+                "Read and change your browsing history",
+                "Lire et modifier votre historique de navigation",
+            ),
+            "cookies" => (
+                "high",
+                "Read and modify cookies (including active sessions)",
+                "Lire et modifier les cookies (y compris vos sessions actives)",
+            ),
+            "webRequest" | "webRequestBlocking" | "declarativeNetRequest" => (
+                "medium",
+                "Intercept, inspect, or block network requests",
+                "Intercepter, inspecter ou bloquer les requetes reseau",
+            ),
+            "clipboardRead" => (
+                "high",
+                "Read data you copy and paste",
+                "Lire les donnees copiees dans le presse-papiers",
+            ),
+            "clipboardWrite" => (
+                "low",
+                "Modify data you copy and paste",
+                "Modifier les donnees dans le presse-papiers",
+            ),
+            "nativeMessaging" => (
+                "high",
+                "Communicate with cooperating native applications on this device",
+                "Communiquer avec des applications natives sur cet appareil",
+            ),
+            "debugger" => (
+                "high",
+                "Access the page debugger backend (full tab inspection)",
+                "Acceder au debogueur de page (inspection complete des onglets)",
+            ),
+            "downloads" => (
+                "medium",
+                "Manage your downloads",
+                "Gerer vos telechargements",
+            ),
+            "bookmarks" => (
+                "medium",
+                "Read and change your bookmarks",
+                "Lire et modifier vos favoris",
+            ),
+            "management" => (
+                "high",
+                "Manage your apps, extensions, and themes",
+                "Gerer vos applications, extensions et themes",
+            ),
+            "proxy" => (
+                "high",
+                "Control proxy and network routing settings",
+                "Controler les parametres proxy et le routage reseau",
+            ),
+            "storage" | "unlimitedStorage" => (
+                "low",
+                "Store extension preferences and local data",
+                "Stocker les preferences et donnees locales de l'extension",
+            ),
+            "scripting" | "activeTab" => (
+                "medium",
+                "Run scripts inside web pages you interact with",
+                "Executer des scripts dans les pages web visitees",
+            ),
+            other if other.starts_with("http://") || other.starts_with("https://") || other.starts_with("*://") => {
+                warnings.push(PermissionWarning {
+                    permission: other.to_string(),
+                    severity: "medium".to_string(),
+                    label_en: format!("Read and change your data on {}", other),
+                    label_fr: format!("Lire et modifier vos donnees sur {}", other),
+                });
+                continue;
+            }
+            _ => continue,
+        };
+        warnings.push(PermissionWarning {
+            permission: p.to_string(),
+            severity: severity.to_string(),
+            label_en: en.to_string(),
+            label_fr: fr.to_string(),
+        });
+    }
+    warnings
+}
+
+/// Inspects an unpacked directory or `.crx`/`.zip`/`.xpi` archive and returns a permission review
+/// summary without permanently enabling the extension.
+pub fn stage_extension_for_review(source: &Path) -> Result<StagedExtensionReview, String> {
+    let manifest_raw = if source.is_dir() {
+        std::fs::read_to_string(source.join("manifest.json"))
+            .map_err(|e| format!("Cannot read manifest.json: {}", e))?
+    } else if source.is_file() {
+        let bytes = std::fs::read(source).map_err(|e| format!("Cannot read archive: {}", e))?;
+        if bytes.len() > MAX_CRX_BYTES {
+            return Err("Archive exceeds 32 MiB limit".to_string());
+        }
+        let zip_slice = extract_zip_slice_from_crx(&bytes).unwrap_or(&bytes);
+        let mut archive = zip::ZipArchive::new(Cursor::new(zip_slice))
+            .map_err(|e| format!("Invalid extension archive (.crx/.zip/.xpi): {}", e))?;
+        let mut mf = archive
+            .by_name("manifest.json")
+            .map_err(|_| "Archive does not contain a root manifest.json".to_string())?;
+        let mut s = String::new();
+        mf.read_to_string(&mut s)
+            .map_err(|e| format!("Failed to read manifest.json from archive: {}", e))?;
+        s
+    } else {
+        return Err("Extension source path does not exist".to_string());
+    };
+
+    let manifest: serde_json::Value = serde_json::from_str(manifest_raw.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("Invalid manifest.json: {}", e))?;
+    let name = manifest
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown Extension")
+        .to_string();
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1.0")
+        .to_string();
+    let manifest_version = manifest
+        .get("manifest_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3);
+    let permissions: Vec<String> = manifest
+        .get("permissions")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let host_permissions: Vec<String> = manifest
+        .get("host_permissions")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let warnings = describe_extension_permissions(&permissions, &host_permissions);
+    let id = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("staged_ext")
+        .to_string();
+
+    Ok(StagedExtensionReview {
+        id,
+        name,
+        version,
+        manifest_version,
+        permissions,
+        host_permissions,
+        warnings,
+        staged_path: source.to_string_lossy().to_string(),
+    })
+}
+
+pub fn set_extension_site_access(
+    roaming_root: &Path,
+    dir_id: &str,
+    mode: SiteAccessMode,
+    allowed_sites: Vec<String>,
+) -> Result<(), String> {
+    if !is_valid_extension_dir_id(dir_id) {
+        return Err("Invalid extension ID".to_string());
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    meta.site_access_mode = mode;
+    meta.allowed_sites = allowed_sites
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(128)
+        .collect();
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+    Ok(())
+}
+
+pub fn set_extension_privacy_flags(
+    roaming_root: &Path,
+    dir_id: &str,
+    allow_in_incognito: Option<bool>,
+    allow_file_urls: Option<bool>,
+    allow_user_scripts: Option<bool>,
+) -> Result<(), String> {
+    if !is_valid_extension_dir_id(dir_id) {
+        return Err("Invalid extension ID".to_string());
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    if let Some(v) = allow_in_incognito {
+        meta.allow_in_incognito = v;
+    }
+    if let Some(v) = allow_file_urls {
+        meta.allow_file_urls = v;
+    }
+    if let Some(v) = allow_user_scripts {
+        meta.allow_user_scripts = v;
+    }
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+    Ok(())
+}
+
+pub fn set_extension_command_shortcut(
+    roaming_root: &Path,
+    dir_id: &str,
+    command_name: &str,
+    shortcut: Option<String>,
+) -> Result<(), String> {
+    if !is_valid_extension_dir_id(dir_id) || command_name.trim().is_empty() {
+        return Err("Invalid extension ID or command name".to_string());
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    match shortcut.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(key) => {
+            meta.custom_shortcuts.insert(command_name.trim().to_string(), key);
+        }
+        None => {
+            meta.custom_shortcuts.remove(command_name.trim());
+        }
+    }
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+    Ok(())
+}
+
+pub fn record_extension_error(
+    roaming_root: &Path,
+    dir_id: &str,
+    entry: ExtensionErrorEntry,
+) -> Result<(), String> {
+    if !is_valid_extension_dir_id(dir_id) {
+        return Err("Invalid extension ID".to_string());
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    meta.errors.push(entry);
+    if meta.errors.len() > 200 {
+        let excess = meta.errors.len() - 200;
+        meta.errors.drain(0..excess);
+    }
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+    Ok(())
+}
+
+pub fn get_extension_errors(roaming_root: &Path, dir_id: &str) -> Vec<ExtensionErrorEntry> {
+    read_extension_meta(roaming_root, dir_id).errors
+}
+
+pub fn clear_extension_errors(roaming_root: &Path, dir_id: &str) -> Result<(), String> {
+    if !is_valid_extension_dir_id(dir_id) {
+        return Err("Invalid extension ID".to_string());
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    meta.errors.clear();
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+    Ok(())
+}
+
+pub fn set_extension_action_badge(
+    roaming_root: &Path,
+    dir_id: &str,
+    badge_text: String,
+    badge_bg_color: Option<String>,
+) -> Result<(), String> {
+    if !is_valid_extension_dir_id(dir_id) {
+        return Err("Invalid extension ID".to_string());
+    }
+    let mut meta = read_extension_meta(roaming_root, dir_id);
+    meta.action_state.badge_text = badge_text.chars().take(8).collect();
+    if let Some(bg) = badge_bg_color {
+        if !bg.trim().is_empty() {
+            meta.action_state.badge_bg_color = bg.trim().to_string();
+        }
+    }
+    write_extension_meta(roaming_root, dir_id, &meta);
+    invalidate_extensions_cache();
+    Ok(())
+}
+
+/// Parses an Omaha v3 XML update manifest (`<app appid="..."><updatecheck codebase="..." version="..." hash_sha256="..."/>`)
+/// in pure Rust with zero external XML dependencies.
+pub fn parse_omaha_update_xml(xml: &str) -> Vec<ExtensionUpdateAvailable> {
+    fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+        let pat_dq = format!("{}=\"", attr);
+        if let Some(pos) = tag.find(&pat_dq) {
+            let rest = &tag[pos + pat_dq.len()..];
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].to_string());
+            }
+        }
+        let pat_sq = format!("{}='", attr);
+        if let Some(pos) = tag.find(&pat_sq) {
+            let rest = &tag[pos + pat_sq.len()..];
+            if let Some(end) = rest.find('\'') {
+                return Some(rest[..end].to_string());
+            }
+        }
+        None
+    }
+
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(app_pos) = rest.find("<app ") {
+        rest = &rest[app_pos..];
+        let app_tag_end = match rest.find('>') {
+            Some(i) => i,
+            None => break,
+        };
+        let app_tag = &rest[..app_tag_end];
+        let app_id = extract_attr(app_tag, "appid").unwrap_or_default();
+        let next_section_end = rest.find("</app>").unwrap_or(rest.len());
+        let app_body = &rest[app_tag_end..next_section_end];
+        if let Some(uc_pos) = app_body.find("<updatecheck") {
+            let uc_rest = &app_body[uc_pos..];
+            if let Some(uc_end) = uc_rest.find('>') {
+                let uc_tag = &uc_rest[..uc_end];
+                let status = extract_attr(uc_tag, "status").unwrap_or_else(|| "ok".to_string());
+                if status == "ok" {
+                    if let (Some(version), Some(codebase)) =
+                        (extract_attr(uc_tag, "version"), extract_attr(uc_tag, "codebase"))
+                    {
+                        let sha256 = extract_attr(uc_tag, "hash_sha256")
+                            .or_else(|| extract_attr(uc_tag, "fp"));
+                        if !app_id.is_empty() && !codebase.is_empty() {
+                            out.push(ExtensionUpdateAvailable {
+                                id: app_id,
+                                version,
+                                codebase_url: codebase,
+                                sha256,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        rest = &rest[next_section_end.min(rest.len())..];
+    }
+    out
+}
+
+/// Discovers Chrome-compatible Native Messaging host JSON manifests from configured directories.
+pub fn discover_native_messaging_hosts(dirs: &[PathBuf]) -> Vec<NativeMessagingHost> {
+    let mut hosts = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(raw) = std::fs::read_to_string(&p) {
+                if let Ok(host) = serde_json::from_str::<NativeMessagingHost>(&raw) {
+                    if !host.name.trim().is_empty() && !host.path.trim().is_empty() {
+                        hosts.push(host);
+                    }
+                }
+            }
+        }
+    }
+    hosts
 }
 
 #[cfg(test)]

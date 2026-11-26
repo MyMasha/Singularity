@@ -186,6 +186,14 @@ pub enum CefCallbackEvent {
         tab_id: u64,
         action: &'static str,
     },
+    StatusMessage {
+        tab_id: u64,
+        value: String,
+    },
+    LoadingProgress {
+        tab_id: u64,
+        progress: f64,
+    },
     CloseExtensionPopup,
 }
 
@@ -862,15 +870,39 @@ wrap_app! {
                 cmd.append_switch(Some(&CefString::from("disable-component-update")));
             }
 
+            let mut disable_feats = "BackForwardCache,RenderDocument,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls".to_string();
+            let mut enable_feats = "PlatformHEVCDecoderSupport".to_string();
+            let mut extra_flag_switches: Vec<String> = Vec::new();
+            if let Some(roaming_dir) = self.extensions_dir.as_ref().and_then(|d| d.parent()) {
+                let flags_toml = roaming_dir.join("flags.toml");
+                if let Ok(raw) = std::fs::read_to_string(&flags_toml) {
+                    let mut store = singularity_settings_registry::FlagsStore::new();
+                    if store.import_toml(&raw).is_ok() {
+                        let (ef, df, sws) = store.compile_chromium_args();
+                        for f in ef {
+                            if !enable_feats.split(',').any(|x| x == f) {
+                                if !enable_feats.is_empty() {
+                                    enable_feats.push(',');
+                                }
+                                enable_feats.push_str(&f);
+                            }
+                        }
+                        for f in df {
+                            if !disable_feats.split(',').any(|x| x == f) {
+                                if !disable_feats.is_empty() {
+                                    disable_feats.push(',');
+                                }
+                                disable_feats.push_str(&f);
+                            }
+                        }
+                        extra_flag_switches = sws;
+                    }
+                }
+            }
+
             let kv_switches = [
-                (
-                    "disable-features",
-                    // Disable `RenderDocument` alongside `BackForwardCache` to prevent CEF 150
-                    // Alloy speculative-frame `Timeout of new browser info response (has_rfh=0)`
-                    // renderer stalls (upstream chromiumembedded/cef#4348).
-                    "BackForwardCache,RenderDocument,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls",
-                ),
-                ("enable-features", "PlatformHEVCDecoderSupport"),
+                ("disable-features", disable_feats.as_str()),
+                ("enable-features", enable_feats.as_str()),
                 ("disable-blink-features", "AutomationControlled"),
                 ("autoplay-policy", "no-user-gesture-required"),
                 ("disk-cache-size", "67108864"),
@@ -878,6 +910,17 @@ wrap_app! {
             ];
             for (k, v) in kv_switches {
                 cmd.append_switch_with_value(Some(&CefString::from(k)), Some(&CefString::from(v)));
+            }
+            for sw in extra_flag_switches {
+                let clean = sw.trim_start_matches('-');
+                if let Some((k, v)) = clean.split_once('=') {
+                    cmd.append_switch_with_value(
+                        Some(&CefString::from(k)),
+                        Some(&CefString::from(v)),
+                    );
+                } else if !clean.is_empty() {
+                    cmd.append_switch(Some(&CefString::from(clean)));
+                }
             }
 
             if let Some(io_pipes) = cdp_pipe_io_arg() {
@@ -1222,6 +1265,19 @@ pub fn create_incognito_request_context() -> Option<RequestContext> {
     request_context_create_context(Some(&settings), None)
 }
 
+/// Creates a persistent isolated Chromium `RequestContext` backed by `cache_path` (for
+/// multi-profiles and Multi-Account Container tabs with isolated cookies/storage).
+pub fn create_isolated_request_context(cache_path: &Path) -> Option<RequestContext> {
+    let _ = std::fs::create_dir_all(cache_path);
+    let path_str = cache_path.to_string_lossy();
+    let settings = RequestContextSettings {
+        cache_path: CefString::from(path_str.as_ref()),
+        persist_session_cookies: 1,
+        ..Default::default()
+    };
+    request_context_create_context(Some(&settings), None)
+}
+
 #[derive(Clone)]
 struct ClientConfig {
     is_ui: bool,
@@ -1425,6 +1481,28 @@ wrap_life_span_handler! {
                     return 0;
                 }
             }
+            if target_disposition == WindowOpenDisposition::NEW_PICTURE_IN_PICTURE
+                && !self.cfg.is_ui
+                && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
+            {
+                if let Some(client_slot) = client {
+                    let pip_cfg = ClientConfig {
+                        is_ui: false,
+                        is_ext_popup: false,
+                        is_standalone_popup: true,
+                        tab_id: 0,
+                        bind_port: self.cfg.bind_port,
+                        sink: Arc::clone(&self.cfg.sink),
+                        shared_shell: Arc::clone(&self.cfg.shared_shell),
+                        download_resolver: Arc::clone(&self.cfg.download_resolver),
+                        downloads: Arc::new(Mutex::new(HashMap::new())),
+                        last_user_gesture_ms: Arc::new(AtomicU64::new(monotonic_millis())),
+                        no_gesture_urls: Arc::new(Mutex::new(HashMap::new())),
+                    };
+                    *client_slot = Some(SingularityCefClient::new(pip_cfg));
+                }
+                return 0;
+            }
             if !self.cfg.is_ui && parse_http_host_port(&url).is_some()
                 && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
             {
@@ -1553,6 +1631,27 @@ wrap_display_handler! {
             (self.cfg.sink)(CefCallbackEvent::FullscreenChanged {
                 tab_id: self.cfg.tab_id,
                 enabled: fullscreen != 0,
+            });
+        }
+
+        fn on_status_message(&self, _browser: Option<&mut Browser>, value: Option<&CefString>) {
+            if self.cfg.is_ui || self.cfg.is_ext_popup || self.cfg.tab_id == 0 {
+                return;
+            }
+            let text = value.map(CefString::to_string).unwrap_or_default();
+            (self.cfg.sink)(CefCallbackEvent::StatusMessage {
+                tab_id: self.cfg.tab_id,
+                value: text.chars().take(512).collect(),
+            });
+        }
+
+        fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
+            if self.cfg.is_ui || self.cfg.is_ext_popup || self.cfg.tab_id == 0 {
+                return;
+            }
+            (self.cfg.sink)(CefCallbackEvent::LoadingProgress {
+                tab_id: self.cfg.tab_id,
+                progress: progress.clamp(0.0, 1.0),
             });
         }
     }
@@ -1788,8 +1887,41 @@ wrap_resource_request_handler! {
             if is_blocked_local_ipc_url(&url, self.cfg.bind_port) {
                 return ReturnValue::CANCEL;
             }
+            let (gpc_enabled, https_only_enabled) = self
+                .cfg
+                .shared_shell
+                .lock()
+                .map(|shell| {
+                    let gpc = matches!(
+                        shell.core.settings.get("privacy.gpc_signal").map(|e| &e.current_value),
+                        Some(singularity_settings_registry::schema::SettingValue::Bool(true))
+                    );
+                    let https_only = matches!(
+                        shell.core.settings.get("privacy.https_only_mode").map(|e| &e.current_value),
+                        Some(singularity_settings_registry::schema::SettingValue::Bool(true))
+                    );
+                    (gpc, https_only)
+                })
+                .unwrap_or((true, false));
+            if gpc_enabled {
+                req.set_header_by_name(
+                    Some(&CefString::from("Sec-GPC")),
+                    Some(&CefString::from("1")),
+                    1,
+                );
+            }
             let rtype = req.resource_type();
             if rtype == ResourceType::MAIN_FRAME {
+                if https_only_enabled {
+                    if let Some(rest) = strip_prefix_ignore_ascii_case(&url, "http://") {
+                        let is_local = parse_http_host_port(&url)
+                            .is_some_and(|(h, _)| is_local_or_ambiguous_host(&h));
+                        if !is_local {
+                            let upgraded = format!("https://{}", rest);
+                            req.set_url(Some(&CefString::from(upgraded.as_str())));
+                        }
+                    }
+                }
                 return ReturnValue::CONTINUE;
             }
             let Some((req_host, _)) = parse_http_host_port(&url) else {
@@ -2155,25 +2287,44 @@ wrap_keyboard_handler! {
             const VK_NEXT: i32 = 0x22; // PageDown
             const VK_LEFT: i32 = 0x25;
             const VK_RIGHT: i32 = 0x27;
+            const VK_DELETE: i32 = 0x2E;
             const VK_0: i32 = 0x30;
             const VK_1: i32 = 0x31;
             const VK_9: i32 = 0x39;
+            const VK_A: i32 = 0x41;
+            const VK_B: i32 = 0x42;
+            const VK_C: i32 = 0x43;
             const VK_D: i32 = 0x44;
+            const VK_E: i32 = 0x45;
+            const VK_F: i32 = 0x46;
             const VK_H: i32 = 0x48;
+            const VK_I: i32 = 0x49;
+            const VK_J: i32 = 0x4A;
+            const VK_K: i32 = 0x4B;
             const VK_L: i32 = 0x4C;
+            const VK_M: i32 = 0x4D;
             const VK_N: i32 = 0x4E;
+            const VK_O: i32 = 0x4F;
+            const VK_P: i32 = 0x50;
             const VK_R: i32 = 0x52;
+            const VK_S: i32 = 0x53;
             const VK_T: i32 = 0x54;
+            const VK_U: i32 = 0x55;
             const VK_W: i32 = 0x57;
             const VK_NUMPAD0: i32 = 0x60;
             const VK_NUMPAD1: i32 = 0x61;
             const VK_NUMPAD9: i32 = 0x69;
             const VK_ADD: i32 = 0x6B;
             const VK_SUBTRACT: i32 = 0x6D;
+            const VK_F2: i32 = 0x71;
+            const VK_F3: i32 = 0x72;
             const VK_F4: i32 = 0x73;
             const VK_F5: i32 = 0x74;
             const VK_F6: i32 = 0x75;
+            const VK_F7: i32 = 0x76;
+            const VK_F9: i32 = 0x78;
             const VK_F11: i32 = 0x7A;
+            const VK_F12: i32 = 0x7B;
             const VK_BROWSER_BACK: i32 = 0xA6;
             const VK_BROWSER_FORWARD: i32 = 0xA7;
             const VK_OEM_PLUS: i32 = 0xBB;
@@ -2203,7 +2354,7 @@ wrap_keyboard_handler! {
                 return 0;
             }
 
-            // Native navigation & zoom shortcuts (dispatched via `NativeShortcut`).
+            // Native navigation, zoom, DevTools, print & mute shortcuts (dispatched via `NativeShortcut`).
             let native_action: Option<&'static str> = if vk == VK_BROWSER_BACK
                 || (alt_only && !shift && vk == VK_LEFT)
             {
@@ -2221,6 +2372,18 @@ wrap_keyboard_handler! {
                 Some("zoom_out")
             } else if !self.cfg.is_ui && ctrl_only && !shift && (vk == VK_0 || vk == VK_NUMPAD0) {
                 Some("zoom_reset")
+            } else if !self.cfg.is_ui && ((no_mods && vk == VK_F12) || (ctrl_only && shift && vk == VK_I)) {
+                Some("devtools_toggle")
+            } else if !self.cfg.is_ui && ctrl_only && shift && vk == VK_C {
+                Some("devtools_inspect")
+            } else if !self.cfg.is_ui && ctrl_only && shift && vk == VK_J {
+                Some("devtools_console")
+            } else if !self.cfg.is_ui && ctrl_only && !shift && vk == VK_P {
+                Some("print_page")
+            } else if !self.cfg.is_ui && ctrl_only && !shift && vk == VK_U {
+                Some("view_source")
+            } else if !self.cfg.is_ui && ctrl_only && !shift && vk == VK_M {
+                Some("toggle_mute_tab")
             } else {
                 None
             };
@@ -2242,6 +2405,8 @@ wrap_keyboard_handler! {
                     Some(("reopen_closed_tab", None))
                 } else if ctrl_only && !shift && vk == VK_T {
                     Some(("new_tab", None))
+                } else if ctrl_only && shift && vk == VK_N {
+                    Some(("new_private_window", None))
                 } else if ctrl_only && !shift && vk == VK_N {
                     Some(("new_window", None))
                 } else if ctrl_only && !shift && (vk == VK_W || vk == VK_F4) {
@@ -2257,14 +2422,48 @@ wrap_keyboard_handler! {
                     || (no_mods && vk == VK_F6)
                 {
                     Some(("focus_omnibar", None))
-                } else if (ctrl_only && vk == VK_R)
-                    || ((no_mods || (ctrl_only && !shift)) && vk == VK_F5)
-                {
+                } else if (ctrl_only && shift && vk == VK_R) || (ctrl_only && !shift && vk == VK_F5) {
+                    Some(("hard_reload_tab", None))
+                } else if (ctrl_only && !shift && vk == VK_R) || (no_mods && vk == VK_F5) {
                     Some(("reload_tab", None))
+                } else if ctrl_only && !shift && vk == VK_F {
+                    Some(("find_in_page", None))
+                } else if no_mods && vk == VK_F3 {
+                    Some(("find_next", None))
+                } else if shift && !ctrl && !alt && !meta && vk == VK_F3 {
+                    Some(("find_prev", None))
+                } else if ctrl_only && !shift && vk == VK_K || (no_mods && vk == VK_F2) {
+                    Some(("open_command_palette", None))
+                } else if ctrl_only && shift && vk == VK_A {
+                    Some(("open_tab_search", None))
+                } else if ctrl_only && shift && vk == VK_B {
+                    Some(("toggle_bookmarks_bar", None))
+                } else if ctrl_only && shift && vk == VK_O {
+                    Some(("open_bookmarks_manager", None))
+                } else if ctrl_only && shift && vk == VK_D {
+                    Some(("bookmark_all_tabs", None))
                 } else if ctrl_only && !shift && vk == VK_D {
                     Some(("toggle_bookmark", None))
+                } else if ctrl_only && !shift && vk == VK_J {
+                    Some(("open_downloads", None))
                 } else if ctrl_only && !shift && vk == VK_H {
                     Some(("open_history", None))
+                } else if ctrl_only && shift && vk == VK_S {
+                    Some(("start_web_capture", None))
+                } else if ctrl_only && !shift && vk == VK_S {
+                    Some(("save_page", None))
+                } else if ctrl_only && shift && vk == VK_DELETE {
+                    Some(("open_clear_data", None))
+                } else if shift && !ctrl && !alt && !meta && vk == VK_ESCAPE {
+                    Some(("open_task_manager", None))
+                } else if no_mods && vk == VK_F4 {
+                    Some(("toggle_sidebar", None))
+                } else if no_mods && vk == VK_F7 {
+                    Some(("toggle_caret_browsing", None))
+                } else if no_mods && vk == VK_F9 {
+                    Some(("toggle_reader_mode", None))
+                } else if alt_only && !shift && vk == VK_E {
+                    Some(("open_audio_equalizer", None))
                 } else if ctrl_only && !shift && vk == VK_OEM_COMMA {
                     Some(("open_settings", None))
                 } else if ctrl_only && !shift && (VK_1..=VK_9).contains(&vk) {
@@ -2530,6 +2729,126 @@ impl CefBrowserHandle {
             host.set_zoom_level(0.0);
         }
         100
+    }
+
+    pub fn set_zoom_level(&self, zoom_level: f64) {
+        if let Some(host) = self.browser.host() {
+            host.set_zoom_level(zoom_level.clamp(-4.0, 5.0));
+        }
+    }
+
+    pub fn set_audio_muted(&self, mute: bool) {
+        if let Some(host) = self.browser.host() {
+            host.set_audio_muted(if mute { 1 } else { 0 });
+        }
+    }
+
+    pub fn is_audio_muted(&self) -> bool {
+        self.browser
+            .host()
+            .is_some_and(|host| host.is_audio_muted() != 0)
+    }
+
+    pub fn find(&self, search_text: &str, forward: bool, match_case: bool, find_next: bool) {
+        if let Some(host) = self.browser.host() {
+            host.find(
+                Some(&CefString::from(search_text)),
+                if forward { 1 } else { 0 },
+                if match_case { 1 } else { 0 },
+                if find_next { 1 } else { 0 },
+            );
+        }
+    }
+
+    pub fn stop_finding(&self, clear_selection: bool) {
+        if let Some(host) = self.browser.host() {
+            host.stop_finding(if clear_selection { 1 } else { 0 });
+        }
+    }
+
+    pub fn print(&self) {
+        if let Some(host) = self.browser.host() {
+            host.print();
+        }
+    }
+
+    pub fn print_to_pdf(&self, path: &Path) {
+        if let Some(host) = self.browser.host() {
+            let p = path.to_string_lossy();
+            let settings = PdfPrintSettings::default();
+            host.print_to_pdf(Some(&CefString::from(p.as_ref())), Some(&settings), None);
+        }
+    }
+
+    pub fn show_dev_tools(
+        &self,
+        parent_hwnd_isize: Option<isize>,
+        rect: Option<(i32, i32, u32, u32)>,
+        inspect_at: Option<(i32, i32)>,
+    ) {
+        if let Some(host) = self.browser.host() {
+            let window_info = match (parent_hwnd_isize, rect) {
+                (Some(hwnd), Some((x, y, w, h))) if hwnd != 0 => {
+                    let parent_handle = sys::HWND(hwnd as *mut sys::HWND__);
+                    let r = Rect {
+                        x,
+                        y,
+                        width: w.max(1) as i32,
+                        height: h.max(1) as i32,
+                    };
+                    WindowInfo {
+                        runtime_style: RuntimeStyle::ALLOY,
+                        ..Default::default()
+                    }
+                    .set_as_child(parent_handle, &r)
+                }
+                _ => WindowInfo {
+                    runtime_style: RuntimeStyle::ALLOY,
+                    window_name: CefString::from("Singularity DevTools"),
+                    ..Default::default()
+                },
+            };
+            let settings = BrowserSettings {
+                background_color: 0xFF00_0000,
+                ..Default::default()
+            };
+            let pt = inspect_at
+                .map(|(x, y)| Point { x, y })
+                .unwrap_or_default();
+            host.show_dev_tools(Some(&window_info), None, Some(&settings), Some(&pt));
+        }
+    }
+
+    pub fn close_dev_tools(&self) {
+        if let Some(host) = self.browser.host() {
+            host.close_dev_tools();
+        }
+    }
+
+    pub fn has_dev_tools(&self) -> bool {
+        self.browser
+            .host()
+            .is_some_and(|host| host.has_dev_tools() != 0)
+    }
+
+    pub fn send_dev_tools_message(&self, message: &[u8]) -> bool {
+        self.browser
+            .host()
+            .is_some_and(|host| host.send_dev_tools_message(Some(message)) != 0)
+    }
+
+    pub fn view_source(&self) {
+        if let Some(frame) = self.browser.main_frame() {
+            frame.view_source();
+        }
+    }
+
+    pub fn stop_load(&self) {
+        self.browser.stop_load();
+    }
+
+    pub fn reload_ignore_cache(&self) {
+        self.browser.reload_ignore_cache();
     }
 
     pub fn request_context(&self) -> Option<RequestContext> {

@@ -1,16 +1,37 @@
 //! Singularity OLED Pure Black (`#000000`) 200Hz+ Native UI Shell Orchestrator.
 
+use crate::bookmarks_store::BookmarksStore;
 use crate::cursor::CustomCursorEngine;
+use crate::history_store::HistoryStore;
+use crate::keybinds::{
+    CommandChainStore, CommandRegistry, KeymapTable, MouseGestureRecognizer, MruTabCycler,
+};
+use crate::omnibox::OmniboxEngine;
+use crate::page_tools::{CollectionsStore, NotesStore, PdfAnnotationStore, ReadingListStore};
+use crate::profiles::{
+    ContainerRegistry, CustomizationStore, ProfileRegistry, SitePermissionsStore,
+    WorkspaceSessionStore,
+};
+use crate::pwa::PwaRegistry;
 use crate::roaming_store::{RoamingSingularityStore, SavedTabEntry, TabHandoffPayload};
 use crate::theme::SingularityThemeManifest;
+use crate::userscripts::UserscriptManager;
 use crate::vim::VimModalEngine;
+use singularity_cast::OptInCastController;
 use singularity_core::SingularityCoreOrchestrator;
-use singularity_media::{DirectStreamRecorder, OledMediaPlayer, TenBandParametricEqualizer};
+use singularity_media::{
+    DirectStreamRecorder, LiveCaptionsConfig, LiveCaptionsEngine, MediaSessionRegistry,
+    OledMediaPlayer, PerTabAudioDspManager, ReadAloudSession, TenBandParametricEqualizer,
+    TtsConfig,
+};
 use singularity_settings_registry::{
     schema::{SettingCategory, SettingValue},
     search::VirtualizedViewport,
     storage::TomlSettingsSnapshot,
+    FlagsStore, PolicyEngine,
 };
+use singularity_sync::SingularitySyncEngine;
+use singularity_translate::{OfflineTranslationEngine, TranslationPrefs};
 use singularity_vault::{Argon2idConfig, SingularityVault};
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,11 +53,39 @@ pub struct SingularityBrowserShell {
     pub vault: SingularityVault,
     pub roaming: RoamingSingularityStore,
     pub equalizer: TenBandParametricEqualizer,
+    pub audio_dsp: PerTabAudioDspManager,
     pub media_player: OledMediaPlayer,
     pub stream_recorder: DirectStreamRecorder,
+    pub media_sessions: MediaSessionRegistry,
+    pub tts_session: ReadAloudSession,
+    pub live_captions: LiveCaptionsEngine,
     pub theme: SingularityThemeManifest,
     pub cursor_engine: CustomCursorEngine,
     pub vim_engine: VimModalEngine,
+    pub flags: FlagsStore,
+    pub policy: PolicyEngine,
+    pub sync_engine: Option<SingularitySyncEngine>,
+    pub translate_engine: OfflineTranslationEngine,
+    pub cast_controller: OptInCastController,
+    pub omnibox: OmniboxEngine,
+    pub history_store: HistoryStore,
+    pub bookmarks_store: BookmarksStore,
+    pub collections: CollectionsStore,
+    pub notes: NotesStore,
+    pub reading_list: ReadingListStore,
+    pub pdf_annotations: PdfAnnotationStore,
+    pub commands: CommandRegistry,
+    pub keybinds: KeymapTable,
+    pub command_chains: CommandChainStore,
+    pub gestures: MouseGestureRecognizer,
+    pub mru_cycler: MruTabCycler,
+    pub profiles: ProfileRegistry,
+    pub containers: ContainerRegistry,
+    pub workspaces: WorkspaceSessionStore,
+    pub permissions: SitePermissionsStore,
+    pub customization: CustomizationStore,
+    pub userscripts: UserscriptManager,
+    pub pwas: PwaRegistry,
     pub settings_search_query: String,
     pub settings_category_filter: Option<SettingCategory>,
     pub settings_scroll_offset_px: usize,
@@ -60,19 +109,29 @@ impl SingularityBrowserShell {
         Self::launch_with_launch_args(detach_handoff_id, None, force_new_window)
     }
 
+    /// Launches a browser shell anchored to an isolated profile directory.
+    pub fn launch_at_dir(root_dir: std::path::PathBuf) -> Result<Self, String> {
+        let roaming = RoamingSingularityStore::open_at(root_dir)?;
+        Self::launch_with_roaming(roaming)
+    }
+
     pub fn launch_with_launch_args(
         detach_handoff_id: Option<&str>,
         restore_session_id: Option<&str>,
         force_new_window: bool,
     ) -> Result<Self, String> {
-        let mut core = SingularityCoreOrchestrator::boot()?;
-        let mut roaming = RoamingSingularityStore::open_default_with_launch_args(
+        let roaming = RoamingSingularityStore::open_default_with_launch_args(
             detach_handoff_id,
             restore_session_id,
             force_new_window,
         )?;
+        Self::launch_with_roaming(roaming)
+    }
 
-        // Restore persisted user overrides across the 2,165 settings registry from `%APPDATA%\.singularity\settings.toml`
+    fn launch_with_roaming(mut roaming: RoamingSingularityStore) -> Result<Self, String> {
+        let mut core = SingularityCoreOrchestrator::boot()?;
+
+        // Restore persisted user overrides across the 2,500+ settings registry from `%APPDATA%\.singularity\settings.toml`
         // and inspect any explicit `mullvad.killswitch.*` entries so they are never clobbered by default `false`.
         let mut toml_strict_override: Option<bool> = None;
         let mut toml_block_lan_override: Option<bool> = None;
@@ -98,6 +157,10 @@ impl SingularityBrowserShell {
             let _ = core.settings.import_toml(&saved_toml);
         }
 
+        // Load enterprise/managed policy overlay (read-only if present)
+        let policy = PolicyEngine::load_default_linux_policies();
+        let _ = core.settings.apply_policy_engine(&policy);
+
         // Configure Mullvad Kill-Switch for real end users:
         // By default, users without a Mullvad subscription browse freely with Singularity Shields active.
         // Preserve strict kill-switch activation from EITHER `roaming.profile.strict_mullvad_killswitch`
@@ -114,7 +177,7 @@ impl SingularityBrowserShell {
             .set_block_lan_rfc1918(effective_block_lan);
         roaming.profile.strict_mullvad_killswitch = effective_strict;
 
-        // Wire live hot-reload hook so kill-switch changes in the 2,165 Settings Registry apply immediately
+        // Wire live hot-reload hook so kill-switch changes in the Settings Registry apply immediately
         let ks_arc = Arc::clone(core.mullvad_vpn.kill_switch());
         core.settings.register_hot_reload_hook(Arc::new(move |evt| {
             if let SettingValue::Bool(b) = evt.new_value {
@@ -160,16 +223,86 @@ impl SingularityBrowserShell {
             &core.chromium_bridge,
         );
 
+        let root_dir = roaming.root_dir().to_path_buf();
+        let mut flags = FlagsStore::new();
+        if let Ok(raw_flags) = std::fs::read_to_string(root_dir.join("flags.toml")) {
+            let _ = flags.import_toml(&raw_flags);
+        }
+        let history_store =
+            HistoryStore::load_from_dir(&root_dir).unwrap_or_else(|_| HistoryStore::new(100_000));
+        let bookmarks_store =
+            BookmarksStore::load_from_dir(&root_dir).unwrap_or_else(|_| BookmarksStore::new());
+        let collections = CollectionsStore::load_from_path(&root_dir.join("collections.json"))
+            .unwrap_or_else(|_| CollectionsStore::new());
+        let notes = NotesStore::load_from_path(&root_dir.join("notes.json"))
+            .unwrap_or_else(|_| NotesStore::new());
+        let reading_list = ReadingListStore::load_from_path(&root_dir.join("reading_list.json"))
+            .unwrap_or_else(|_| ReadingListStore::new());
+        let keybinds = KeymapTable::load_or_default(&root_dir.join("keybinds.json"));
+        let command_chains =
+            CommandChainStore::load_from_path(&root_dir.join("command_chains.json"))
+                .unwrap_or_else(|_| CommandChainStore::new());
+        let profiles = ProfileRegistry::load_from_path(&root_dir.join("profiles.json"))
+            .unwrap_or_else(|_| ProfileRegistry::new_default());
+        let containers = ContainerRegistry::load_from_path(&root_dir.join("containers.json"))
+            .unwrap_or_else(|_| ContainerRegistry::new());
+        let workspaces =
+            WorkspaceSessionStore::load_from_path(&root_dir.join("workspaces.json"))
+                .unwrap_or_default();
+        let permissions =
+            SitePermissionsStore::load_from_path(&root_dir.join("permissions.json"))
+                .unwrap_or_else(|_| SitePermissionsStore::new_hardened());
+        let customization =
+            CustomizationStore::load_from_path(&root_dir.join("customization.json"))
+                .unwrap_or_default();
+        let userscripts = UserscriptManager::open_at(&root_dir)
+            .unwrap_or_else(|_| UserscriptManager::open_at(&std::env::temp_dir().join("singularity-userscripts")).expect("temp userscripts"));
+        let pwas = PwaRegistry::open_at(&root_dir)
+            .unwrap_or_else(|_| PwaRegistry::open_at(&std::env::temp_dir().join("singularity-pwas")).expect("temp pwas"));
+        let mut translate_prefs = TranslationPrefs::default();
+        if !roaming.profile.language.trim().is_empty() {
+            translate_prefs.target_lang = roaming.profile.language.trim().to_ascii_lowercase();
+        }
+        let translate_engine = OfflineTranslationEngine::new(translate_prefs);
+
         let mut shell = Self {
             core,
             vault,
             roaming,
             equalizer: TenBandParametricEqualizer::default(),
+            audio_dsp: PerTabAudioDspManager::new(48_000.0),
             media_player: OledMediaPlayer::default(),
             stream_recorder: DirectStreamRecorder::new(),
+            media_sessions: MediaSessionRegistry::new(),
+            tts_session: ReadAloudSession::new(TtsConfig::default()),
+            live_captions: LiveCaptionsEngine::new(LiveCaptionsConfig::default(), 256),
             theme: SingularityThemeManifest::default(),
             cursor_engine: CustomCursorEngine::default(),
             vim_engine: VimModalEngine::default(),
+            flags,
+            policy,
+            sync_engine: None,
+            translate_engine,
+            cast_controller: OptInCastController::new(),
+            omnibox: OmniboxEngine::default(),
+            history_store,
+            bookmarks_store,
+            collections,
+            notes,
+            reading_list,
+            pdf_annotations: PdfAnnotationStore::new(),
+            commands: CommandRegistry::new(),
+            keybinds,
+            command_chains,
+            gestures: MouseGestureRecognizer::default(),
+            mru_cycler: MruTabCycler::new(),
+            profiles,
+            containers,
+            workspaces,
+            permissions,
+            customization,
+            userscripts,
+            pwas,
             settings_search_query: String::new(),
             settings_category_filter: None,
             settings_scroll_offset_px: 0,
@@ -363,7 +496,7 @@ impl SingularityBrowserShell {
             .map_err(|e| e.to_string())
     }
 
-    /// Queries the 2,165+ settings registry with virtualized scrolling for `singularity://settings`.
+    /// Queries the 2,500+ settings registry with virtualized scrolling for `singularity://settings`.
     pub fn render_virtualized_settings_viewport(
         &self,
         viewport_height_px: usize,
@@ -375,5 +508,88 @@ impl SingularityBrowserShell {
             viewport_height_px,
             54,
         )
+    }
+
+    pub fn save_flags(&self) -> Result<(), String> {
+        let toml = self.flags.export_toml()?;
+        std::fs::write(self.roaming.root_dir().join("flags.toml"), toml).map_err(|e| e.to_string())
+    }
+
+    pub fn save_history_store(&self) -> Result<(), String> {
+        self.history_store
+            .save_to_dir(self.roaming.root_dir())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_bookmarks_store(&self) -> Result<(), String> {
+        self.bookmarks_store
+            .save_to_dir(self.roaming.root_dir())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_collections(&self) -> Result<(), String> {
+        self.collections
+            .save_to_path(&self.roaming.root_dir().join("collections.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_notes(&self) -> Result<(), String> {
+        self.notes
+            .save_to_path(&self.roaming.root_dir().join("notes.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_reading_list(&self) -> Result<(), String> {
+        self.reading_list
+            .save_to_path(&self.roaming.root_dir().join("reading_list.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_keybinds(&self) -> Result<(), String> {
+        self.keybinds
+            .save_to_path(&self.roaming.root_dir().join("keybinds.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_command_chains(&self) -> Result<(), String> {
+        self.command_chains
+            .save_to_path(&self.roaming.root_dir().join("command_chains.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_profiles(&self) -> Result<(), String> {
+        self.profiles
+            .save_to_path(&self.roaming.root_dir().join("profiles.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_containers(&self) -> Result<(), String> {
+        self.containers
+            .save_to_path(&self.roaming.root_dir().join("containers.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_workspaces(&self) -> Result<(), String> {
+        self.workspaces
+            .save_to_path(&self.roaming.root_dir().join("workspaces.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_permissions(&self) -> Result<(), String> {
+        self.permissions
+            .save_to_path(&self.roaming.root_dir().join("permissions.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_customization(&self) -> Result<(), String> {
+        self.customization
+            .save_to_path(&self.roaming.root_dir().join("customization.json"))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn verified_vault_master_bytes(&self) -> Option<&[u8]> {
+        self.verified_vault_master.as_deref().map(|v| v.as_slice())
     }
 }

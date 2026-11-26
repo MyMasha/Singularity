@@ -2488,8 +2488,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
+name = "singularity-cast"
+version = "3.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "singularity-chromium-ffi"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "hex",
  "rand_core",
@@ -2502,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-core"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2515,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-installer"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "windows",
  "zip",
@@ -2523,14 +2532,14 @@ dependencies = [
 
 [[package]]
 name = "singularity-media"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "singularity-net-mullvad"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2544,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-settings-registry"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2553,8 +2562,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "singularity-sync"
+version = "3.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hex",
+ "hmac",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "singularity-translate"
+version = "3.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "singularity-ui"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "cef",
@@ -2565,10 +2605,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "singularity-cast",
  "singularity-core",
  "singularity-media",
  "singularity-net-mullvad",
  "singularity-settings-registry",
+ "singularity-sync",
+ "singularity-translate",
  "singularity-vault",
  "subtle",
  "tao",
@@ -2582,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "singularity-vault"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2595,7 +2638,9 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "subtle",
  "thiserror 2.0.21",
+ "x25519-dalek",
  "zeroize",
 ]
 

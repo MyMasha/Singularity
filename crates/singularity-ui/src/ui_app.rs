@@ -2074,6 +2074,265 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     cursor: pointer;
   }
   .crash-btn-close:hover { background: rgba(255, 255, 255, 0.14); }
+/* ============================================================================
+ * SINGULARITY v3.0 OLED PARITY SHELL COMPONENTS
+ * ============================================================================ */
+#omnibox-dropdown {
+  position: fixed;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(680px, 88vw);
+  max-height: 440px;
+  overflow-y: auto;
+  background: rgba(6, 6, 10, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.92);
+  padding: 6px;
+  z-index: 9400;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  backdrop-filter: blur(18px);
+}
+#omnibox-dropdown.open { display: flex; }
+.omni-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  cursor: pointer;
+  color: #f4f4f8;
+  font-size: 12.5px;
+  border: 1px solid transparent;
+}
+.omni-item:hover, .omni-item.active {
+  background: rgba(124, 58, 237, 0.18);
+  border-color: rgba(167, 139, 250, 0.35);
+}
+.omni-item-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.omni-item-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.omni-item-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); }
+.omni-badge {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--gold-bright);
+  flex-shrink: 0;
+}
+
+#v3-sidebar {
+  position: fixed;
+  top: 46px;
+  left: 0;
+  bottom: 0;
+  width: 340px;
+  max-width: 90vw;
+  background: #000000;
+  border-right: 1px solid rgba(255, 255, 255, 0.12);
+  z-index: 8800;
+  display: none;
+  flex-direction: column;
+  box-shadow: 12px 0 40px rgba(0, 0, 0, 0.85);
+}
+#v3-sidebar.open { display: flex; }
+.v3-sb-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  overflow-x: auto;
+}
+.v3-sb-tab {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  font-size: 11px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.v3-sb-tab.active {
+  background: rgba(124, 58, 237, 0.28);
+  border-color: rgba(167, 139, 250, 0.5);
+  color: #ffffff;
+}
+.v3-sb-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+
+#command-palette-modal, #tab-search-modal, #v3-internal-frame-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(12px);
+  z-index: 9600;
+  display: none;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 72px;
+}
+#command-palette-modal.open, #tab-search-modal.open, #v3-internal-frame-modal.open { display: flex; }
+.v3-modal-card {
+  width: min(640px, 92vw);
+  max-height: 76vh;
+  background: #050508;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 16px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.95);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.v3-modal-input {
+  width: 100%;
+  background: #000000;
+  color: #ffffff;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 14px 16px;
+  font-size: 14px;
+  outline: none;
+}
+.v3-modal-list {
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.v3-kbd {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--text-secondary);
+}
+
+#find-in-page-bar {
+  position: fixed;
+  top: 50px;
+  right: 18px;
+  z-index: 9500;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  background: #050508;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 11px;
+  padding: 6px 10px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.9);
+}
+#find-in-page-bar.open { display: flex; }
+#find-in-page-input {
+  background: #000000;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  padding: 5px 8px;
+  font-size: 12px;
+  width: 200px;
+  outline: none;
+}
+
+#v3-popover-panel {
+  position: fixed;
+  top: 48px;
+  right: 14px;
+  width: min(400px, 92vw);
+  max-height: 75vh;
+  overflow-y: auto;
+  background: #050508;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 14px;
+  padding: 14px;
+  z-index: 9550;
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.92);
+}
+#v3-popover-panel.open { display: flex; }
+
+#v3-status-bubble {
+  position: fixed;
+  left: 8px;
+  bottom: 8px;
+  max-width: 60vw;
+  background: rgba(0, 0, 0, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 9300;
+  pointer-events: none;
+  display: none;
+}
+#v3-status-bubble.visible { display: block; }
+
+body.vertical-tabs #v3-vertical-rail { display: flex; }
+#v3-vertical-rail {
+  position: fixed;
+  top: 46px;
+  left: 0;
+  bottom: 0;
+  width: 230px;
+  background: #000000;
+  border-right: 1px solid rgba(255, 255, 255, 0.11);
+  z-index: 8600;
+  display: none;
+  flex-direction: column;
+  padding: 8px;
+  gap: 4px;
+  overflow-y: auto;
+}
+.v3-vtab-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+  border: 1px solid transparent;
+}
+.v3-vtab-row.active {
+  background: rgba(124, 58, 237, 0.22);
+  border-color: rgba(167, 139, 250, 0.42);
+  color: #ffffff;
+}
+.v3-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.v3-chip-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #f4f4f8;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.v3-chip-btn:hover { background: rgba(124, 58, 237, 0.24); border-color: rgba(167, 139, 250, 0.45); }
 </style>
 </head>
 <body>
@@ -2168,6 +2427,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
                  placeholder="Search or enter website address"
                  data-i18n-placeholder="omnibar_placeholder" />
           <button type="button" class="omnibar-drm-pill" id="btn-drm-mode" style="display:none" title="DRM Protected Playback Mode (PlayReady / Widevine VMP)">DRM</button>
+          <button type="button" class="omnibar-act-btn" id="btn-reader-mode" title="Reader Mode (F9)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+          </button>
+          <button type="button" class="omnibar-act-btn" id="btn-qr-share" title="Share QR Code">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>
+          </button>
           <button type="button" class="omnibar-act-btn" id="btn-bookmark-star" title="Bookmark this page (Ctrl+D)" data-i18n-title="nav_bookmark">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
@@ -2186,6 +2451,25 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       <div class="toolbar-right-wrap">
         <div class="toolbar-right">
           <div class="ext-toolbar-strip" id="ext-toolbar-strip"></div>
+
+          <button type="button" class="icon-btn" id="btn-v3-sidebar" title="Sidebar Panels (F4)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="btn-v3-vertical-tabs" title="Vertical Tabs &amp; Workspaces">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="14" y2="18"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="btn-v3-split-view" title="Split View (Side-by-Side)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="btn-v3-downloads" title="Downloads Manager (Ctrl+J)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="btn-v3-media" title="Global Media, 10-Band EQ 600%, TTS &amp; Cast (Alt+E)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="btn-v3-palette" title="Command Palette (Ctrl+K)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          </button>
 
           <button type="button" class="icon-btn" id="btn-extensions" title="Chrome Extensions (Web Store & local)" data-i18n-title="nav_extensions" data-open-sheet="extensions">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
@@ -2476,12 +2760,32 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
           </button>
           <button type="button" class="sheet-tab-btn" id="stab-settings" data-sheet-tab="settings">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/></svg>
-            <span id="stab-settings-label" data-i18n="stab_engine">Engine (2,165+ settings)</span>
+            <span id="stab-settings-label" data-i18n="stab_engine">Engine (2,500+ settings)</span>
+          </button>
+          <button type="button" class="sheet-tab-btn" id="stab-profiles" data-sheet-tab="profiles">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            <span>Profiles &amp; Containers</span>
+          </button>
+          <button type="button" class="sheet-tab-btn" id="stab-performance" data-sheet-tab="performance">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            <span>Performance &amp; DNS</span>
+          </button>
+          <button type="button" class="sheet-tab-btn" id="stab-ecosystem" data-sheet-tab="ecosystem">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            <span>Userscripts, PWA &amp; Translate</span>
+          </button>
+          <button type="button" class="sheet-tab-btn" id="stab-sync" data-sheet-tab="sync">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            <span>Zero-Knowledge Sync</span>
+          </button>
+          <button type="button" class="sheet-tab-btn" id="stab-internals" data-sheet-tab="internals">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            <span>Flags, Keybinds &amp; browser://</span>
           </button>
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v2.0.10</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.0</div>
         </div>
       </aside>
 
@@ -2849,9 +3153,178 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         </div>
         <div class="rows-pane" id="modal-rows-list"></div>
       </div>
+
+      <!-- TAB 9: PROFILES, CONTAINERS, WORKSPACES & SITE PERMISSIONS -->
+      <div class="panel-grid" id="pane-profiles" style="display:none;">
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Multi-Profiles &amp; Multi-Account Containers</div>
+          <div class="v3-grid-2" style="margin-top:8px;">
+            <div>
+              <div style="font-size:11.5px;color:var(--text-secondary);margin-bottom:6px;">Active Profiles</div>
+              <div id="v3-profiles-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+              <div style="display:flex;gap:6px;margin-top:8px;">
+                <input id="v3-new-profile-name" class="sheet-search" style="flex:1;" placeholder="New profile name (Work, Gaming...)" />
+                <button type="button" id="btn-v3-create-profile" class="v3-chip-btn">Create</button>
+              </div>
+            </div>
+            <div>
+              <div style="font-size:11.5px;color:var(--text-secondary);margin-bottom:6px;">Container Tabs (Isolated Cookies)</div>
+              <div id="v3-containers-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+            </div>
+          </div>
+        </div>
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Workspaces &amp; Site Privacy Shredder</div>
+          <div id="v3-workspaces-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+          <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+            <input id="v3-shred-domain" class="sheet-search" style="flex:1;min-width:180px;" placeholder="Domain to shred (e.g. tracker.example.com)" />
+            <button type="button" id="btn-v3-shred-site" class="btn-subtle btn-danger">Shred Site Data</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 10: PERFORMANCE, RESOURCE LIMITERS, ENERGY SAVER & ENCRYPTED DNS -->
+      <div class="panel-grid" id="pane-performance" style="display:none;">
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Performance Profiles &amp; Resource Limiters</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+            <button type="button" class="v3-chip-btn" data-perf-preset="ultra">Ultra 200Hz</button>
+            <button type="button" class="v3-chip-btn" data-perf-preset="balanced">Balanced</button>
+            <button type="button" class="v3-chip-btn" data-perf-preset="gaming">Gaming Low-Latency</button>
+            <button type="button" class="v3-chip-btn" data-perf-preset="eco">Eco / Battery Saver</button>
+          </div>
+          <pre id="v3-perf-status" style="margin-top:10px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:pre-wrap;">Loading telemetry...</pre>
+        </div>
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Encrypted DNS (DoH / DoT / DoQ / ODoH) &amp; Tab Organizer</div>
+          <div id="v3-dns-presets" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+          <div style="display:flex;gap:8px;margin-top:10px;">
+            <button type="button" id="btn-v3-dns-clear" class="v3-chip-btn">Clear DNS Cache</button>
+            <button type="button" id="btn-v3-tab-organize" class="v3-chip-btn">Suggest Smart Tab Groups &amp; Duplicates</button>
+          </div>
+          <pre id="v3-tab-org-out" style="margin-top:8px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);white-space:pre-wrap;display:none;"></pre>
+        </div>
+      </div>
+
+      <!-- TAB 11: USERSCRIPTS, PWA APPS & OFFLINE TRANSLATE -->
+      <div class="panel-grid" id="pane-ecosystem" style="display:none;">
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Native Userscripts Engine (GM_* Isolated Sandbox)</div>
+          <div id="v3-userscripts-list" style="display:flex;flex-direction:column;gap:6px;margin-top:8px;"></div>
+          <textarea id="v3-userscript-src" class="sheet-search" rows="4" style="margin-top:8px;font-family:var(--font-mono);font-size:11px;" placeholder="// ==UserScript==&#10;// @name My Script&#10;// @match https://example.com/*&#10;// ==/UserScript==&#10;console.log('Singularity');"></textarea>
+          <button type="button" id="btn-v3-install-us" class="v3-chip-btn" style="margin-top:6px;align-self:flex-start;">Install Userscript</button>
+        </div>
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Progressive Web Apps (PWA) &amp; 100% Offline Translate</div>
+          <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+            <input id="v3-pwa-url" class="sheet-search" style="flex:1;" placeholder="https://app.example.com" />
+            <input id="v3-pwa-title" class="sheet-search" style="width:160px;" placeholder="App Name" />
+            <button type="button" id="btn-v3-install-pwa" class="v3-chip-btn">Install Site as App</button>
+          </div>
+          <div id="v3-pwa-list" style="display:flex;flex-direction:column;gap:6px;margin-top:8px;"></div>
+          <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
+            <input id="v3-tr-input" class="sheet-search" style="flex:1;" placeholder="Offline translate test (EN/FR/ES/DE)..." />
+            <button type="button" id="btn-v3-tr-run" class="v3-chip-btn">Detect &amp; Translate Offline</button>
+          </div>
+          <div id="v3-tr-out" style="margin-top:6px;font-family:var(--font-mono);font-size:11.5px;color:var(--gold-bright);"></div>
+        </div>
+      </div>
+
+      <!-- TAB 12: ZERO-KNOWLEDGE P2P E2EE SYNC -->
+      <div class="panel-grid" id="pane-sync" style="display:none;">
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Singularity Zero-Knowledge P2P Sync (24+1 Words, XChaCha20-Poly1305, Zero Cloud Account)</div>
+          <div id="v3-sync-status" style="margin-top:8px;font-family:var(--font-mono);font-size:11.5px;color:var(--text-secondary);">Not linked</div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+            <button type="button" id="btn-v3-sync-create" class="v3-chip-btn">Create New Sync Chain</button>
+            <button type="button" id="btn-v3-sync-leave" class="btn-subtle btn-danger">Leave Chain</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:10px;">
+            <input id="v3-sync-phrase" class="sheet-search" style="flex:1;" placeholder="Enter 24 or 25-word recovery phrase to join..." />
+            <button type="button" id="btn-v3-sync-join" class="v3-chip-btn">Join Chain</button>
+          </div>
+          <pre id="v3-sync-words-out" style="display:none;margin-top:10px;padding:10px;border-radius:8px;background:#000;border:1px solid rgba(255,255,255,0.14);font-family:var(--font-mono);font-size:11px;color:var(--gold-bright);white-space:pre-wrap;"></pre>
+        </div>
+      </div>
+
+      <!-- TAB 13: EXPERIMENTAL FLAGS, KEYBINDS & browser:// INTERNAL PAGES -->
+      <div class="panel-grid" id="pane-internals" style="display:none;">
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Internal Diagnostic Pages (browser://) &amp; DevTools</div>
+          <div id="v3-internal-links" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+        </div>
+        <div class="info-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="font-size:14px;font-weight:600;">Experimental Flags (browser://flags)</div>
+            <button type="button" id="btn-v3-flags-reset" class="v3-chip-btn">Reset All Flags</button>
+          </div>
+          <div id="v3-flags-list" style="display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:260px;overflow-y:auto;"></div>
+        </div>
+        <div class="info-card">
+          <div style="font-size:14px;font-weight:600;">Keyboard Presets &amp; Remapping</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+            <button type="button" class="v3-chip-btn" data-kb-preset="chrome_edge">Chrome / Edge</button>
+            <button type="button" class="v3-chip-btn" data-kb-preset="vivaldi">Vivaldi</button>
+            <button type="button" class="v3-chip-btn" data-kb-preset="arc">Arc</button>
+            <button type="button" class="v3-chip-btn" data-kb-preset="vim">Vim Modal</button>
+          </div>
+          <div id="v3-keybinds-summary" style="margin-top:8px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);"></div>
+        </div>
+      </div>
       </div>
     </div>
   </div>
+
+  <!-- SINGULARITY v3.0 FLOATING OVERLAYS -->
+  <div id="omnibox-dropdown" role="listbox" aria-label="Omnibox suggestions"></div>
+  <aside id="v3-vertical-rail" aria-label="Vertical tabs rail"></aside>
+  <aside id="v3-sidebar" aria-label="Singularity Sidebar">
+    <div class="v3-sb-tabs">
+      <button type="button" class="v3-sb-tab active" data-sb="bookmarks">Bookmarks</button>
+      <button type="button" class="v3-sb-tab" data-sb="history">History</button>
+      <button type="button" class="v3-sb-tab" data-sb="downloads">Downloads</button>
+      <button type="button" class="v3-sb-tab" data-sb="reading">Read Later</button>
+      <button type="button" class="v3-sb-tab" data-sb="notes">Notes</button>
+      <button type="button" class="v3-sb-tab" data-sb="collections">Collections</button>
+      <button type="button" class="v3-sb-tab" id="btn-v3-sb-close" style="margin-left:auto;">✕</button>
+    </div>
+    <div class="v3-sb-body" id="v3-sb-body"></div>
+  </aside>
+
+  <div id="command-palette-modal" role="dialog" aria-modal="true" aria-label="Command Palette">
+    <div class="v3-modal-card">
+      <input id="command-palette-input" class="v3-modal-input" type="text" placeholder="Type a command (Ctrl+K / F2)..." />
+      <div id="command-palette-list" class="v3-modal-list"></div>
+    </div>
+  </div>
+
+  <div id="tab-search-modal" role="dialog" aria-modal="true" aria-label="Search Open Tabs">
+    <div class="v3-modal-card">
+      <input id="tab-search-input" class="v3-modal-input" type="text" placeholder="Search open &amp; recently closed tabs (Ctrl+Shift+A)..." />
+      <div id="tab-search-list" class="v3-modal-list"></div>
+    </div>
+  </div>
+
+  <div id="find-in-page-bar" role="search" aria-label="Find in page">
+    <input id="find-in-page-input" type="text" placeholder="Find in page (Ctrl+F)..." />
+    <button type="button" class="v3-chip-btn" id="btn-find-prev">↑</button>
+    <button type="button" class="v3-chip-btn" id="btn-find-next">↓</button>
+    <button type="button" class="v3-chip-btn" id="btn-find-close">✕</button>
+  </div>
+
+  <div id="v3-popover-panel" role="dialog" aria-label="Singularity Quick Popover"></div>
+
+  <div id="v3-internal-frame-modal" role="dialog" aria-modal="true" aria-label="Internal Page Viewer">
+    <div class="v3-modal-card" style="width:min(1080px,95vw);height:82vh;max-height:86vh;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.12);">
+        <span id="v3-internal-frame-title" style="font-family:var(--font-mono);font-size:12.5px;color:var(--gold-bright);">browser://urls</span>
+        <button type="button" class="v3-chip-btn" id="btn-v3-internal-close">Close</button>
+      </div>
+      <iframe id="v3-internal-iframe" sandbox="allow-scripts" style="flex:1;width:100%;border:none;background:#000;"></iframe>
+    </div>
+  </div>
+
+  <div id="v3-status-bubble"></div>
 
   <div id="group-editor-bar" role="dialog" aria-label="Edit tab group" data-i18n-aria="grp_edit_aria">
     <input id="group-editor-name" class="grp-ed-input" type="text" maxlength="40" placeholder="Group name..." data-i18n-placeholder="grp_name_ph" />
@@ -3438,6 +3911,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (u.includes("vault")) return "vault";
     if (u.includes("mullvad") || u.includes("vpn")) return "mullvad";
     if (u.includes("engine")) return "settings";
+    if (u.includes("profiles") || u.includes("containers")) return "profiles";
+    if (u.includes("performance") || u.includes("dns")) return "performance";
+    if (u.includes("ecosystem") || u.includes("pwa") || u.includes("userscripts")) return "ecosystem";
+    if (u.includes("sync")) return "sync";
+    if (u.includes("internals") || u.includes("flags") || u.includes("keybinds")) return "internals";
     return "general";
   }
 
@@ -3449,6 +3927,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (sec === "vault") return "singularity://settings/vault";
     if (sec === "mullvad") return "singularity://settings/mullvad";
     if (sec === "settings") return "singularity://settings/engine";
+    if (sec === "profiles") return "singularity://settings/profiles";
+    if (sec === "performance") return "singularity://settings/performance";
+    if (sec === "ecosystem") return "singularity://settings/ecosystem";
+    if (sec === "sync") return "singularity://settings/sync";
+    if (sec === "internals") return "singularity://settings/internals";
     return "singularity://settings";
   }
 
@@ -3460,6 +3943,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     if (sec === "vault") return L("Vault & 2FA", "Coffre-fort & 2FA");
     if (sec === "mullvad") return L("Shield & WireGuard", "Bouclier & WireGuard");
     if (sec === "settings") return L("Settings · Engine", "Paramètres · Moteur");
+    if (sec === "profiles") return L("Profiles & Containers", "Profils & Conteneurs");
+    if (sec === "performance") return L("Performance & DNS", "Performance & DNS");
+    if (sec === "ecosystem") return L("Userscripts & PWAs", "Userscripts & PWAs");
+    if (sec === "sync") return L("Zero-Knowledge Sync", "Sync Zero-Knowledge");
+    if (sec === "internals") return L("Flags & browser://", "Flags & browser://");
     return L("Settings", "Paramètres");
   }
 
@@ -5389,6 +5877,54 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
         break;
       case "web_forward":
         historyForward();
+        break;
+      case "open_command_palette":
+        if (window.__v3) window.__v3.openPalette();
+        break;
+      case "open_tab_search":
+        if (window.__v3) window.__v3.openTabSearch();
+        break;
+      case "toggle_sidebar":
+        if (window.__v3) window.__v3.toggleSidebar();
+        break;
+      case "find_in_page":
+        if (window.__v3) window.__v3.openFindBar();
+        break;
+      case "find_next":
+        if (window.__v3) window.__v3.stepFind(true);
+        break;
+      case "find_prev":
+        if (window.__v3) window.__v3.stepFind(false);
+        break;
+      case "open_downloads":
+        if (window.__v3) window.__v3.openPopover("downloads");
+        break;
+      case "open_audio_equalizer":
+        if (window.__v3) window.__v3.openPopover("media");
+        break;
+      case "toggle_reader_mode":
+        if (window.__v3) window.__v3.openReaderPreview();
+        break;
+      case "open_task_manager":
+        if (window.__v3) window.__v3.openInternalPage("process-manager");
+        break;
+      case "open_bookmarks_manager":
+        openSheet("bookmarks");
+        break;
+      case "bookmark_all_tabs":
+        if (window.__v3) window.__v3.bookmarkAllTabs();
+        break;
+      case "hard_reload_tab":
+        sendNativeIpc({ cmd: "hard_reload" });
+        break;
+      case "new_private_window":
+        togglePrivateMode();
+        break;
+      case "devtools_toggle":
+        sendNativeIpc({ cmd: "dev_tools_action", action: "toggle", dock_width_px: 0 });
+        break;
+      case "toggle_mute_tab":
+        if (window.__v3) window.__v3.toggleActiveMute();
         break;
     }
   }
@@ -7536,7 +8072,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       bookmarks: L("Bookmarks & History", "Favoris & Historique"),
       vault: L("Zero-Knowledge Vault & 2FA", "Coffre-fort Zero-Knowledge & 2FA"),
       mullvad: L("Network Shield & WireGuard", "Bouclier Réseau & WireGuard"),
-      settings: L("Singularity Engine (2,165+ settings)", "Moteur Singularity (2 165+ réglages)")
+      settings: L("Singularity Engine (2,500+ settings)", "Moteur Singularity (2 500+ réglages)"),
+      profiles: L("Profiles, Containers & Workspaces", "Profils, Conteneurs & Espaces de travail"),
+      performance: L("Performance, Limiters, Energy & DNS", "Performance, Limiteurs, Énergie & DNS"),
+      ecosystem: L("Userscripts, PWAs & Offline Translate", "Userscripts, PWAs & Traduction Hors-ligne"),
+      sync: L("Zero-Knowledge P2P Sync", "Synchronisation P2P Zero-Knowledge"),
+      internals: L("Experimental Flags, Keybinds & browser://", "Flags Expérimentaux, Raccourcis & browser://")
     };
     return map[sec] || L("Settings", "Paramètres");
   }
@@ -7553,7 +8094,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     currentSettingsSection = sec;
     stopVaultTotpTicker();
 
-    const allTabs = ["general", "appearance", "extensions", "tokens", "bookmarks", "vault", "mullvad", "settings"];
+    const allTabs = ["general", "appearance", "extensions", "tokens", "bookmarks", "vault", "mullvad", "settings", "profiles", "performance", "ecosystem", "sync", "internals"];
     allTabs.forEach(k => {
       const btn = document.getElementById("stab-" + k);
       const pane = document.getElementById("pane-" + k);
@@ -7590,6 +8131,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     else if (sec === "vault") await loadVaultPanel();
     else if (sec === "mullvad") await loadMullvadPanel();
     else if (sec === "settings") { await loadCategories(); await querySettings(true); }
+    else if (window.__v3 && window.__v3.loadSettingsPane) { await window.__v3.loadSettingsPane(sec); }
   }
 
   /* --- TAB 1: GENERAL & UPDATES (REAL-TIME DOWNLOAD PROGRESS BAR) --- */
@@ -9638,6 +10180,756 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }, 8000);
   // Periodically unload inactive tabs from RAM according to the active 4-mode RAM policy
   setInterval(sweepInactiveTabsForRam, 30000);
+  /* ============================================================================
+   * SINGULARITY v3.0 PARITY CONTROLLER (ALL 10 DOMAINS LIVE API WIRING)
+   * ============================================================================ */
+  (function initSingularityV3Shell() {
+    let sbOpen = false;
+    let sbTab = "bookmarks";
+    let verticalMode = false;
+    let splitActive = false;
+    let activeMuted = false;
+    let omniTimer = null;
+    let omniIdx = -1;
+    let omniItems = [];
+
+    const byId = (id) => document.getElementById(id);
+    const mk = (tag, cls, text) => {
+      const el = document.createElement(tag);
+      if (cls) el.className = cls;
+      if (text !== undefined && text !== null) el.textContent = String(text);
+      return el;
+    };
+
+    async function apiJson(url, method, payload) {
+      const opts = { method: method || "GET" };
+      if (payload !== undefined) {
+        opts.headers = { "Content-Type": "application/json" };
+        opts.body = JSON.stringify(payload);
+      }
+      const res = await apiFetch(url, opts);
+      return await res.json();
+    }
+
+    function syncChromeInsets() {
+      const leftPx = (sbOpen ? 340 : 0) + (verticalMode && !sbOpen ? 230 : 0);
+      sendNativeIpc({
+        cmd: "set_chrome_layout",
+        top_bar_extra_px: 0,
+        left_sidebar_px: leftPx,
+        right_sidebar_px: 0,
+        bottom_bar_px: 0
+      });
+    }
+
+    function openInternalPage(slug) {
+      const clean = String(slug || "urls").replace(/^(browser|singularity|chrome):\/\//i, "").replace(/^\/+/, "");
+      const modal = byId("v3-internal-frame-modal");
+      const iframe = byId("v3-internal-iframe");
+      const title = byId("v3-internal-frame-title");
+      if (!modal || !iframe) return;
+      if (title) title.textContent = "browser://" + clean;
+      iframe.src = "/browser/" + encodeURIComponent(clean);
+      modal.classList.add("open");
+      sendNativeIpc({ cmd: "set_overlay", open: true });
+    }
+
+    function closeInternalPage() {
+      const modal = byId("v3-internal-frame-modal");
+      if (modal) modal.classList.remove("open");
+      sendNativeIpc({ cmd: "set_overlay", open: anyModalOpen() });
+    }
+
+    function closeAllV3Popups() {
+      ["omnibox-dropdown", "command-palette-modal", "tab-search-modal", "v3-popover-panel"].forEach((id) => {
+        const el = byId(id);
+        if (el) el.classList.remove("open");
+      });
+      sendNativeIpc({ cmd: "set_overlay", open: anyModalOpen() });
+    }
+
+    // --- 1. OMNIBOX LIVE DROPDOWN (FRECENCY, BANGS, INSTANT ANSWERS, SCOPES) ---
+    function renderOmniboxDropdown(resp) {
+      const dd = byId("omnibox-dropdown");
+      if (!dd) return;
+      dd.textContent = "";
+      omniItems = Array.isArray(resp && resp.items) ? resp.items : [];
+      omniIdx = -1;
+      if (!omniItems.length) {
+        dd.classList.remove("open");
+        return;
+      }
+      omniItems.forEach((it, i) => {
+        const row = mk("div", "omni-item");
+        const main = mk("div", "omni-item-main");
+        main.appendChild(mk("div", "omni-item-title", it.title || it.text || it.url || ""));
+        main.appendChild(mk("div", "omni-item-sub", it.subtitle || it.url || ""));
+        row.appendChild(main);
+        row.appendChild(mk("span", "omni-badge", String(it.kind || "item").replace(/_/g, " ")));
+        row.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          dd.classList.remove("open");
+          const targetUrl = it.url || it.target_url || "";
+          if (/^(browser|chrome):\/\//i.test(targetUrl)) {
+            openInternalPage(targetUrl);
+          } else if (it.kind === "open_tab" && it.tab_id) {
+            activateTab(Number(it.tab_id));
+          } else if (it.kind === "instant_answer" && it.subtitle) {
+            navigator.clipboard?.writeText(String(it.title || "")).catch(() => {});
+            showToast(L("Copied instant answer", "Réponse instantanée copiée"));
+          } else if (targetUrl) {
+            const inp = byId("omnibar-input");
+            if (inp) inp.value = targetUrl;
+            if (typeof submitOmnibar === "function") submitOmnibar(targetUrl);
+          }
+        });
+        row.dataset.idx = String(i);
+        dd.appendChild(row);
+      });
+      dd.classList.add("open");
+    }
+
+    const omniInput = byId("omnibar-input");
+    if (omniInput) {
+      omniInput.addEventListener("input", () => {
+        clearTimeout(omniTimer);
+        const val = omniInput.value || "";
+        if (!val.trim()) {
+          const dd = byId("omnibox-dropdown");
+          if (dd) dd.classList.remove("open");
+          return;
+        }
+        omniTimer = setTimeout(async () => {
+          try {
+            const resp = await apiJson("/api/omnibox/suggest?limit=10&q=" + encodeURIComponent(val));
+            renderOmniboxDropdown(resp);
+          } catch (_) {}
+        }, 70);
+      });
+      omniInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          const raw = (omniInput.value || "").trim();
+          if (/^browser:\/\//i.test(raw)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const dd = byId("omnibox-dropdown");
+            if (dd) dd.classList.remove("open");
+            openInternalPage(raw);
+          }
+        } else if (e.key === "Escape") {
+          const dd = byId("omnibox-dropdown");
+          if (dd) dd.classList.remove("open");
+        }
+      }, true);
+      omniInput.addEventListener("blur", () => {
+        setTimeout(() => {
+          const dd = byId("omnibox-dropdown");
+          if (dd) dd.classList.remove("open");
+        }, 160);
+      });
+    }
+
+    // --- 2. COMMAND PALETTE (Ctrl+K / F2) ---
+    async function queryPalette(q) {
+      const list = byId("command-palette-list");
+      if (!list) return;
+      list.textContent = "";
+      try {
+        const resp = await apiJson("/api/palette/query?limit=25&q=" + encodeURIComponent(q || ""));
+        (resp.commands || []).forEach((cmd) => {
+          const row = mk("div", "omni-item");
+          const main = mk("div", "omni-item-main");
+          main.appendChild(mk("div", "omni-item-title", currentLang === "fr" ? cmd.label_fr : cmd.label_en));
+          main.appendChild(mk("div", "omni-item-sub", cmd.id));
+          row.appendChild(main);
+          if (cmd.shortcut) row.appendChild(mk("span", "v3-kbd", cmd.shortcut));
+          row.addEventListener("click", () => {
+            closeAllV3Popups();
+            executePaletteCommand(cmd.id);
+          });
+          list.appendChild(row);
+        });
+      } catch (_) {}
+    }
+
+    function executePaletteCommand(cmdId) {
+      if (cmdId === "tabs.new") createNewTab();
+      else if (cmdId === "tabs.close") closeTab(activeTabId);
+      else if (cmdId === "tabs.reopen_closed") reopenLastClosedTab();
+      else if (cmdId === "tabs.search") openTabSearch();
+      else if (cmdId === "tabs.toggle_vertical") toggleVerticalTabs();
+      else if (cmdId === "tabs.split_toggle") toggleSplitView();
+      else if (cmdId === "view.toggle_sidebar") toggleSidebar();
+      else if (cmdId === "view.reader_mode") openReaderPreview();
+      else if (cmdId === "devtools.toggle") sendNativeIpc({ cmd: "dev_tools_action", action: "toggle", dock_width_px: 0 });
+      else if (cmdId === "page.find") openFindBar();
+      else if (cmdId === "page.print") sendNativeIpc({ cmd: "print_page" });
+      else if (cmdId === "page.view_source") sendNativeIpc({ cmd: "view_source" });
+      else if (cmdId === "app.settings") openSheet("general");
+      else if (cmdId === "app.flags") openInternalPage("flags");
+      else if (cmdId === "app.task_manager") openInternalPage("process-manager");
+      else if (cmdId === "downloads.open") openPopover("downloads");
+      else if (cmdId === "media.equalizer") openPopover("media");
+      else showToast(cmdId);
+    }
+
+    function openPalette() {
+      const m = byId("command-palette-modal");
+      const inp = byId("command-palette-input");
+      if (!m || !inp) return;
+      m.classList.add("open");
+      sendNativeIpc({ cmd: "set_overlay", open: true });
+      inp.value = "";
+      inp.focus();
+      queryPalette("");
+    }
+
+    // --- 3. TAB SEARCH (Ctrl+Shift+A) ---
+    function renderTabSearch(q) {
+      const list = byId("tab-search-list");
+      if (!list) return;
+      list.textContent = "";
+      const needle = String(q || "").trim().toLowerCase();
+      tabs.forEach((t) => {
+        const hay = ((t.title || "") + " " + (t.url || "")).toLowerCase();
+        if (needle && !hay.includes(needle)) return;
+        const row = mk("div", "omni-item");
+        const main = mk("div", "omni-item-main");
+        main.appendChild(mk("div", "omni-item-title", t.title || L("New Tab", "Nouvel onglet")));
+        main.appendChild(mk("div", "omni-item-sub", t.url || "singularity://newtab"));
+        row.appendChild(main);
+        row.appendChild(mk("span", "omni-badge", t.id === activeTabId ? "Active" : "Tab"));
+        row.addEventListener("click", () => {
+          closeAllV3Popups();
+          activateTab(t.id);
+        });
+        list.appendChild(row);
+      });
+    }
+
+    function openTabSearch() {
+      const m = byId("tab-search-modal");
+      const inp = byId("tab-search-input");
+      if (!m || !inp) return;
+      m.classList.add("open");
+      sendNativeIpc({ cmd: "set_overlay", open: true });
+      inp.value = "";
+      inp.focus();
+      renderTabSearch("");
+    }
+
+    // --- 4. VERTICAL TABS & SPLIT VIEW ---
+    function renderVerticalRail() {
+      const rail = byId("v3-vertical-rail");
+      if (!rail) return;
+      rail.textContent = "";
+      const hdr = mk("div", "", "");
+      hdr.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:4px 6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);margin-bottom:4px;";
+      hdr.appendChild(mk("span", "", "Tabs (" + tabs.length + ")"));
+      const addBtn = mk("button", "v3-chip-btn", "+");
+      addBtn.addEventListener("click", () => { createNewTab(); renderVerticalRail(); });
+      hdr.appendChild(addBtn);
+      rail.appendChild(hdr);
+      tabs.forEach((t) => {
+        const row = mk("div", "v3-vtab-row" + (t.id === activeTabId ? " active" : ""));
+        row.appendChild(mk("span", "omni-item-title", t.title || L("New Tab", "Nouvel onglet")));
+        row.addEventListener("click", () => { activateTab(t.id); renderVerticalRail(); });
+        rail.appendChild(row);
+      });
+    }
+
+    function toggleVerticalTabs() {
+      verticalMode = !verticalMode;
+      document.body.classList.toggle("vertical-tabs", verticalMode);
+      if (verticalMode) renderVerticalRail();
+      syncChromeInsets();
+      showToast(verticalMode ? L("Vertical Tabs enabled", "Onglets verticaux activés") : L("Horizontal Tabs restored", "Onglets horizontaux restaurés"));
+    }
+
+    function toggleSplitView() {
+      splitActive = !splitActive;
+      if (splitActive && tabs.length >= 2) {
+        const second = tabs.find((t) => t.id !== activeTabId);
+        sendNativeIpc({
+          cmd: "set_split_layout",
+          tab_ids: [activeTabId, second.id],
+          orientation: "horizontal",
+          ratio: 0.5
+        });
+        showToast(L("Split View active (50/50)", "Vue scindée active (50/50)"));
+      } else {
+        splitActive = false;
+        sendNativeIpc({ cmd: "set_split_layout", tab_ids: [], orientation: "horizontal", ratio: 0.5 });
+        showToast(L("Split View closed", "Vue scindée fermée"));
+      }
+    }
+
+    // --- 5. DOCKABLE SIDEBAR (6 NATIVE PANELS) ---
+    async function renderSidebarPanel(kind) {
+      sbTab = kind || sbTab;
+      document.querySelectorAll(".v3-sb-tab[data-sb]").forEach((b) => b.classList.toggle("active", b.dataset.sb === sbTab));
+      const body = byId("v3-sb-body");
+      if (!body) return;
+      body.textContent = "Loading...";
+      try {
+        if (sbTab === "bookmarks") {
+          const r = await apiJson("/api/bookmarks/tree");
+          body.textContent = "";
+          const addBtn = mk("button", "v3-chip-btn", "+ Bookmark Active Tab");
+          addBtn.addEventListener("click", async () => {
+            const t = getActiveTab();
+            if (t && t.url) {
+              await apiJson("/api/bookmarks/add", "POST", { title: t.title || t.url, url: t.url });
+              renderSidebarPanel("bookmarks");
+            }
+          });
+          body.appendChild(addBtn);
+          (r.children || []).forEach((n) => {
+            const row = mk("div", "omni-item");
+            row.appendChild(mk("div", "omni-item-title", (n.kind === "folder" ? "📁 " : "★ ") + (n.title || n.url || "")));
+            row.addEventListener("click", () => { if (n.url && typeof submitOmnibar === "function") submitOmnibar(n.url); });
+            body.appendChild(row);
+          });
+        } else if (sbTab === "history") {
+          const r = await apiJson("/api/history/query?limit=40");
+          body.textContent = "";
+          (r.items || []).forEach((h) => {
+            const row = mk("div", "omni-item");
+            const main = mk("div", "omni-item-main");
+            main.appendChild(mk("div", "omni-item-title", h.title || h.url));
+            main.appendChild(mk("div", "omni-item-sub", h.domain || h.url));
+            row.appendChild(main);
+            row.addEventListener("click", () => { if (typeof submitOmnibar === "function") submitOmnibar(h.url); });
+            body.appendChild(row);
+          });
+        } else if (sbTab === "downloads") {
+          const r = await apiJson("/api/downloads/list");
+          body.textContent = "";
+          body.appendChild(mk("div", "omni-item-sub", "Active: " + r.active_count + " · Queued: " + r.queued_count));
+          (r.records || []).forEach((d) => {
+            const row = mk("div", "omni-item");
+            row.appendChild(mk("div", "omni-item-title", d.filename + " (" + d.state + ")"));
+            body.appendChild(row);
+          });
+        } else if (sbTab === "reading") {
+          const r = await apiJson("/api/reading_list/list");
+          body.textContent = "";
+          const addBtn = mk("button", "v3-chip-btn", "+ Save Active Page Offline");
+          addBtn.addEventListener("click", async () => {
+            const t = getActiveTab();
+            if (t && t.url) {
+              await apiJson("/api/reading_list/add", "POST", { url: t.url, title: t.title || t.url });
+              renderSidebarPanel("reading");
+            }
+          });
+          body.appendChild(addBtn);
+          (r.items || []).forEach((it) => {
+            const row = mk("div", "omni-item");
+            row.appendChild(mk("div", "omni-item-title", it.title || it.url));
+            body.appendChild(row);
+          });
+        } else if (sbTab === "notes") {
+          const r = await apiJson("/api/notes/list");
+          body.textContent = "";
+          const ta = mk("textarea", "sheet-search");
+          ta.rows = 3;
+          ta.placeholder = "Quick Markdown note...";
+          const btn = mk("button", "v3-chip-btn", "Save Note");
+          btn.addEventListener("click", async () => {
+            if (!ta.value.trim()) return;
+            await apiJson("/api/notes/create", "POST", { title: ta.value.slice(0, 36), markdown: ta.value });
+            renderSidebarPanel("notes");
+          });
+          body.appendChild(ta);
+          body.appendChild(btn);
+          (r.notes || []).forEach((n) => {
+            const row = mk("div", "omni-item");
+            row.appendChild(mk("div", "omni-item-title", n.title));
+            body.appendChild(row);
+          });
+        } else if (sbTab === "collections") {
+          const r = await apiJson("/api/collections/list");
+          body.textContent = "";
+          const btn = mk("button", "v3-chip-btn", "+ New Collection");
+          btn.addEventListener("click", async () => {
+            await apiJson("/api/collections/create", "POST", { title: "Research " + new Date().toLocaleTimeString() });
+            renderSidebarPanel("collections");
+          });
+          body.appendChild(btn);
+          (r.collections || []).forEach((c) => {
+            const row = mk("div", "omni-item");
+            row.appendChild(mk("div", "omni-item-title", c.title + " (" + (c.items || []).length + ")"));
+            body.appendChild(row);
+          });
+        }
+      } catch (e) {
+        body.textContent = String(e);
+      }
+    }
+
+    function toggleSidebar() {
+      sbOpen = !sbOpen;
+      const sb = byId("v3-sidebar");
+      if (sb) sb.classList.toggle("open", sbOpen);
+      if (sbOpen) renderSidebarPanel(sbTab);
+      syncChromeInsets();
+    }
+
+    // --- 6. POPOVER HUB (DOWNLOADS, MEDIA/EQ/TTS/CAST, QR, READER) ---
+    async function openPopover(kind) {
+      const pop = byId("v3-popover-panel");
+      if (!pop) return;
+      pop.textContent = "";
+      pop.classList.add("open");
+      sendNativeIpc({ cmd: "set_overlay", open: true });
+      const head = mk("div", "");
+      head.style.cssText = "display:flex;justify-content:space-between;align-items:center;";
+      head.appendChild(mk("strong", "", kind.toUpperCase()));
+      const closeBtn = mk("button", "v3-chip-btn", "✕");
+      closeBtn.addEventListener("click", closeAllV3Popups);
+      head.appendChild(closeBtn);
+      pop.appendChild(head);
+
+      if (kind === "downloads") {
+        const r = await apiJson("/api/downloads/list");
+        pop.appendChild(mk("div", "omni-item-sub", "Active: " + r.active_count + " | Queued: " + r.queued_count + " | Max concurrent: " + r.max_concurrent));
+        (r.records || []).slice(0, 12).forEach((d) => {
+          const row = mk("div", "omni-item");
+          row.appendChild(mk("div", "omni-item-title", d.filename + " [" + d.state + "]"));
+          pop.appendChild(row);
+        });
+      } else if (kind === "media") {
+        const [ms, cast, caps] = await Promise.all([
+          apiJson("/api/media/sessions"),
+          apiJson("/api/cast/status"),
+          apiJson("/api/media/capabilities")
+        ]);
+        pop.appendChild(mk("div", "omni-item-sub", "Global Media Sessions: " + (ms.sessions || []).length + " | Cast sockets: " + cast.active_sockets));
+        const boostLabel = mk("div", "omni-item-sub", "Volume Boost (0-600%) & 10-Band EQ Presets:");
+        pop.appendChild(boostLabel);
+        const eqRow = mk("div", "");
+        eqRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+        ["flat", "event_horizon", "harman", "vocal", "cinema", "gaming"].forEach((p) => {
+          const b = mk("button", "v3-chip-btn", p);
+          b.addEventListener("click", async () => {
+            await apiJson("/api/media/equalizer", "POST", { preset: p });
+            showToast("EQ preset: " + p);
+          });
+          eqRow.appendChild(b);
+        });
+        pop.appendChild(eqRow);
+        const slider = mk("input");
+        slider.type = "range"; slider.min = "0"; slider.max = "600"; slider.value = "100";
+        slider.addEventListener("change", async () => {
+          await apiJson("/api/media/equalizer", "POST", { volume_boost_percent: Number(slider.value) });
+          showToast("Volume Boost: " + slider.value + "%");
+        });
+        pop.appendChild(slider);
+        const castRow = mk("div", "");
+        castRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+        const bStart = mk("button", "v3-chip-btn", "Opt-In Cast Scan");
+        bStart.addEventListener("click", async () => { await apiJson("/api/cast/discover_start", "POST", {}); showToast("Opt-in Cast discovery started"); });
+        const bStop = mk("button", "v3-chip-btn", "Stop Cast Scan");
+        bStop.addEventListener("click", async () => { await apiJson("/api/cast/discover_stop", "POST", {}); showToast("Cast sockets closed (0 active)"); });
+        castRow.appendChild(bStart);
+        castRow.appendChild(bStop);
+        pop.appendChild(castRow);
+        pop.appendChild(mk("div", "omni-item-sub", "HW Codecs: " + JSON.stringify(caps).slice(0, 180)));
+      } else if (kind === "qr") {
+        const t = getActiveTab();
+        const url = (t && t.url) || "https://singularity.browser";
+        const r = await apiJson("/api/omnibox/qr?data=" + encodeURIComponent(url));
+        pop.appendChild(mk("div", "omni-item-sub", url));
+        if (r.svg) {
+          const img = mk("img");
+          img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(r.svg);
+          img.style.cssText = "width:220px;height:220px;align-self:center;border-radius:10px;background:#fff;padding:8px;";
+          pop.appendChild(img);
+        }
+      }
+    }
+
+    async function openReaderPreview() {
+      const t = getActiveTab();
+      const title = (t && t.title) || "Singularity Reader Mode";
+      const url = (t && t.url) || "https://singularity.browser";
+      const sampleHtml = "<article><h1>" + title + "</h1><p>Distraction-free OLED Pure Black Reader Mode with WCAG AAA contrast, OpenDyslexic support, and Line Focus.</p></article>";
+      const r = await apiJson("/api/reader/extract", "POST", { url, html: sampleHtml, theme: "oled" });
+      const modal = byId("v3-internal-frame-modal");
+      const iframe = byId("v3-internal-iframe");
+      const hdr = byId("v3-internal-frame-title");
+      if (modal && iframe && r.html) {
+        if (hdr) hdr.textContent = "Reader Mode · " + title;
+        iframe.srcdoc = r.html;
+        modal.classList.add("open");
+        sendNativeIpc({ cmd: "set_overlay", open: true });
+      }
+    }
+
+    // --- 7. FIND IN PAGE (Ctrl+F) ---
+    function openFindBar() {
+      const bar = byId("find-in-page-bar");
+      const inp = byId("find-in-page-input");
+      if (!bar || !inp) return;
+      bar.classList.add("open");
+      inp.focus();
+      inp.select();
+    }
+
+    function stepFind(forward) {
+      const inp = byId("find-in-page-input");
+      if (!inp) return;
+      sendNativeIpc({
+        cmd: "find_in_page",
+        text: inp.value || "",
+        forward: !!forward,
+        match_case: false,
+        find_next: true,
+        stop: false
+      });
+    }
+
+    // --- 8. NEW SETTINGS PANES LOADER ---
+    async function loadSettingsPane(sec) {
+      if (sec === "profiles") {
+        const [profs, conts, wss] = await Promise.all([
+          apiJson("/api/profiles/list"),
+          apiJson("/api/containers/list"),
+          apiJson("/api/workspaces/list")
+        ]);
+        const pl = byId("v3-profiles-list");
+        if (pl) {
+          pl.textContent = "";
+          (profs.profiles || []).forEach((p) => {
+            const b = mk("button", "v3-chip-btn", (p.id === profs.active_profile_id ? "● " : "") + p.name + " (" + p.id + ")");
+            b.addEventListener("click", async () => { await apiJson("/api/profiles/switch", "POST", { id: p.id }); loadSettingsPane("profiles"); });
+            pl.appendChild(b);
+          });
+        }
+        const cl = byId("v3-containers-list");
+        if (cl) {
+          cl.textContent = "";
+          (conts.containers || []).forEach((c) => cl.appendChild(mk("div", "omni-item-sub", "● " + c.name + " [" + c.id + "]")));
+        }
+        const wl = byId("v3-workspaces-list");
+        if (wl) {
+          wl.textContent = "";
+          (wss.workspaces || []).forEach((w) => wl.appendChild(mk("span", "omni-badge", w.name)));
+        }
+      } else if (sec === "performance") {
+        const [st, dns] = await Promise.all([apiJson("/api/performance/status"), apiJson("/api/dns/presets")]);
+        const out = byId("v3-perf-status");
+        if (out) out.textContent = JSON.stringify(st, null, 2);
+        const dp = byId("v3-dns-presets");
+        if (dp) {
+          dp.textContent = "";
+          (dns.presets || []).forEach((p) => dp.appendChild(mk("span", "omni-badge", p.display_name)));
+        }
+      } else if (sec === "ecosystem") {
+        const [us, pwas] = await Promise.all([apiJson("/api/userscripts/list"), apiJson("/api/pwa/list")]);
+        const ul = byId("v3-userscripts-list");
+        if (ul) {
+          ul.textContent = "";
+          (us.scripts || []).forEach((s) => ul.appendChild(mk("div", "omni-item-sub", (s.enabled ? "✓ " : "○ ") + s.meta.name + " (" + s.id + ")")));
+        }
+        const pl = byId("v3-pwa-list");
+        if (pl) {
+          pl.textContent = "";
+          (pwas.apps || []).forEach((a) => pl.appendChild(mk("div", "omni-item-sub", "▣ " + (a.manifest && a.manifest.name) + " — " + (a.manifest && a.manifest.start_url))));
+        }
+      } else if (sec === "sync") {
+        const st = await apiJson("/api/sync/status");
+        const el = byId("v3-sync-status");
+        if (el) el.textContent = st.linked ? ("Linked Chain: " + st.chain_id + " · Device: " + st.device_id + " · Peers: " + (st.devices || []).length) : "Not linked (Zero-Knowledge local only)";
+      } else if (sec === "internals") {
+        const [urls, fl, kb] = await Promise.all([
+          apiJson("/api/internal/urls"),
+          apiJson("/api/internal/flags"),
+          apiJson("/api/keybinds/list")
+        ]);
+        const il = byId("v3-internal-links");
+        if (il) {
+          il.textContent = "";
+          (urls.pages || []).slice(0, 24).forEach((p) => {
+            const b = mk("button", "v3-chip-btn", p.url);
+            b.addEventListener("click", () => openInternalPage(p.slug));
+            il.appendChild(b);
+          });
+        }
+        const flEl = byId("v3-flags-list");
+        if (flEl) {
+          flEl.textContent = "";
+          (fl.flags || []).forEach((f) => {
+            const row = mk("div", "omni-item");
+            row.appendChild(mk("div", "omni-item-title", f.title + " (" + f.id + ")"));
+            const sel = mk("select", "v3-chip-btn");
+            (f.options || []).forEach((opt, oi) => {
+              const o = mk("option", "", opt);
+              o.value = String(oi);
+              if (oi === f.current_index) o.selected = true;
+              sel.appendChild(o);
+            });
+            sel.addEventListener("change", async () => {
+              await apiJson("/api/flags/set", "POST", { id: f.id, option_index: Number(sel.value) });
+              showToast("Flag updated: " + f.id);
+            });
+            row.appendChild(sel);
+            flEl.appendChild(row);
+          });
+        }
+        const kbEl = byId("v3-keybinds-summary");
+        if (kbEl) kbEl.textContent = "Active preset: " + kb.preset + " · Bound commands: " + Object.keys(kb.bindings || {}).length + " · Conflicts: " + (kb.conflicts || []).length;
+      }
+    }
+
+    // Wire buttons & events
+    byId("btn-v3-sidebar")?.addEventListener("click", toggleSidebar);
+    byId("btn-v3-sb-close")?.addEventListener("click", toggleSidebar);
+    byId("btn-v3-vertical-tabs")?.addEventListener("click", toggleVerticalTabs);
+    byId("btn-v3-split-view")?.addEventListener("click", toggleSplitView);
+    byId("btn-v3-downloads")?.addEventListener("click", () => openPopover("downloads"));
+    byId("btn-v3-media")?.addEventListener("click", () => openPopover("media"));
+    byId("btn-v3-palette")?.addEventListener("click", openPalette);
+    byId("btn-qr-share")?.addEventListener("click", () => openPopover("qr"));
+    byId("btn-reader-mode")?.addEventListener("click", openReaderPreview);
+    byId("btn-v3-internal-close")?.addEventListener("click", closeInternalPage);
+    byId("btn-find-prev")?.addEventListener("click", () => stepFind(false));
+    byId("btn-find-next")?.addEventListener("click", () => stepFind(true));
+    byId("btn-find-close")?.addEventListener("click", () => {
+      byId("find-in-page-bar")?.classList.remove("open");
+      sendNativeIpc({ cmd: "find_in_page", text: "", forward: true, match_case: false, find_next: false, stop: true });
+    });
+    byId("find-in-page-input")?.addEventListener("input", () => stepFind(true));
+    byId("command-palette-input")?.addEventListener("input", (e) => queryPalette(e.currentTarget.value));
+    byId("tab-search-input")?.addEventListener("input", (e) => renderTabSearch(e.currentTarget.value));
+    byId("command-palette-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(); });
+    byId("tab-search-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(); });
+    document.querySelectorAll(".v3-sb-tab[data-sb]").forEach((b) => b.addEventListener("click", () => renderSidebarPanel(b.dataset.sb)));
+    document.querySelectorAll("[data-perf-preset]").forEach((b) => b.addEventListener("click", async () => {
+      await apiJson("/api/performance/profile", "POST", { preset: b.dataset.perfPreset });
+      loadSettingsPane("performance");
+      showToast("Performance profile: " + b.dataset.perfPreset);
+    }));
+    document.querySelectorAll("[data-kb-preset]").forEach((b) => b.addEventListener("click", async () => {
+      await apiJson("/api/keybinds/preset", "POST", { preset: b.dataset.kbPreset });
+      loadSettingsPane("internals");
+      showToast("Keymap preset: " + b.dataset.kbPreset);
+    }));
+    byId("btn-v3-create-profile")?.addEventListener("click", async () => {
+      const name = (byId("v3-new-profile-name")?.value || "").trim();
+      if (!name) return;
+      await apiJson("/api/profiles/create", "POST", { name });
+      loadSettingsPane("profiles");
+    });
+    byId("btn-v3-shred-site")?.addEventListener("click", async () => {
+      const domain = (byId("v3-shred-domain")?.value || "").trim();
+      if (!domain) return;
+      const r = await apiJson("/api/privacy/shred_site", "POST", { domain });
+      showToast("Shredded " + domain + " (" + (r.history_removed || 0) + " visits)");
+    });
+    byId("btn-v3-dns-clear")?.addEventListener("click", async () => {
+      await apiJson("/api/dns/clear_cache", "POST", {});
+      showToast("DNS cache cleared");
+    });
+    byId("btn-v3-tab-organize")?.addEventListener("click", async () => {
+      const r = await apiJson("/api/tabs/organize_suggest");
+      const out = byId("v3-tab-org-out");
+      if (out) { out.style.display = "block"; out.textContent = JSON.stringify(r, null, 2); }
+    });
+    byId("btn-v3-install-us")?.addEventListener("click", async () => {
+      const source = byId("v3-userscript-src")?.value || "";
+      const r = await apiJson("/api/userscripts/install", "POST", { source });
+      showToast(r.ok ? "Userscript installed" : (r.error || "Install failed"));
+      loadSettingsPane("ecosystem");
+    });
+    byId("btn-v3-install-pwa")?.addEventListener("click", async () => {
+      const url = byId("v3-pwa-url")?.value || "";
+      const title = byId("v3-pwa-title")?.value || "App";
+      const r = await apiJson("/api/pwa/install", "POST", { url, title });
+      showToast(r.ok ? "PWA installed" : (r.error || "Install failed"));
+      loadSettingsPane("ecosystem");
+    });
+    byId("btn-v3-tr-run")?.addEventListener("click", async () => {
+      const text = byId("v3-tr-input")?.value || "";
+      if (!text.trim()) return;
+      const det = await apiJson("/api/translate/detect", "POST", { text });
+      const target = det.language === "fr" ? "en" : "fr";
+      const tr = await apiJson("/api/translate/batch", "POST", { source_lang: det.language, target_lang: target, segments: [text] });
+      const out = byId("v3-tr-out");
+      if (out) out.textContent = "[" + det.language + " -> " + target + "] " + ((tr.segments && tr.segments[0]) || "");
+    });
+    byId("btn-v3-sync-create")?.addEventListener("click", async () => {
+      const r = await apiJson("/api/sync/create_chain", "POST", { device_name: "Singularity Desktop" });
+      const out = byId("v3-sync-words-out");
+      if (out && r.ok) {
+        out.style.display = "block";
+        out.textContent = "24-Word Permanent Key:\n" + r.permanent_24_words + "\n\nToday's 25-Word Enrollment Phrase:\n" + r.daily_25_words;
+      }
+      loadSettingsPane("sync");
+    });
+    byId("btn-v3-sync-join")?.addEventListener("click", async () => {
+      const phrase = byId("v3-sync-phrase")?.value || "";
+      const r = await apiJson("/api/sync/join_chain", "POST", { phrase, device_name: "Singularity Desktop" });
+      showToast(r.ok ? "Joined sync chain!" : (r.error || "Invalid phrase"));
+      loadSettingsPane("sync");
+    });
+    byId("btn-v3-sync-leave")?.addEventListener("click", async () => {
+      await apiJson("/api/sync/leave_chain", "POST", {});
+      loadSettingsPane("sync");
+    });
+    byId("btn-v3-flags-reset")?.addEventListener("click", async () => {
+      await apiJson("/api/flags/reset_all", "POST", {});
+      loadSettingsPane("internals");
+      showToast("All flags reset to default");
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        closeAllV3Popups();
+        closeInternalPage();
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        openPalette();
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        openTabSearch();
+      } else if (e.key === "F4" && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        toggleSidebar();
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        openFindBar();
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        openPopover("downloads");
+      } else if (e.key === "F9" && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        openReaderPreview();
+      }
+    });
+
+    window.__v3 = {
+      openPalette,
+      openTabSearch,
+      toggleSidebar,
+      openFindBar,
+      stepFind,
+      openPopover,
+      openReaderPreview,
+      openInternalPage,
+      loadSettingsPane,
+      bookmarkAllTabs: async () => {
+        const r = await apiJson("/api/bookmarks/bookmark_all_tabs", "POST", { folder_name: "Session " + new Date().toLocaleDateString() });
+        showToast("Bookmarked " + (r.count || 0) + " tabs");
+      },
+      toggleActiveMute: () => {
+        activeMuted = !activeMuted;
+        sendNativeIpc({ cmd: "set_tab_audio_muted", tab_id: activeTabId, muted: activeMuted });
+        showToast(activeMuted ? "Tab muted" : "Tab unmuted");
+      }
+    };
+  })();
+
   sendNativeIpc({ cmd: "ui_ready" });
 </script>
 </body>

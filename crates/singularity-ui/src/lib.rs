@@ -1,11 +1,20 @@
 //! `singularity-ui` — OLED Pure Black (`#000000`) 200Hz+ Native UI Shell,
 //! Custom Cursor Engine, Black Hole WGSL Shader, Vim Modal Navigation, and 2,165+ Virtualized Settings UI.
 
+pub mod api_v3;
+pub mod bookmarks_store;
 pub mod browser_import;
 pub mod crash_guard;
 pub mod cursor;
 pub mod drm_webview;
 pub mod extensions;
+pub mod history_store;
+pub mod internal_pages;
+pub mod keybinds;
+pub mod omnibox;
+pub mod page_tools;
+pub mod profiles;
+pub mod pwa;
 pub mod roaming_store;
 pub mod server;
 pub mod shaders;
@@ -13,17 +22,41 @@ pub mod shell;
 pub mod theme;
 pub mod ui_app;
 pub mod updater;
+pub mod userscripts;
 pub mod vim;
 #[cfg(target_os = "windows")]
 pub mod cef_runtime;
 pub mod winhttp_client;
 
+pub use bookmarks_store::{BookmarkNode, BookmarkNodeKind, BookmarksStore, SmartFolderRule};
 pub use browser_import::{
     parse_chromium_bookmarks, parse_chromium_snss_session, parse_firefox_bookmarks_lz4,
     parse_firefox_session, scan_installed_browsers, DetectedBrowserInfo, ImportedBookmark,
     ImportedTab,
 };
 pub use cursor::{CursorAssetFormat, CursorFormatError, CursorTrailSample, CustomCursorEngine};
+pub use history_store::{HistoryJourney, HistoryRetentionPolicy, HistoryStore, VisitTransitionType};
+pub use internal_pages::{
+    normalize_internal_url, render_internal_page_html, InternalPageContext, InternalPageSpec,
+    INTERNAL_PAGE_REGISTRY,
+};
+pub use keybinds::{
+    CommandChainStore, CommandRegistry, KeymapPreset, KeymapTable, MouseGestureRecognizer,
+    MruTabCycler,
+};
+pub use omnibox::{
+    evaluate_instant_answer, generate_qr_svg, FxRatesCache, OmniboxEngine, OmniboxScope,
+    SearchEngineEntry, SearchEngineRegistry,
+};
+pub use page_tools::{
+    build_text_fragment_url, compute_line_diff, format_smart_copy, render_safe_markdown_html,
+    CollectionsStore, NotesStore, PdfAnnotationStore, ReaderModeExtractor, ReadingListStore,
+};
+pub use profiles::{
+    ContainerRegistry, ContainerTabProfile, CustomizationStore, PermissionDecision, PermissionKind,
+    ProfileRegistry, SitePermissionsStore, WorkspaceSessionStore,
+};
+pub use pwa::{InstalledPwa, PwaRegistry, WebAppManifest};
 pub use roaming_store::{
     apply_media_timestamp_to_url, classify_auth_cookie, classify_tracker_or_malicious_cookie,
     ensure_roaming_dir_initialized, is_protected_session_or_functional_cookie, is_valid_theme_id,
@@ -37,11 +70,12 @@ pub use server::{
 pub use shaders::{BLACK_HOLE_LENSING_WGSL_SHADER, CURSOR_ACCRETION_TRAIL_WGSL_SHADER};
 pub use shell::SingularityBrowserShell;
 pub use theme::{
-    SingularityThemeManifest, TabBarPlacement, ACCRETION_CYAN, ACCRETION_VIOLET, OBSIDIAN_BORDER,
-    OLED_PURE_BLACK,
+    ReaderThemePreset, SingularityThemeManifest, TabBarPlacement, ThemeColorScheme, UiDensity,
+    WindowBackdropMaterial, ACCRETION_CYAN, ACCRETION_VIOLET, OBSIDIAN_BORDER, OLED_PURE_BLACK,
 };
 pub use ui_app::SINGULARITY_UI_HTML;
 pub use updater::{check_for_updates, execute_self_update, execute_uninstall, perform_startup_maintenance};
+pub use userscripts::{UserScriptMeta, UserScriptRecord, UserscriptManager};
 pub use vim::{LinkHintBadge, VimAction, VimModalEngine, VimMode};
 
 #[cfg(test)]
@@ -789,11 +823,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.10");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.0");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1186,7 +1220,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1353,7 +1387,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"2.0.10"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"3.0.0"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1438,7 +1472,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v2.0.10"));
+        assert!(txt.contains("v3.0.0"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1472,7 +1506,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
     }
 
     #[test]
@@ -1547,7 +1581,7 @@ mod tests {
         // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999996,"started_unix":1700000000,"version":"2.0.10"}"#,
+            r#"{"pid":999996,"started_unix":1700000000,"version":"3.0.0"}"#,
         )
         .expect("write running.lock");
         let sessions_dir = tmp_dir.join("sessions");
@@ -1613,7 +1647,7 @@ mod tests {
         // even after the new process truncates `cef.log`!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999995,"started_unix":1700000000,"version":"2.0.10"}"#,
+            r#"{"pid":999995,"started_unix":1700000000,"version":"3.0.0"}"#,
         )
         .expect("write dead lock");
         std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
@@ -1945,8 +1979,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.10");
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.0");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -2054,9 +2088,9 @@ mod tests {
         assert!(prog_json.get("percent").is_some());
         assert!(prog_json.get("speed_bps").is_some());
 
-        // 6. Verify v2.0.10 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.10");
-        assert!(SINGULARITY_UI_HTML.contains("v2.0.10"));
+        // 6. Verify v3.0.0 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.0");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
         assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
         assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
         assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));
@@ -2118,5 +2152,463 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("vec3 result = vec3(0.0);"));
         assert!(SINGULARITY_UI_HTML.contains("return result;"));
     }
+
+    #[test]
+    fn test_v300_master_roadmap_full_10_domain_api_and_shell_integration() {
+        use crate::server::ParsedHttpRequest;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use zeroize::Zeroizing;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity_v300_e2e_test_{}_{}",
+            std::process::id(),
+            roaming_store::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 1. Hermetic shell launch wires all 27 subsystems across the 11 workspace crates
+        let shell = SingularityBrowserShell::launch_at_dir(tmp_dir.clone())
+            .expect("launch isolated v3.0 shell");
+        assert!(shell.core.settings.len() >= 2500);
+        assert!(shell.flags.len() >= 40);
+        assert!(shell.commands.len() >= 80);
+        assert_eq!(shell.cast_controller.active_socket_count(), 0);
+        assert!(shell.sync_engine.is_none());
+
+        let shell_arc = Arc::new(Mutex::new(shell));
+
+        let call_get = |path: &str, query: &[(&str, &str)]| -> (String, serde_json::Value) {
+            let mut params = HashMap::new();
+            for (k, v) in query {
+                params.insert((*k).to_string(), (*v).to_string());
+            }
+            let req = ParsedHttpRequest {
+                method: "GET".to_string(),
+                path: path.to_string(),
+                query: String::new(),
+                headers: HashMap::new(),
+                body: Zeroizing::new(Vec::new()),
+            };
+            let resp = api_v3::try_handle_v3_route(&req, &params, &shell_arc)
+                .unwrap_or_else(|| panic!("GET {} was not routed", path));
+            let val: serde_json::Value =
+                serde_json::from_slice(&resp.body).unwrap_or(serde_json::Value::Null);
+            (resp.status.to_string(), val)
+        };
+
+        let call_post = |path: &str, payload: serde_json::Value| -> (String, serde_json::Value) {
+            let req = ParsedHttpRequest {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                query: String::new(),
+                headers: HashMap::new(),
+                body: Zeroizing::new(serde_json::to_vec(&payload).expect("serialize payload")),
+            };
+            let resp = api_v3::try_handle_v3_route(&req, &HashMap::new(), &shell_arc)
+                .unwrap_or_else(|| panic!("POST {} was not routed", path));
+            let val: serde_json::Value =
+                serde_json::from_slice(&resp.body).unwrap_or(serde_json::Value::Null);
+            (resp.status.to_string(), val)
+        };
+
+        // Domain 8: Internal browser:// pages + flags + version + process manager
+        for slug in ["urls", "flags", "version", "process-manager", "net-internals", "components", "crashes", "policy"] {
+            let page = api_v3::handle_browser_internal_page(slug, &shell_arc, "tok_test_v3");
+            assert_eq!(page.status, "200 OK", "browser://{} must render 200 OK", slug);
+            let html = String::from_utf8_lossy(&page.body);
+            assert!(html.contains("<html"), "browser://{} must output HTML", slug);
+            assert!(
+                page.extra_headers
+                    .iter()
+                    .any(|(k, v)| *k == "X-Frame-Options" && v == "SAMEORIGIN")
+            );
+        }
+        let missing_page = api_v3::handle_browser_internal_page("does-not-exist", &shell_arc, "tok");
+        assert_eq!(missing_page.status, "404 Not Found");
+
+        let (st, urls_json) = call_get("/api/internal/urls", &[]);
+        assert_eq!(st, "200 OK");
+        assert!(urls_json["pages"].as_array().unwrap().len() >= 25);
+
+        let (st, flags_json) = call_get("/api/internal/flags", &[]);
+        assert_eq!(st, "200 OK");
+        let first_flag_id = flags_json["flags"][0]["id"].as_str().unwrap().to_string();
+        let (st, set_flag_json) = call_post(
+            "/api/flags/set",
+            serde_json::json!({ "id": first_flag_id, "option_index": 1 }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(set_flag_json["ok"], true);
+        let (st, reset_json) = call_post("/api/flags/reset_all", serde_json::json!({}));
+        assert_eq!(st, "200 OK");
+        assert_eq!(reset_json["ok"], true);
+
+        // Domain 2: History, Omnibox unified search + calculator + QR SVG, Search Engines
+        let (st, rec_json) = call_post(
+            "/api/history/record",
+            serde_json::json!({
+                "url": "https://www.rust-lang.org/learn",
+                "title": "Learn Rust",
+                "typed": true
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(rec_json["ok"], true);
+
+        let (st, hist_json) = call_get("/api/history/query", &[("q", "rust")]);
+        assert_eq!(st, "200 OK");
+        assert!(!hist_json["items"].as_array().unwrap().is_empty());
+
+        let (st, omni_calc) = call_get("/api/omnibox/suggest", &[("q", "21 * 2")]);
+        assert_eq!(st, "200 OK");
+        assert!(omni_calc.to_string().contains("42"));
+
+        let (st, qr_json) = call_get("/api/omnibox/qr", &[("data", "https://github.com/MyMasha/Singularity")]);
+        assert_eq!(st, "200 OK");
+        assert!(qr_json["svg"].as_str().unwrap().contains("<svg"));
+
+        let (st, engines_json) = call_get("/api/search_engines/list", &[]);
+        assert_eq!(st, "200 OK");
+        assert!(!engines_json["engines"].as_array().unwrap().is_empty());
+
+        // Domain 3: Bookmarks tree + undo/redo + Reading List + Reader Mode + Page Tools
+        let (st, bm_add) = call_post(
+            "/api/bookmarks/add",
+            serde_json::json!({
+                "title": "Singularity Repo",
+                "url": "https://github.com/MyMasha/Singularity",
+                "tags": ["rust", "browser"]
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(bm_add["ok"], true);
+        let (st, bm_tree) = call_get("/api/bookmarks/tree", &[]);
+        assert_eq!(st, "200 OK");
+        assert!(!bm_tree["children"].as_array().unwrap().is_empty());
+        let (st, undo_json) = call_post("/api/bookmarks/undo", serde_json::json!({}));
+        assert_eq!(st, "200 OK");
+        assert_eq!(undo_json["ok"], true);
+        let (st, redo_json) = call_post("/api/bookmarks/redo", serde_json::json!({}));
+        assert_eq!(st, "200 OK");
+        assert_eq!(redo_json["ok"], true);
+
+        let (st, rl_add) = call_post(
+            "/api/reading_list/add",
+            serde_json::json!({
+                "url": "https://doc.rust-lang.org/book/",
+                "title": "The Rust Book",
+                "html": "<article><h1>The Rust Book</h1><p>Memory safety without garbage collection across systems programming workloads.</p></article>"
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(rl_add["ok"], true);
+
+        let (st, reader_json) = call_post(
+            "/api/reader/extract",
+            serde_json::json!({
+                "url": "https://example.org/article",
+                "html": "<html><body><article><h1>OLED Reader</h1><p>Singularity Reader Mode renders distraction-free typography on true black displays for extended reading sessions.</p></article></body></html>",
+                "theme": "oled"
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert!(reader_json["html"].as_str().unwrap().contains("OLED Reader"));
+
+        let (st, copy_json) = call_post(
+            "/api/page_tools/smart_copy",
+            serde_json::json!({
+                "title": "Singularity",
+                "url": "https://github.com/MyMasha/Singularity",
+                "format": "markdown"
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert!(copy_json["output"].as_str().unwrap().contains("[Singularity]"));
+
+        // Domain 4: Shields per-site policy, threat check, granular permissions, DoH presets
+        let (st, sh_set) = call_post(
+            "/api/shields/site_policy",
+            serde_json::json!({
+                "site": "tracker.example.com",
+                "adblock_level": "aggressive",
+                "fingerprint_level": "strict",
+                "forgetful_browsing": true
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(sh_set["ok"], true);
+
+        let (st, threat_json) = call_post(
+            "/api/shields/threat_check",
+            serde_json::json!({ "url": "https://www.rust-lang.org/" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(threat_json["is_safe"], true);
+
+        let (st, perm_set) = call_post(
+            "/api/permissions/set",
+            serde_json::json!({
+                "origin": "https://meet.example.com",
+                "kind": "camera",
+                "decision": "allow"
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(perm_set["ok"], true);
+        let (st, perm_list) = call_get("/api/permissions/list", &[("origin", "https://meet.example.com")]);
+        assert_eq!(st, "200 OK");
+        assert!(perm_list["grants"].as_object().unwrap().contains_key("camera"));
+
+        let (st, dns_json) = call_get("/api/dns/presets", &[]);
+        assert_eq!(st, "200 OK");
+        assert!(dns_json["presets"].as_array().unwrap().len() >= 4);
+
+        // Domain 5: Vault password & Diceware passphrase generation
+        let (st, pw_json) = call_post(
+            "/api/vault/generate",
+            serde_json::json!({ "mode": "password", "length": 24, "include_symbols": true }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(pw_json["secret"].as_str().unwrap().len(), 24);
+        let (st, pp_json) = call_post(
+            "/api/vault/generate",
+            serde_json::json!({ "mode": "passphrase", "words": 5, "language": "fr" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert!(pp_json["entropy_bits"].as_f64().unwrap() > 40.0);
+
+        // Domain 6: Downloads queue, Media DSP 600% EQ, Platform capabilities, Opt-in Cast
+        let (st, dl_enq) = call_post(
+            "/api/downloads/enqueue",
+            serde_json::json!({
+                "url": "https://github.com/MyMasha/Singularity/releases/download/v3.0.0/singularity.zip",
+                "filename": "singularity.zip",
+                "total_bytes": 1048576
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        let dl_id = dl_enq["id"].as_u64().unwrap();
+        let (st, dl_list) = call_get("/api/downloads/list", &[]);
+        assert_eq!(st, "200 OK");
+        assert!(!dl_list["records"].as_array().unwrap().is_empty());
+        let (st, dl_pause) = call_post(
+            "/api/downloads/action",
+            serde_json::json!({ "id": dl_id, "action": "pause" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(dl_pause["ok"], true);
+
+        let (st, eq_json) = call_post(
+            "/api/media/equalizer",
+            serde_json::json!({ "volume_boost_percent": 600.0, "preset": "cinema" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert!((eq_json["volume_boost_percent"].as_f64().unwrap() - 600.0).abs() < 0.01);
+
+        let (st, cast_json) = call_get("/api/cast/status", &[]);
+        assert_eq!(st, "200 OK");
+        assert_eq!(cast_json["discovery_active"], false);
+        assert_eq!(cast_json["active_sockets"], 0);
+
+        // Domain 7: Userscripts, PWA registry, Extensions helpers
+        let (st, us_inst) = call_post(
+            "/api/userscripts/install",
+            serde_json::json!({
+                "source": "// ==UserScript==\n// @name OLED Helper\n// @match https://example.org/*\n// @version 1.0\n// ==/UserScript==\nconsole.log('ok');\n"
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(us_inst["ok"], true);
+        let (st, us_list) = call_get("/api/userscripts/list", &[]);
+        assert_eq!(st, "200 OK");
+        assert_eq!(us_list["scripts"].as_array().unwrap().len(), 1);
+
+        let (st, pwa_inst) = call_post(
+            "/api/pwa/install",
+            serde_json::json!({
+                "url": "https://app.example.org/",
+                "title": "Example OLED App",
+                "theme_color": "#000000"
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(pwa_inst["ok"], true);
+        let (st, pwa_list) = call_get("/api/pwa/list", &[]);
+        assert_eq!(st, "200 OK");
+        assert_eq!(pwa_list["apps"].as_array().unwrap().len(), 1);
+
+        // Domain 1 & 9: Tab organizer, Performance profiles, Mullvad relay filter & DNS blocker
+        let (st, perf_json) = call_post(
+            "/api/performance/profile",
+            serde_json::json!({ "preset": "gaming" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(perf_json["ok"], true);
+
+        let (st, relays_json) = call_get("/api/mullvad/relays_filtered", &[("owned", "true")]);
+        assert_eq!(st, "200 OK");
+        assert!(!relays_json["relays"].as_array().unwrap().is_empty());
+
+        let (st, m_dns) = call_post(
+            "/api/mullvad/dns_blocker",
+            serde_json::json!({
+                "block_ads": true,
+                "block_trackers": true,
+                "block_malware": true,
+                "block_adult": false,
+                "block_gambling": false,
+                "block_social": false
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(m_dns["dns_ip"], "100.64.0.7");
+
+        // Domain 10: Multi-profiles, Command Palette, Offline Translate, Zero-Knowledge Sync Chain
+        let (st, prof_create) = call_post(
+            "/api/profiles/create",
+            serde_json::json!({ "name": "Work Vault", "color": "#00D4FF" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(prof_create["ok"], true);
+
+        let (st, pal_json) = call_get("/api/palette/query", &[("q", "reader")]);
+        assert_eq!(st, "200 OK");
+        assert!(!pal_json["commands"].as_array().unwrap().is_empty());
+
+        let (st, tr_det) = call_post(
+            "/api/translate/detect",
+            serde_json::json!({ "text": "Bonjour, bienvenue dans le navigateur Singularity avec confidentialité totale." }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(tr_det["language"], "fr");
+
+        let (st, tr_batch) = call_post(
+            "/api/translate/batch",
+            serde_json::json!({
+                "source_lang": "en",
+                "target_lang": "fr",
+                "segments": ["Hello world"]
+            }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(tr_batch["ok"], true);
+
+        let (st, sync_create) = call_post(
+            "/api/sync/create_chain",
+            serde_json::json!({ "device_name": "Singularity Test Node" }),
+        );
+        assert_eq!(st, "200 OK");
+        assert_eq!(sync_create["ok"], true);
+        assert_eq!(
+            sync_create["permanent_24_words"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            24
+        );
+        assert_eq!(
+            sync_create["daily_25_words"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            25
+        );
+        let (st, sync_st) = call_get("/api/sync/status", &[]);
+        assert_eq!(st, "200 OK");
+        assert_eq!(sync_st["linked"], true);
+        let (st, sync_leave) = call_post("/api/sync/leave_chain", serde_json::json!({}));
+        assert_eq!(st, "200 OK");
+        assert_eq!(sync_leave["ok"], true);
+
+        // 2. Verify new extensions.rs & drm_webview.rs helpers
+        assert_eq!(
+            extensions::parse_edge_addons_id(
+                "https://microsoftedge.microsoft.com/addons/detail/ublock-origin/odfafepnkmbhccpbejgmiehpchacaeak"
+            )
+            .as_deref(),
+            Some("odfafepnkmbhccpbejgmiehpchacaeak")
+        );
+        let perm_warnings = extensions::describe_extension_permissions(
+            &["tabs".into(), "cookies".into()],
+            &["<all_urls>".into()],
+        );
+        assert!(perm_warnings.len() >= 2);
+        let omaha_xml = r#"<?xml version="1.0"?><gupdate><app appid="cjpalhdlnbpafiamejdnhcphjbkeiagm"><updatecheck codebase="https://clients2.googleusercontent.com/crx/ext.crx" version="1.62.0"/></app></gupdate>"#;
+        let updates = extensions::parse_omaha_update_xml(omaha_xml);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].version, "1.62.0");
+
+        extensions::set_extension_site_access(
+            &tmp_dir,
+            "cjpalhdlnbpafiamejdnhcphjbkeiagm",
+            extensions::SiteAccessMode::OnSpecificSites,
+            vec!["https://example.org/*".into()],
+        )
+        .expect("set site access");
+        extensions::set_extension_privacy_flags(
+            &tmp_dir,
+            "cjpalhdlnbpafiamejdnhcphjbkeiagm",
+            Some(true),
+            Some(false),
+            Some(true),
+        )
+        .expect("set privacy flags");
+        let ext_meta = extensions::read_extension_meta(&tmp_dir, "cjpalhdlnbpafiamejdnhcphjbkeiagm");
+        assert_eq!(ext_meta.site_access_mode, extensions::SiteAccessMode::OnSpecificSites);
+        assert!(ext_meta.allow_in_incognito);
+        assert!(ext_meta.allow_user_scripts);
+
+        let wv_status = drm_webview::inspect_widevine_status(&tmp_dir);
+        assert!(!wv_status.cef_widevine_ready);
+        assert!(wv_status.supported_vmp_domains_count > 0);
+
+        // 3. Verify v3.0 OLED UI shell & Windows CEF/DRM source-level invariants
+        for marker in [
+            "id=\"omnibox-dropdown\"",
+            "id=\"v3-vertical-rail\"",
+            "id=\"v3-sidebar\"",
+            "id=\"command-palette-modal\"",
+            "id=\"tab-search-modal\"",
+            "id=\"find-in-page-bar\"",
+            "id=\"v3-popover-panel\"",
+            "id=\"v3-internal-frame-modal\"",
+            "id=\"pane-profiles\"",
+            "id=\"pane-performance\"",
+            "id=\"pane-ecosystem\"",
+            "id=\"pane-sync\"",
+            "id=\"pane-internals\"",
+            "initSingularityV3Shell",
+            "window.__v3",
+        ] {
+            assert!(
+                SINGULARITY_UI_HTML.contains(marker),
+                "SINGULARITY_UI_HTML missing v3.0 element: {}",
+                marker
+            );
+        }
+        assert!(!SINGULARITY_UI_HTML.contains("allow-same-origin"));
+        assert!(!SINGULARITY_UI_HTML.contains("sessionMasterCache"));
+
+        let drm_src = include_str!("drm_webview.rs");
+        assert!(drm_src.contains("OpenDevToolsWindow"));
+        assert!(!drm_src.contains("self.webview.open_devtools()"));
+
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("create_isolated_request_context"));
+        assert!(cef_src.contains("Sec-GPC"));
+        assert!(cef_src.contains("NEW_PICTURE_IN_PICTURE"));
+        assert!(cef_src.contains("flags.toml"));
+
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("try_handle_v3_route"));
+        assert!(server_src.contains("handle_browser_internal_page"));
+        assert!(server_src.contains("compute_pane_rects"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }
+
 

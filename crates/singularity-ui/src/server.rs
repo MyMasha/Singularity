@@ -424,23 +424,23 @@ impl HttpThreadPool {
     }
 }
 
-struct ParsedHttpRequest {
-    method: String,
-    path: String,
-    query: String,
-    headers: HashMap<String, String>,
-    body: Zeroizing<Vec<u8>>,
+pub(crate) struct ParsedHttpRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Zeroizing<Vec<u8>>,
 }
 
-struct HttpResponse {
-    status: &'static str,
-    content_type: &'static str,
-    extra_headers: Vec<(&'static str, String)>,
-    body: Zeroizing<Vec<u8>>,
+pub(crate) struct HttpResponse {
+    pub(crate) status: &'static str,
+    pub(crate) content_type: &'static str,
+    pub(crate) extra_headers: Vec<(&'static str, String)>,
+    pub(crate) body: Zeroizing<Vec<u8>>,
 }
 
 impl HttpResponse {
-    fn new(status: &'static str, content_type: &'static str, body: Vec<u8>) -> Self {
+    pub(crate) fn new(status: &'static str, content_type: &'static str, body: Vec<u8>) -> Self {
         Self {
             status,
             content_type,
@@ -449,7 +449,7 @@ impl HttpResponse {
         }
     }
 
-    fn json(status: &'static str, val: &serde_json::Value) -> Self {
+    pub(crate) fn json(status: &'static str, val: &serde_json::Value) -> Self {
         Self::new(
             status,
             "application/json; charset=utf-8",
@@ -457,15 +457,15 @@ impl HttpResponse {
         )
     }
 
-    fn json_bytes(status: &'static str, bytes: &[u8]) -> Self {
+    pub(crate) fn json_bytes(status: &'static str, bytes: &[u8]) -> Self {
         Self::new(status, "application/json; charset=utf-8", bytes.to_vec())
     }
 
-    fn text(status: &'static str, text: &str) -> Self {
+    pub(crate) fn text(status: &'static str, text: &str) -> Self {
         Self::new(status, "text/plain; charset=utf-8", text.as_bytes().to_vec())
     }
 
-    fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+    pub(crate) fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
         self.extra_headers.push((name, value.into()));
         self
     }
@@ -778,6 +778,58 @@ fn run_windows_frameless_browser(
             #[serde(default)]
             lang: Option<String>,
         },
+        DevToolsAction {
+            #[serde(default)]
+            action: String,
+            #[serde(default)]
+            dock_width_px: u32,
+        },
+        FindInPage {
+            #[serde(default)]
+            text: String,
+            #[serde(default = "default_true_ipc")]
+            forward: bool,
+            #[serde(default)]
+            match_case: bool,
+            #[serde(default)]
+            find_next: bool,
+            #[serde(default)]
+            stop: bool,
+        },
+        PrintPage {
+            #[serde(default)]
+            pdf_path: Option<String>,
+        },
+        ViewSource,
+        HardReload,
+        StopLoad,
+        SetTabAudioMuted {
+            #[serde(default)]
+            tab_id: u64,
+            muted: bool,
+        },
+        SetSplitLayout {
+            #[serde(default)]
+            tab_ids: Vec<u64>,
+            #[serde(default)]
+            orientation: String,
+            #[serde(default)]
+            ratio: f32,
+        },
+        SetChromeLayout {
+            #[serde(default)]
+            top_bar_extra_px: u32,
+            #[serde(default)]
+            left_sidebar_px: u32,
+            #[serde(default)]
+            right_sidebar_px: u32,
+            #[serde(default)]
+            bottom_bar_px: u32,
+        },
+    }
+
+    fn default_true_ipc() -> bool {
+        true
     }
 
     #[derive(Default)]
@@ -1008,6 +1060,86 @@ fn run_windows_frameless_browser(
             }
         }
 
+        fn set_audio_muted(&self, muted: bool) {
+            match self {
+                Self::Cef(b) => b.set_audio_muted(muted),
+                Self::Drm(d) => {
+                    let _ = d.set_audio_muted(muted);
+                }
+            }
+        }
+
+        fn is_audio_muted(&self) -> bool {
+            match self {
+                Self::Cef(b) => b.is_audio_muted(),
+                Self::Drm(d) => d.is_audio_muted(),
+            }
+        }
+
+        fn open_devtools(&self, parent_hwnd: Option<isize>, rect: Option<(i32, i32, u32, u32)>) {
+            match self {
+                Self::Cef(b) => b.show_dev_tools(parent_hwnd, rect, None),
+                Self::Drm(d) => d.open_devtools(),
+            }
+        }
+
+        fn close_devtools(&self) {
+            if let Self::Cef(b) = self {
+                b.close_dev_tools();
+            }
+        }
+
+        fn has_devtools(&self) -> bool {
+            match self {
+                Self::Cef(b) => b.has_dev_tools(),
+                Self::Drm(_) => false,
+            }
+        }
+
+        fn find(&self, text: &str, forward: bool, match_case: bool, find_next: bool) {
+            if let Self::Cef(b) = self {
+                b.find(text, forward, match_case, find_next);
+            }
+        }
+
+        fn stop_finding(&self, clear_selection: bool) {
+            if let Self::Cef(b) = self {
+                b.stop_finding(clear_selection);
+            }
+        }
+
+        fn print(&self) {
+            match self {
+                Self::Cef(b) => b.print(),
+                Self::Drm(d) => d.evaluate_script("window.print()"),
+            }
+        }
+
+        fn print_to_pdf(&self, path: &std::path::Path) {
+            if let Self::Cef(b) = self {
+                b.print_to_pdf(path);
+            }
+        }
+
+        fn view_source(&self) {
+            if let Self::Cef(b) = self {
+                b.view_source();
+            }
+        }
+
+        fn reload_ignore_cache(&self) {
+            match self {
+                Self::Cef(b) => b.reload_ignore_cache(),
+                Self::Drm(d) => d.reload(),
+            }
+        }
+
+        fn stop_load(&self) {
+            if let Self::Cef(b) = self {
+                b.stop_load();
+            }
+        }
+
         fn close_force(&self) {
             match self {
                 Self::Cef(b) => b.close_force(),
@@ -1047,6 +1179,11 @@ fn run_windows_frameless_browser(
         was_minimized: bool,
         last_ext_popup_closed: Option<(String, std::time::Instant)>,
         last_nav_at: Option<std::time::Instant>,
+        top_bar_extra_logical_px: u32,
+        left_sidebar_logical_px: u32,
+        right_sidebar_logical_px: u32,
+        bottom_bar_logical_px: u32,
+        split_layout: Option<singularity_core::SplitLayoutTree>,
     }
 
     impl BrowserWindowState {
@@ -1085,8 +1222,18 @@ fn run_windows_frameless_browser(
             let w = phys.width;
             let h = phys.height;
             let scale = self.window.scale_factor();
-            let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(h);
-            let content_h = h.saturating_sub(bar_h).max(1);
+            let top_logical = APPLE_BAR_LOGICAL_HEIGHT + (self.top_bar_extra_logical_px as f64);
+            let bar_h = ((top_logical * scale).round() as u32).min(h);
+            let left_w = ((self.left_sidebar_logical_px as f64 * scale).round() as u32)
+                .min(w.saturating_sub(200));
+            let right_w = ((self.right_sidebar_logical_px as f64 * scale).round() as u32)
+                .min(w.saturating_sub(left_w + 200));
+            let bottom_h = ((self.bottom_bar_logical_px as f64 * scale).round() as u32)
+                .min(h.saturating_sub(bar_h + 100));
+            let content_x = left_w as i32;
+            let content_y = bar_h as i32;
+            let content_w = w.saturating_sub(left_w + right_w).max(1);
+            let content_h = h.saturating_sub(bar_h + bottom_h).max(1);
             let in_fs = self.html_fullscreen || self.user_f11_fullscreen;
             let show_active_web = self.web_visible
                 && !self.overlay_open
@@ -1144,20 +1291,63 @@ fn run_windows_frameless_browser(
                 }
                 apply_ui(&mut self.layout_cache, &self.ui_browser, false, None);
             } else if show_active_web {
-                apply_ui(
-                    &mut self.layout_cache,
-                    &self.ui_browser,
-                    true,
-                    Some((0, 0, w, bar_h.max(1))),
-                );
+                // Keep UI shell covering full chrome frame when sidebars/status bar are open,
+                // or strictly top bar when no side/bottom insets exist.
+                let ui_rect = if left_w > 0 || right_w > 0 || bottom_h > 0 {
+                    (0, 0, w, h)
+                } else {
+                    (0, 0, w, bar_h.max(1))
+                };
+                apply_ui(&mut self.layout_cache, &self.ui_browser, true, Some(ui_rect));
+
+                // Multi-pane Split View support via `singularity_core::SplitLayoutTree`
+                let split_rects: Option<HashMap<u64, (i32, i32, u32, u32)>> =
+                    self.split_layout.as_ref().and_then(|tree| {
+                        let panes = tree.compute_pane_rects(
+                            content_x as f32,
+                            content_y as f32,
+                            content_w as f32,
+                            content_h as f32,
+                            4.0,
+                        );
+                        if panes.len() >= 2
+                            && panes.iter().any(|(tid, _, _, _, _)| *tid == self.active_tab_id)
+                        {
+                            Some(
+                                panes
+                                    .into_iter()
+                                    .map(|(tid, rx, ry, rw, rh)| {
+                                        (
+                                            tid,
+                                            (
+                                                rx.round() as i32,
+                                                ry.round() as i32,
+                                                rw.round().max(1.0) as u32,
+                                                rh.round().max(1.0) as u32,
+                                            ),
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        }
+                    });
+
                 for (&tid, b) in &self.tab_browsers {
-                    if tid == self.active_tab_id {
+                    if let Some(ref map) = split_rects {
+                        if let Some(&rect) = map.get(&tid) {
+                            apply_tab(&mut self.layout_cache, tid, b, true, Some(rect));
+                        } else {
+                            apply_tab(&mut self.layout_cache, tid, b, false, None);
+                        }
+                    } else if tid == self.active_tab_id {
                         apply_tab(
                             &mut self.layout_cache,
                             tid,
                             b,
                             true,
-                            Some((0, bar_h as i32, w, content_h)),
+                            Some((content_x, content_y, content_w, content_h)),
                         );
                     } else {
                         apply_tab(&mut self.layout_cache, tid, b, false, None);
@@ -3110,6 +3300,11 @@ fn run_windows_frameless_browser(
             ext_popup: None,
             last_ext_popup_closed: None,
             last_nav_at: None,
+            top_bar_extra_logical_px: 0,
+            left_sidebar_logical_px: 0,
+            right_sidebar_logical_px: 0,
+            bottom_bar_logical_px: 0,
+            split_layout: None,
         };
         st.capture_geometry(server_cfg, shared_shell);
         st.sync_layout();
@@ -5134,7 +5329,65 @@ fn run_windows_frameless_browser(
                                 "zoom_in" | "zoom_out" | "zoom_reset" => {
                                     perform_tab_zoom(st, action);
                                 }
+                                "devtools_toggle" | "devtools_inspect" | "devtools_console" => {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        if action == "devtools_toggle" && b.has_devtools() {
+                                            b.close_devtools();
+                                        } else {
+                                            b.open_devtools(None, None);
+                                        }
+                                    }
+                                }
+                                "print_page" => {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.print();
+                                    }
+                                }
+                                "view_source" => {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.view_source();
+                                    }
+                                }
+                                "toggle_mute_tab" => {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        let next_muted = !b.is_audio_muted();
+                                        b.set_audio_muted(next_muted);
+                                        emit_ui_sync(
+                                            &st.ui_browser,
+                                            &serde_json::json!({
+                                                "tab_id": st.active_tab_id,
+                                                "audio_muted": next_muted
+                                            }),
+                                        );
+                                    }
+                                }
                                 _ => {}
+                            }
+                        }
+                    }
+                    CefCallbackEvent::StatusMessage { tab_id, value } => {
+                        if let Some(st) = windows.get(&wid) {
+                            if tab_id == st.active_tab_id {
+                                emit_ui_sync(
+                                    &st.ui_browser,
+                                    &serde_json::json!({
+                                        "tab_id": tab_id,
+                                        "status_message": value
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    CefCallbackEvent::LoadingProgress { tab_id, progress } => {
+                        if let Some(st) = windows.get(&wid) {
+                            if tab_id == st.active_tab_id {
+                                emit_ui_sync(
+                                    &st.ui_browser,
+                                    &serde_json::json!({
+                                        "tab_id": tab_id,
+                                        "loading_progress": progress
+                                    }),
+                                );
                             }
                         }
                     }
@@ -7209,6 +7462,144 @@ fn run_windows_frameless_browser(
                                     }
                                 }
                             }
+                            UiIpcCmd::DevToolsAction {
+                                action,
+                                dock_width_px,
+                            } => {
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        match action.as_str() {
+                                            "close" => b.close_devtools(),
+                                            "toggle" => {
+                                                if b.has_devtools() {
+                                                    b.close_devtools();
+                                                } else {
+                                                    b.open_devtools(None, None);
+                                                }
+                                            }
+                                            _ => {
+                                                let _ = dock_width_px;
+                                                b.open_devtools(None, None);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            UiIpcCmd::FindInPage {
+                                text,
+                                forward,
+                                match_case,
+                                find_next,
+                                stop,
+                            } => {
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        if stop || text.is_empty() {
+                                            b.stop_finding(true);
+                                        } else {
+                                            b.find(&text, forward, match_case, find_next);
+                                        }
+                                    }
+                                }
+                            }
+                            UiIpcCmd::PrintPage { pdf_path } => {
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        if let Some(p) = pdf_path.filter(|s| !s.trim().is_empty()) {
+                                            b.print_to_pdf(std::path::Path::new(&p));
+                                        } else {
+                                            b.print();
+                                        }
+                                    }
+                                }
+                            }
+                            UiIpcCmd::ViewSource => {
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.view_source();
+                                    }
+                                }
+                            }
+                            UiIpcCmd::HardReload => {
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.reload_ignore_cache();
+                                    }
+                                }
+                            }
+                            UiIpcCmd::StopLoad => {
+                                if let Some(st) = windows.get(&wid) {
+                                    if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
+                                        b.stop_load();
+                                    }
+                                }
+                            }
+                            UiIpcCmd::SetTabAudioMuted { tab_id, muted } => {
+                                if let Some(st) = windows.get(&wid) {
+                                    let tid = if tab_id == 0 { st.active_tab_id } else { tab_id };
+                                    if let Some(b) = st.tab_browsers.get(&tid) {
+                                        b.set_audio_muted(muted);
+                                    }
+                                }
+                            }
+                            UiIpcCmd::SetSplitLayout {
+                                tab_ids,
+                                orientation,
+                                ratio,
+                            } => {
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    if tab_ids.len() < 2 {
+                                        st.split_layout = None;
+                                    } else {
+                                        let ori = if orientation.eq_ignore_ascii_case("vertical") {
+                                            singularity_core::SplitOrientation::Vertical
+                                        } else {
+                                            singularity_core::SplitOrientation::Horizontal
+                                        };
+                                        let r = if ratio > 0.15 && ratio < 0.85 {
+                                            singularity_core::snap_split_ratio(ratio)
+                                        } else {
+                                            0.5
+                                        };
+                                        let mut tree = singularity_core::SplitLayoutTree::Split {
+                                            orientation: ori,
+                                            ratio: r,
+                                            first: Box::new(singularity_core::SplitLayoutTree::leaf(
+                                                tab_ids[0],
+                                            )),
+                                            second: Box::new(singularity_core::SplitLayoutTree::leaf(
+                                                tab_ids[1],
+                                            )),
+                                        };
+                                        for &extra_tid in tab_ids.iter().skip(2).take(2) {
+                                            tree = singularity_core::SplitLayoutTree::Split {
+                                                orientation: ori,
+                                                ratio: 0.5,
+                                                first: Box::new(tree),
+                                                second: Box::new(
+                                                    singularity_core::SplitLayoutTree::leaf(extra_tid),
+                                                ),
+                                            };
+                                        }
+                                        st.split_layout = Some(tree);
+                                    }
+                                    st.sync_layout();
+                                }
+                            }
+                            UiIpcCmd::SetChromeLayout {
+                                top_bar_extra_px,
+                                left_sidebar_px,
+                                right_sidebar_px,
+                                bottom_bar_px,
+                            } => {
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    st.top_bar_extra_logical_px = top_bar_extra_px.min(200);
+                                    st.left_sidebar_logical_px = left_sidebar_px.min(480);
+                                    st.right_sidebar_logical_px = right_sidebar_px.min(600);
+                                    st.bottom_bar_logical_px = bottom_bar_px.min(80);
+                                    st.sync_layout();
+                                }
+                            }
                         }
                     }
                 },
@@ -8171,6 +8562,20 @@ fn dispatch_http_request(
                 return HttpResponse::text("401 Unauthorized", "Authentication required");
             }
             return handle_web_proxy(req, shell_mutex);
+        }
+        p if p == "/browser" || p.starts_with("/browser/") => {
+            if req.method != "GET" {
+                return HttpResponse::text("405 Method Not Allowed", "Method Not Allowed");
+            }
+            if !cfg.verify_token_or_session_cookie(req) {
+                return HttpResponse::text("401 Unauthorized", "Authentication required");
+            }
+            let slug = p.strip_prefix("/browser/").unwrap_or("urls");
+            return crate::api_v3::handle_browser_internal_page(
+                slug,
+                shell_mutex,
+                &cfg.ipc_token,
+            );
         }
         "/api/window/adopt_tab" => {
             if req.method != "POST" {
@@ -10470,7 +10875,8 @@ fn dispatch_http_request(
                 }),
             )
         }
-        _ => HttpResponse::text("404 Not Found", "Not Found"),
+        _ => crate::api_v3::try_handle_v3_route(req, &params, shell_mutex)
+            .unwrap_or_else(|| HttpResponse::text("404 Not Found", "Not Found")),
     }
 }
 

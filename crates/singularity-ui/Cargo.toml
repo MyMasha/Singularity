@@ -16,6 +16,9 @@ singularity-core = { path = "../singularity-core" }
 singularity-net-mullvad = { path = "../singularity-net-mullvad" }
 singularity-vault = { path = "../singularity-vault" }
 singularity-media = { path = "../singularity-media" }
+singularity-sync = { path = "../singularity-sync" }
+singularity-translate = { path = "../singularity-translate" }
+singularity-cast = { path = "../singularity-cast" }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

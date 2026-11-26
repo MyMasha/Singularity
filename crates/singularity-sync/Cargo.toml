@@ -1,0 +1,22 @@
+[package]
+name = "singularity-sync"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Zero-knowledge P2P / E2EE browser synchronization using 24+1 rotating mnemonics, HKDF-SHA256, LWW-Element-Set CRDT + Vector Clocks, XChaCha20-Poly1305, and Ed25519"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10"
+hmac = "0.12"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["zeroize", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+thiserror = "2.0"

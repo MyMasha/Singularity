@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// The 8 mandatory power-user configuration categories in `singularity://settings` & `singularity://flags`.
+/// The 9 mandatory power-user configuration categories in `singularity://settings` & `singularity://flags`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SettingCategory {
     SecurityHardening,
@@ -14,10 +14,11 @@ pub enum SettingCategory {
     PasswordManagerCrypto,
     MediaAudioVideo,
     ThemesCursorsUiUx,
+    ExtensionsPwaEcosystem,
 }
 
 impl SettingCategory {
-    pub const ALL: [SettingCategory; 8] = [
+    pub const ALL: [SettingCategory; 9] = [
         SettingCategory::SecurityHardening,
         SettingCategory::PrivacyAntiFingerprinting,
         SettingCategory::NetworkDnsHttp3,
@@ -26,7 +27,13 @@ impl SettingCategory {
         SettingCategory::PasswordManagerCrypto,
         SettingCategory::MediaAudioVideo,
         SettingCategory::ThemesCursorsUiUx,
+        SettingCategory::ExtensionsPwaEcosystem,
     ];
+
+    /// Returns all registered setting categories in canonical display order.
+    pub fn all() -> &'static [SettingCategory] {
+        &Self::ALL
+    }
 
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -38,6 +45,21 @@ impl SettingCategory {
             Self::PasswordManagerCrypto => "6. Password Manager & Cryptography",
             Self::MediaAudioVideo => "7. Media, Audio & Video Engine",
             Self::ThemesCursorsUiUx => "8. Themes, Cursors & UI/UX Customization",
+            Self::ExtensionsPwaEcosystem => "9. Extensions, Userscripts & PWA Ecosystem",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::SecurityHardening => "Process sandboxing, V8 JIT hardening, CSP/CORS policies, and DevTools CDP isolation.",
+            Self::PrivacyAntiFingerprinting => "Anti-fingerprinting guards, Shields, GPC headers, forgetful browsing, and site permissions.",
+            Self::NetworkDnsHttp3 => "QUIC/HTTP3, encrypted DNS, download manager, and zero-knowledge cross-device sync.",
+            Self::MullvadWireGuard => "Integrated Mullvad WireGuard tunnel, DAITA padding, multihop relays, and killswitch.",
+            Self::RenderingGpuPerformance => "WebGPU/Vulkan compositor, 200Hz+ frame pacing, tab freezing, resource limiters, and energy saver.",
+            Self::PasswordManagerCrypto => "Argon2id vault encryption, passkeys, biometric/PIN unlock, payments, and email aliases.",
+            Self::MediaAudioVideo => "Hardware video decode, 10-band EQ, PiP, built-in PDF viewer, reader mode, capture, and print.",
+            Self::ThemesCursorsUiUx => "OLED themes, custom cursors, sidebar/split-view, omnibox, bookmarks, translate, and accessibility.",
+            Self::ExtensionsPwaEcosystem => "MV2/MV3 extension runtime, native userscripts engine, and Progressive Web App host.",
         }
     }
 
@@ -51,6 +73,7 @@ impl SettingCategory {
             Self::PasswordManagerCrypto => "vault",
             Self::MediaAudioVideo => "media",
             Self::ThemesCursorsUiUx => "ui",
+            Self::ExtensionsPwaEcosystem => "extensions",
         }
     }
 }
@@ -74,6 +97,13 @@ pub enum TargetSubsystem {
     MediaPipeline,
     OledThemeEngine,
     CustomCursorEngine,
+    ExtensionRuntime,
+    UserscriptEngine,
+    PwaHost,
+    SyncEngine,
+    TranslateEngine,
+    AccessibilityEngine,
+    DevToolsEngine,
 }
 
 impl TargetSubsystem {
@@ -89,6 +119,13 @@ impl TargetSubsystem {
             Self::MediaPipeline => "media_pipeline",
             Self::OledThemeEngine => "oled_theme_engine",
             Self::CustomCursorEngine => "custom_cursor_engine",
+            Self::ExtensionRuntime => "extension_runtime",
+            Self::UserscriptEngine => "userscript_engine",
+            Self::PwaHost => "pwa_host",
+            Self::SyncEngine => "sync_engine",
+            Self::TranslateEngine => "translate_engine",
+            Self::AccessibilityEngine => "accessibility_engine",
+            Self::DevToolsEngine => "devtools_engine",
         }
     }
 }
@@ -524,6 +561,23 @@ pub struct HotReloadEvent {
     pub new_value: SettingValue,
     pub chromium_cli_arg: Option<String>,
     pub requires_restart: bool,
+}
+
+/// Alias for [`SettingEntry`] representing the full metadata descriptor of a setting.
+pub type SettingDescriptor = SettingEntry;
+
+/// Serializable diff row describing a single modified setting relative to its factory default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingDiffRow {
+    pub id: usize,
+    pub key: String,
+    pub category: SettingCategory,
+    pub subsystem: TargetSubsystem,
+    pub title: String,
+    pub default_value: SettingValue,
+    pub current_value: SettingValue,
+    pub hot_reloadable: bool,
+    pub locked_by_policy: bool,
 }
 
 #[cfg(test)]

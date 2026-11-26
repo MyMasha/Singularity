@@ -1,17 +1,63 @@
-//! FIDO2 / WebAuthn CTAP2.1 Software Passkey Authenticator (Asymmetric Ed25519 / COSE EdDSA -8).
+//! FIDO2 / WebAuthn Level 3 Software Passkey Authenticator (Asymmetric Ed25519 / COSE EdDSA -8,
+//! Canonical CTAP2 CBOR/COSE Attestation Encoding, `prf`/`hmac-secret` HKDF Extension,
+//! Strict RP ID Validation, and WebAuthn Signal API Level 3).
 
+use crate::crypto::hkdf_sha256;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// WebAuthn authenticatorData flag bits (W3C WebAuthn Level 2/3 §6.1).
 pub const WEBAUTHN_FLAG_UP: u8 = 0x01; // User Present
 pub const WEBAUTHN_FLAG_UV: u8 = 0x04; // User Verified
 pub const WEBAUTHN_FLAG_BE: u8 = 0x08; // Backup Eligible
 pub const WEBAUTHN_FLAG_BS: u8 = 0x10; // Backup State
+pub const WEBAUTHN_FLAG_AT: u8 = 0x40; // Attested Credential Data Included
+pub const WEBAUTHN_FLAG_ED: u8 = 0x80; // Extension Data Included
+
+/// 16-byte Singularity Vault Software Authenticator AAGUID (UUID `53696e67-756c-4a72-8974-795661756c74`).
+pub const SINGULARITY_PASSKEY_AAGUID: [u8; 16] = [
+    0x53, 0x69, 0x6e, 0x67, 0x75, 0x6c, 0x4a, 0x72, 0x89, 0x74, 0x79, 0x56, 0x61, 0x75, 0x6c, 0x74,
+];
+
+/// COSE algorithm identifier supported for stored passkeys (IANA COSE Algorithms Registry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(i32)]
+pub enum PasskeyAlgorithm {
+    #[default]
+    Ed25519 = -8,
+    Es256 = -7,
+    Rs256 = -257,
+}
+
+impl PasskeyAlgorithm {
+    pub fn cose_alg_id(self) -> i32 {
+        self as i32
+    }
+
+    pub fn from_cose_alg_id(alg: i32) -> Option<Self> {
+        match alg {
+            -8 => Some(PasskeyAlgorithm::Ed25519),
+            -7 => Some(PasskeyAlgorithm::Es256),
+            -257 => Some(PasskeyAlgorithm::Rs256),
+            _ => None,
+        }
+    }
+}
+
+/// Audit log entry recording passkey lifecycle and authentication events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyAuditEvent {
+    pub timestamp_unix: u64,
+    pub action: String,
+    pub rp_id: String,
+    pub origin: Option<String>,
+    pub user_verified: bool,
+}
 
 /// Resident Passkey credential stored inside the encrypted `.singularity-vault`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -24,6 +70,22 @@ pub struct StoredPasskeyCredential {
     pub public_key_hex: String,
     pub secret_seed_hex: String,
     pub sign_count: u32,
+    #[serde(default)]
+    pub algorithm: PasskeyAlgorithm,
+    #[serde(default)]
+    pub rp_name: String,
+    #[serde(default)]
+    pub user_name: String,
+    #[serde(default)]
+    pub created_at_unix: u64,
+    #[serde(default)]
+    pub last_used_at_unix: Option<u64>,
+    #[serde(default)]
+    pub linked_item_id: Option<String>,
+    #[serde(default)]
+    pub trashed_at: Option<u64>,
+    #[serde(default)]
+    pub audit_log: Vec<PasskeyAuditEvent>,
 }
 
 impl fmt::Debug for StoredPasskeyCredential {
@@ -31,11 +93,19 @@ impl fmt::Debug for StoredPasskeyCredential {
         f.debug_struct("StoredPasskeyCredential")
             .field("credential_id_hex", &self.credential_id_hex)
             .field("rp_id", &self.rp_id)
+            .field("rp_name", &self.rp_name)
             .field("user_handle_hex", &self.user_handle_hex)
+            .field("user_name", &self.user_name)
             .field("user_display_name", &self.user_display_name)
             .field("public_key_hex", &self.public_key_hex)
             .field("secret_seed_hex", &"[REDACTED]")
             .field("sign_count", &self.sign_count)
+            .field("algorithm", &self.algorithm)
+            .field("created_at_unix", &self.created_at_unix)
+            .field("last_used_at_unix", &self.last_used_at_unix)
+            .field("linked_item_id", &self.linked_item_id)
+            .field("trashed_at", &self.trashed_at)
+            .field("audit_log_len", &self.audit_log.len())
             .finish()
     }
 }
@@ -58,9 +128,266 @@ pub struct PasskeyAssertionResponse {
     pub signature_hex: String,
 }
 
+/// WebAuthn registration attestation output containing canonical CBOR attestationObject & COSE key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyAttestationObject {
+    pub credential_id_hex: String,
+    pub aaguid_hex: String,
+    pub cose_public_key_cbor: Vec<u8>,
+    pub authenticator_data: Vec<u8>,
+    pub attestation_object_cbor: Vec<u8>,
+}
+
+/// Output of the WebAuthn `prf` / CTAP2 `hmac-secret` extension derived via HKDF-SHA256.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct PrfExtensionOutput {
+    pub first: [u8; 32],
+    pub second: Option<[u8; 32]>,
+}
+
+impl fmt::Debug for PrfExtensionOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrfExtensionOutput")
+            .field("first", &"[REDACTED]")
+            .field("second", &self.second.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+/// Validates a WebAuthn Relying Party ID (`rpId`) per W3C WebAuthn Level 3 §5.4.2:
+/// must be a valid domain string (or `localhost`), lowercased, with no scheme, port, path,
+/// wildcard, whitespace, or raw IP address.
+pub fn validate_rp_id(rp_id: &str) -> Result<String, String> {
+    let normalized = rp_id.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 253 {
+        return Err("WebAuthn rp_id must be 1..=253 ASCII characters".into());
+    }
+    if normalized.contains("://")
+        || normalized.contains('/')
+        || normalized.contains(':')
+        || normalized.contains('*')
+        || normalized.contains('@')
+        || normalized.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!("Invalid WebAuthn rp_id '{}'", rp_id));
+    }
+    if normalized.starts_with('.') || normalized.ends_with('.') || normalized.contains("..") {
+        return Err(format!("Malformed domain labels in rp_id '{}'", rp_id));
+    }
+    // Reject raw IPv4 addresses (all-numeric labels like 127.0.0.1)
+    let labels: Vec<&str> = normalized.split('.').collect();
+    if labels.len() == 4 && labels.iter().all(|l| l.parse::<u8>().is_ok()) {
+        return Err(format!(
+            "Raw IPv4 address '{}' is not a valid WebAuthn rp_id",
+            rp_id
+        ));
+    }
+    if normalized.starts_with('[') || normalized.ends_with(']') {
+        return Err(format!(
+            "Raw IPv6 address '{}' is not a valid WebAuthn rp_id",
+            rp_id
+        ));
+    }
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return Err(format!("Invalid label length in rp_id '{}'", rp_id));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "Domain label '{}' in rp_id cannot start or end with '-'",
+                label
+            ));
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(format!(
+                "Invalid character in rp_id label '{}'",
+                label
+            ));
+        }
+    }
+    Ok(normalized)
+}
+
+// --- Pure-Rust Canonical CTAP2 CBOR Encoder (RFC 8949 §4.2) ---
+
+fn cbor_write_type_and_arg(major: u8, arg: u64, out: &mut Vec<u8>) {
+    let major_bits = major << 5;
+    if arg < 24 {
+        out.push(major_bits | (arg as u8));
+    } else if arg <= u8::MAX as u64 {
+        out.push(major_bits | 24);
+        out.push(arg as u8);
+    } else if arg <= u16::MAX as u64 {
+        out.push(major_bits | 25);
+        out.extend_from_slice(&(arg as u16).to_be_bytes());
+    } else if arg <= u32::MAX as u64 {
+        out.push(major_bits | 26);
+        out.extend_from_slice(&(arg as u32).to_be_bytes());
+    } else {
+        out.push(major_bits | 27);
+        out.extend_from_slice(&arg.to_be_bytes());
+    }
+}
+
+fn cbor_write_uint(v: u64, out: &mut Vec<u8>) {
+    cbor_write_type_and_arg(0, v, out);
+}
+
+fn cbor_write_int(v: i64, out: &mut Vec<u8>) {
+    if v >= 0 {
+        cbor_write_type_and_arg(0, v as u64, out);
+    } else {
+        // CBOR negative int encodes (-1 - n) as major 1 with argument n
+        let n = (-1i128 - i128::from(v)) as u64;
+        cbor_write_type_and_arg(1, n, out);
+    }
+}
+
+fn cbor_write_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    cbor_write_type_and_arg(2, bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
+}
+
+fn cbor_write_text(text: &str, out: &mut Vec<u8>) {
+    cbor_write_type_and_arg(3, text.len() as u64, out);
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn cbor_write_map_header(len: usize, out: &mut Vec<u8>) {
+    cbor_write_type_and_arg(5, len as u64, out);
+}
+
+/// Encodes a 32-byte Ed25519 public key into a CTAP2 canonical CBOR COSE_Key (OKP / EdDSA -8 / Ed25519).
+/// Map entries in canonical CTAP2 key order: `{ 1: 1 (OKP), 3: -8 (EdDSA), -1: 6 (Ed25519), -2: bstr(x) }`.
+pub fn encode_cose_ed25519_public_key(public_key: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    cbor_write_map_header(4, &mut out);
+    // 1: kty = 1 (OKP)
+    cbor_write_uint(1, &mut out);
+    cbor_write_uint(1, &mut out);
+    // 3: alg = -8 (EdDSA)
+    cbor_write_uint(3, &mut out);
+    cbor_write_int(-8, &mut out);
+    // -1: crv = 6 (Ed25519)
+    cbor_write_int(-1, &mut out);
+    cbor_write_uint(6, &mut out);
+    // -2: x = 32-byte public key
+    cbor_write_int(-2, &mut out);
+    cbor_write_bytes(public_key, &mut out);
+    out
+}
+
+/// Encodes an uncompressed P-256 (ES256, alg -7) public key `(x, y)` into canonical CTAP2 COSE_Key CBOR.
+pub fn encode_cose_es256_public_key(x: &[u8; 32], y: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
+    cbor_write_map_header(5, &mut out);
+    cbor_write_uint(1, &mut out);
+    cbor_write_uint(2, &mut out); // EC2
+    cbor_write_uint(3, &mut out);
+    cbor_write_int(-7, &mut out); // ES256
+    cbor_write_int(-1, &mut out);
+    cbor_write_uint(1, &mut out); // P-256
+    cbor_write_int(-2, &mut out);
+    cbor_write_bytes(x, &mut out);
+    cbor_write_int(-3, &mut out);
+    cbor_write_bytes(y, &mut out);
+    out
+}
+
+/// Encodes an RSA (RS256, alg -257) public key `(n, e)` into canonical CTAP2 COSE_Key CBOR.
+pub fn encode_cose_rs256_public_key(modulus_n: &[u8], exponent_e: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + modulus_n.len() + exponent_e.len());
+    cbor_write_map_header(4, &mut out);
+    cbor_write_uint(1, &mut out);
+    cbor_write_uint(3, &mut out); // RSA
+    cbor_write_uint(3, &mut out);
+    cbor_write_int(-257, &mut out); // RS256
+    cbor_write_int(-1, &mut out);
+    cbor_write_bytes(modulus_n, &mut out);
+    cbor_write_int(-2, &mut out);
+    cbor_write_bytes(exponent_e, &mut out);
+    out
+}
+
+/// Builds a W3C WebAuthn `authenticatorData` byte buffer.
+/// When `attested_cred_data` is `Some((aaguid, credential_id, cose_public_key_cbor))`,
+/// sets the `AT` (`0x40`) flag and appends `aaguid || u16_be(cred_id.len()) || cred_id || cose_public_key_cbor`.
+pub fn build_authenticator_data(
+    rp_id: &str,
+    flags: u8,
+    sign_count: u32,
+    attested_cred_data: Option<(&[u8; 16], &[u8], &[u8])>,
+) -> Result<Vec<u8>, String> {
+    let normalized_rp = validate_rp_id(rp_id)?;
+    let rp_id_hash: [u8; 32] = Sha256::digest(normalized_rp.as_bytes()).into();
+
+    let mut effective_flags = flags;
+    if attested_cred_data.is_some() {
+        effective_flags |= WEBAUTHN_FLAG_AT;
+    }
+
+    let extra_len = attested_cred_data
+        .map(|(_, cid, pk)| 16 + 2 + cid.len() + pk.len())
+        .unwrap_or(0);
+    let mut auth_data = Vec::with_capacity(37 + extra_len);
+    auth_data.extend_from_slice(&rp_id_hash);
+    auth_data.push(effective_flags);
+    auth_data.extend_from_slice(&sign_count.to_be_bytes());
+
+    if let Some((aaguid, cred_id, cose_pub_key)) = attested_cred_data {
+        let cred_len: u16 = cred_id
+            .len()
+            .try_into()
+            .map_err(|_| "WebAuthn credential ID exceeds 65535 bytes".to_string())?;
+        auth_data.extend_from_slice(aaguid);
+        auth_data.extend_from_slice(&cred_len.to_be_bytes());
+        auth_data.extend_from_slice(cred_id);
+        auth_data.extend_from_slice(cose_pub_key);
+    }
+
+    Ok(auth_data)
+}
+
+/// Encodes a WebAuthn `"none"` CBOR `attestationObject` in canonical CTAP2 key order:
+/// `{ "fmt": "none", "attStmt": {}, "authData": bstr(auth_data) }`.
+pub fn encode_cbor_attestation_object(auth_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(36 + auth_data.len());
+    cbor_write_map_header(3, &mut out);
+    // Canonical CTAP2 CBOR text-key order: shorter byte length first, then lexicographic:
+    // "fmt" (3) < "attStmt" (7) < "authData" (8)
+    cbor_write_text("fmt", &mut out);
+    cbor_write_text("none", &mut out);
+    cbor_write_text("attStmt", &mut out);
+    cbor_write_map_header(0, &mut out);
+    cbor_write_text("authData", &mut out);
+    cbor_write_bytes(auth_data, &mut out);
+    out
+}
+
 impl StoredPasskeyCredential {
     /// Enrolls a new resident FIDO2/WebAuthn Ed25519 passkey for `rp_id`.
     pub fn enroll_new(rp_id: &str, user_display_name: &str) -> Self {
+        Self::enroll_new_with_metadata(
+            rp_id,
+            rp_id,
+            user_display_name,
+            user_display_name,
+            PasskeyAlgorithm::Ed25519,
+            None,
+            0,
+        )
+    }
+
+    /// Enrolls a new resident passkey with full V2 metadata and initial audit event.
+    pub fn enroll_new_with_metadata(
+        rp_id: &str,
+        rp_name: &str,
+        user_name: &str,
+        user_display_name: &str,
+        algorithm: PasskeyAlgorithm,
+        linked_item_id: Option<String>,
+        now_unix: u64,
+    ) -> Self {
         let mut cred_id = [0u8; 16];
         let mut user_handle = [0u8; 16];
         let mut secret_seed = [0u8; 32];
@@ -73,15 +400,122 @@ impl StoredPasskeyCredential {
         let seed_hex = hex::encode(secret_seed);
         secret_seed.zeroize();
 
+        let normalized_rp = validate_rp_id(rp_id).unwrap_or_else(|_| rp_id.trim().to_ascii_lowercase());
+
         Self {
             credential_id_hex: hex::encode(cred_id),
-            rp_id: rp_id.to_string(),
+            rp_id: normalized_rp.clone(),
             user_handle_hex: hex::encode(user_handle),
             user_display_name: user_display_name.to_string(),
             public_key_hex: pub_hex,
             secret_seed_hex: seed_hex,
             sign_count: 0,
+            algorithm,
+            rp_name: rp_name.to_string(),
+            user_name: user_name.to_string(),
+            created_at_unix: now_unix,
+            last_used_at_unix: None,
+            linked_item_id,
+            trashed_at: None,
+            audit_log: vec![PasskeyAuditEvent {
+                timestamp_unix: now_unix,
+                action: "enrolled".to_string(),
+                rp_id: normalized_rp,
+                origin: None,
+                user_verified: true,
+            }],
         }
+    }
+
+    /// Returns `true` if this passkey has been moved to trash or revoked via Signal API.
+    pub fn is_trashed(&self) -> bool {
+        self.trashed_at.is_some()
+    }
+
+    /// Produces a WebAuthn registration `attestationObject` (`fmt: "none"`, `AT=0x40`, Singularity AAGUID,
+    /// and canonical CBOR COSE_Key) for this Ed25519 passkey.
+    pub fn build_attestation_object(
+        &self,
+        user_verified: bool,
+    ) -> Result<PasskeyAttestationObject, String> {
+        let pub_bytes = hex::decode(&self.public_key_hex).map_err(|e| e.to_string())?;
+        let pub_arr: [u8; 32] = pub_bytes
+            .try_into()
+            .map_err(|_| "Invalid Ed25519 public key length (expected 32 bytes)".to_string())?;
+        let cred_id_bytes = hex::decode(&self.credential_id_hex).map_err(|e| e.to_string())?;
+        let cose_public_key_cbor = encode_cose_ed25519_public_key(&pub_arr);
+
+        let mut flags = WEBAUTHN_FLAG_UP | WEBAUTHN_FLAG_BE | WEBAUTHN_FLAG_BS | WEBAUTHN_FLAG_AT;
+        if user_verified {
+            flags |= WEBAUTHN_FLAG_UV;
+        }
+
+        let authenticator_data = build_authenticator_data(
+            &self.rp_id,
+            flags,
+            self.sign_count,
+            Some((&SINGULARITY_PASSKEY_AAGUID, &cred_id_bytes, &cose_public_key_cbor)),
+        )?;
+        let attestation_object_cbor = encode_cbor_attestation_object(&authenticator_data);
+
+        Ok(PasskeyAttestationObject {
+            credential_id_hex: self.credential_id_hex.clone(),
+            aaguid_hex: hex::encode(SINGULARITY_PASSKEY_AAGUID),
+            cose_public_key_cbor,
+            authenticator_data,
+            attestation_object_cbor,
+        })
+    }
+
+    /// Derives deterministic 32-byte WebAuthn `prf` / CTAP2 `hmac-secret` extension outputs
+    /// using HKDF-SHA256 bound to this credential's private seed, `rp_id`, and `credential_id`.
+    pub fn derive_prf_extension(
+        &self,
+        salt1: &[u8],
+        salt2: Option<&[u8]>,
+    ) -> Result<PrfExtensionOutput, String> {
+        if self.is_trashed() {
+            return Err("Cannot evaluate PRF extension on trashed passkey".into());
+        }
+        if salt1.is_empty() {
+            return Err("WebAuthn PRF salt1 cannot be empty".into());
+        }
+        if let Some(s2) = salt2 {
+            if s2.is_empty() {
+                return Err("WebAuthn PRF salt2 cannot be empty when present".into());
+            }
+        }
+
+        let mut seed_bytes = hex::decode(&self.secret_seed_hex).map_err(|e| e.to_string())?;
+        if seed_bytes.len() != 32 {
+            seed_bytes.zeroize();
+            return Err("Invalid passkey seed length (expected 32 bytes)".into());
+        }
+
+        let ctx_info = format!("singularity-prf-root:{}:{}", self.rp_id, self.credential_id_hex);
+        let mut prf_root = [0u8; 32];
+        hkdf_sha256(
+            b"singularity-webauthn-prf-v1",
+            &seed_bytes,
+            ctx_info.as_bytes(),
+            &mut prf_root,
+        )
+        .map_err(|e| e.to_string())?;
+        seed_bytes.zeroize();
+
+        let mut first = [0u8; 32];
+        hkdf_sha256(salt1, &prf_root, b"WebAuthn PRF\0", &mut first).map_err(|e| e.to_string())?;
+
+        let second = if let Some(s2) = salt2 {
+            let mut out2 = [0u8; 32];
+            hkdf_sha256(s2, &prf_root, b"WebAuthn PRF\0", &mut out2).map_err(|e| e.to_string())?;
+            Some(out2)
+        } else {
+            None
+        };
+        prf_root.zeroize();
+
+        Ok(PrfExtensionOutput { first, second })
     }
 
     /// Generates an asymmetric Ed25519 WebAuthn CTAP2 assertion over `client_data_json`
@@ -103,7 +537,23 @@ impl StoredPasskeyCredential {
         client_data_json: &[u8],
         user_verified: bool,
     ) -> Result<PasskeyAssertionResponse, String> {
-        if self.rp_id != requesting_rp_id {
+        self.sign_webauthn_assertion_audited(requesting_rp_id, client_data_json, user_verified, 0)
+    }
+
+    /// Generates an asymmetric Ed25519 WebAuthn CTAP2 assertion and records an audit event at `now_unix`.
+    pub fn sign_webauthn_assertion_audited(
+        &mut self,
+        requesting_rp_id: &str,
+        client_data_json: &[u8],
+        user_verified: bool,
+        now_unix: u64,
+    ) -> Result<PasskeyAssertionResponse, String> {
+        if self.is_trashed() {
+            return Err("Cannot assert with a trashed or revoked passkey".into());
+        }
+        let normalized_req = validate_rp_id(requesting_rp_id)?;
+        let normalized_self = validate_rp_id(&self.rp_id)?;
+        if normalized_self != normalized_req {
             return Err(format!(
                 "WebAuthn Phishing Guard: passkey bound to '{}' cannot assert for '{}'",
                 self.rp_id, requesting_rp_id
@@ -133,17 +583,17 @@ impl StoredPasskeyCredential {
             self.public_key_hex = pub_hex.clone();
         }
         self.sign_count = next_count;
+        if now_unix > 0 {
+            self.last_used_at_unix = Some(now_unix);
+        }
 
-        let rp_id_hash: [u8; 32] = Sha256::digest(self.rp_id.as_bytes()).into();
+        let rp_id_hash: [u8; 32] = Sha256::digest(normalized_self.as_bytes()).into();
         let mut flags_byte: u8 = WEBAUTHN_FLAG_UP | WEBAUTHN_FLAG_BE | WEBAUTHN_FLAG_BS;
         if user_verified {
             flags_byte |= WEBAUTHN_FLAG_UV;
         }
 
-        let mut auth_data = Vec::with_capacity(37);
-        auth_data.extend_from_slice(&rp_id_hash);
-        auth_data.push(flags_byte);
-        auth_data.extend_from_slice(&self.sign_count.to_be_bytes());
+        let auth_data = build_authenticator_data(&normalized_self, flags_byte, self.sign_count, None)?;
 
         let client_data_hash: [u8; 32] = Sha256::digest(client_data_json).into();
         let mut signed_payload = Vec::with_capacity(auth_data.len() + 32);
@@ -151,6 +601,21 @@ impl StoredPasskeyCredential {
         signed_payload.extend_from_slice(&client_data_hash);
 
         let signature: Signature = signing_key.sign(&signed_payload);
+
+        let origin_opt = serde_json::from_slice::<serde_json::Value>(client_data_json)
+            .ok()
+            .and_then(|v| v.get("origin").and_then(|o| o.as_str()).map(String::from));
+        self.audit_log.push(PasskeyAuditEvent {
+            timestamp_unix: now_unix,
+            action: "assertion".to_string(),
+            rp_id: normalized_self,
+            origin: origin_opt,
+            user_verified,
+        });
+        if self.audit_log.len() > 100 {
+            let drain = self.audit_log.len() - 100;
+            self.audit_log.drain(0..drain);
+        }
 
         Ok(PasskeyAssertionResponse {
             credential_id_hex: self.credential_id_hex.clone(),
@@ -198,6 +663,7 @@ impl StoredPasskeyCredential {
         require_user_verification: bool,
         require_origin: bool,
     ) -> Result<(), String> {
+        let normalized_rp = validate_rp_id(expected_rp_id)?;
         let pub_bytes = hex::decode(public_key_hex).map_err(|e| e.to_string())?;
         let pub_arr: [u8; 32] = pub_bytes
             .try_into()
@@ -205,7 +671,7 @@ impl StoredPasskeyCredential {
         let verifying_key =
             VerifyingKey::from_bytes(&pub_arr).map_err(|e| format!("Invalid public key: {}", e))?;
 
-        let expected_rp_hash: [u8; 32] = Sha256::digest(expected_rp_id.as_bytes()).into();
+        let expected_rp_hash: [u8; 32] = Sha256::digest(normalized_rp.as_bytes()).into();
         let auth_data = hex::decode(&assertion.authenticator_data_hex).map_err(|e| e.to_string())?;
         if auth_data.len() < 37 || auth_data[..32] != expected_rp_hash {
             return Err("RP ID hash mismatch in authenticatorData".into());
@@ -247,7 +713,7 @@ impl StoredPasskeyCredential {
         }
 
         // Validate clientDataJSON structure, type, challenge, and origin/rp_id coherence
-        validate_client_data_json(client_data_json, expected_rp_id, require_origin)?;
+        validate_client_data_json(client_data_json, &normalized_rp, require_origin)?;
 
         let sig_bytes = hex::decode(&assertion.signature_hex).map_err(|e| e.to_string())?;
         let sig_arr: [u8; 64] = sig_bytes
@@ -264,6 +730,112 @@ impl StoredPasskeyCredential {
             .verify(&signed_payload, &signature)
             .map_err(|_| "Ed25519 WebAuthn signature verification failed".to_string())
     }
+}
+
+// --- WebAuthn Level 3 Signal API ---
+
+/// WebAuthn Signal API Level 3 `PublicKeyCredential.signalUnknownCredential`:
+/// Marks a credential rejected by the Relying Party as trashed/revoked.
+pub fn signal_unknown_credential(
+    passkeys: &mut [StoredPasskeyCredential],
+    rp_id: &str,
+    credential_id_hex: &str,
+    now_unix: u64,
+) -> Result<bool, String> {
+    let normalized_rp = validate_rp_id(rp_id)?;
+    let target_id = credential_id_hex.trim().to_ascii_lowercase();
+    let mut found = false;
+
+    for pk in passkeys.iter_mut() {
+        if pk.rp_id.eq_ignore_ascii_case(&normalized_rp)
+            && pk.credential_id_hex.eq_ignore_ascii_case(&target_id)
+            && pk.trashed_at.is_none()
+        {
+            pk.trashed_at = Some(now_unix);
+            pk.audit_log.push(PasskeyAuditEvent {
+                timestamp_unix: now_unix,
+                action: "signal_unknown_credential".to_string(),
+                rp_id: normalized_rp.clone(),
+                origin: None,
+                user_verified: false,
+            });
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+/// WebAuthn Signal API Level 3 `PublicKeyCredential.signalAllAcceptedCredentials`:
+/// Synchronizes the vault's credentials for `(rp_id, user_handle_hex)` by trashing any credential
+/// not present in `accepted_credential_ids_hex`. Returns count of newly trashed credentials.
+pub fn signal_all_accepted_credentials(
+    passkeys: &mut [StoredPasskeyCredential],
+    rp_id: &str,
+    user_handle_hex: &str,
+    accepted_credential_ids_hex: &[String],
+    now_unix: u64,
+) -> Result<usize, String> {
+    let normalized_rp = validate_rp_id(rp_id)?;
+    let target_handle = user_handle_hex.trim().to_ascii_lowercase();
+    let accepted: HashSet<String> = accepted_credential_ids_hex
+        .iter()
+        .map(|id| id.trim().to_ascii_lowercase())
+        .collect();
+
+    let mut trashed_count = 0usize;
+    for pk in passkeys.iter_mut() {
+        if pk.rp_id.eq_ignore_ascii_case(&normalized_rp)
+            && pk.user_handle_hex.eq_ignore_ascii_case(&target_handle)
+            && pk.trashed_at.is_none()
+            && !accepted.contains(&pk.credential_id_hex.to_ascii_lowercase())
+        {
+            pk.trashed_at = Some(now_unix);
+            pk.audit_log.push(PasskeyAuditEvent {
+                timestamp_unix: now_unix,
+                action: "signal_all_accepted_credentials_removed".to_string(),
+                rp_id: normalized_rp.clone(),
+                origin: None,
+                user_verified: false,
+            });
+            trashed_count += 1;
+        }
+    }
+    Ok(trashed_count)
+}
+
+/// WebAuthn Signal API Level 3 `PublicKeyCredential.signalCurrentUserDetails`:
+/// Updates `user_name` and `user_display_name` across all active passkeys for `(rp_id, user_handle_hex)`.
+/// Returns count of updated credentials.
+pub fn signal_current_user_details(
+    passkeys: &mut [StoredPasskeyCredential],
+    rp_id: &str,
+    user_handle_hex: &str,
+    new_user_name: &str,
+    new_display_name: &str,
+    now_unix: u64,
+) -> Result<usize, String> {
+    let normalized_rp = validate_rp_id(rp_id)?;
+    let target_handle = user_handle_hex.trim().to_ascii_lowercase();
+
+    let mut updated = 0usize;
+    for pk in passkeys.iter_mut() {
+        if pk.rp_id.eq_ignore_ascii_case(&normalized_rp)
+            && pk.user_handle_hex.eq_ignore_ascii_case(&target_handle)
+            && pk.trashed_at.is_none()
+        {
+            pk.user_name = new_user_name.to_string();
+            pk.user_display_name = new_display_name.to_string();
+            pk.audit_log.push(PasskeyAuditEvent {
+                timestamp_unix: now_unix,
+                action: "signal_current_user_details".to_string(),
+                rp_id: normalized_rp.clone(),
+                origin: None,
+                user_verified: false,
+            });
+            updated += 1;
+        }
+    }
+    Ok(updated)
 }
 
 fn validate_client_data_json(
@@ -313,14 +885,7 @@ fn validate_client_data_json(
 }
 
 fn validate_origin_matches_rp_id(origin: &str, expected_rp_id: &str) -> Result<(), String> {
-    let rp_lower = expected_rp_id.trim().to_ascii_lowercase();
-    if rp_lower.is_empty()
-        || rp_lower.contains('/')
-        || rp_lower.contains(':')
-        || rp_lower.chars().any(|c| c.is_whitespace())
-    {
-        return Err("Invalid expected_rp_id".into());
-    }
+    let rp_lower = validate_rp_id(expected_rp_id)?;
 
     let (scheme, authority) = origin
         .split_once("://")
@@ -572,5 +1137,125 @@ mod tests {
         let dbg_pk = format!("{:?}", pk);
         assert!(dbg_pk.contains("[REDACTED]"));
         assert!(!dbg_pk.contains(&pk.secret_seed_hex));
+    }
+
+    #[test]
+    fn test_cbor_attestation_cose_key_prf_and_signal_api_level3() {
+        // Strict rp_id validation
+        assert_eq!(validate_rp_id("GitHub.COM").unwrap(), "github.com");
+        assert_eq!(validate_rp_id("localhost").unwrap(), "localhost");
+        assert!(validate_rp_id("https://github.com").is_err());
+        assert!(validate_rp_id("127.0.0.1").is_err());
+        assert!(validate_rp_id("*.github.com").is_err());
+        assert!(validate_rp_id("github.com:443").is_err());
+
+        // Canonical CBOR COSE_Key and AttestationObject
+        let pk1 = StoredPasskeyCredential::enroll_new_with_metadata(
+            "github.com",
+            "GitHub",
+            "alice@example.com",
+            "Alice",
+            PasskeyAlgorithm::Ed25519,
+            Some("item-1".into()),
+            10_000,
+        );
+        let att = pk1.build_attestation_object(true).expect("build attestation");
+        // Ed25519 COSE key is exact 42 bytes starting with 0xA4 0x01 0x01 0x03 0x27 0x20 0x06 0x21 0x58 0x20
+        assert_eq!(att.cose_public_key_cbor.len(), 42);
+        assert_eq!(
+            &att.cose_public_key_cbor[..10],
+            &[0xA4, 0x01, 0x01, 0x03, 0x27, 0x20, 0x06, 0x21, 0x58, 0x20]
+        );
+        // authenticatorData has AT flag (0x40), UV flag (0x04), and Singularity AAGUID at bytes 37..53
+        assert_ne!(att.authenticator_data[32] & WEBAUTHN_FLAG_AT, 0);
+        assert_ne!(att.authenticator_data[32] & WEBAUTHN_FLAG_UV, 0);
+        assert_eq!(&att.authenticator_data[37..53], &SINGULARITY_PASSKEY_AAGUID);
+        // Attestation object starts with map(3), "fmt", "none", "attStmt", {}
+        assert_eq!(att.attestation_object_cbor[0], 0xA3);
+        assert!(att
+            .attestation_object_cbor
+            .windows(4)
+            .any(|w| w == b"none"));
+
+        // PRF / hmac-secret deterministic derivation
+        let prf_a = pk1.derive_prf_extension(b"salt-one", Some(b"salt-two")).unwrap();
+        let prf_b = pk1.derive_prf_extension(b"salt-one", Some(b"salt-two")).unwrap();
+        assert_eq!(prf_a.first, prf_b.first);
+        assert_eq!(prf_a.second, prf_b.second);
+        assert_ne!(prf_a.first, prf_a.second.unwrap());
+        assert!(format!("{:?}", prf_a).contains("[REDACTED]"));
+
+        // Signal API Level 3
+        let mut pk2 = StoredPasskeyCredential::enroll_new("github.com", "Alice");
+        pk2.user_handle_hex = pk1.user_handle_hex.clone();
+        let mut pk3 = StoredPasskeyCredential::enroll_new("github.com", "Alice");
+        pk3.user_handle_hex = pk1.user_handle_hex.clone();
+
+        let keep_id = pk1.credential_id_hex.clone();
+        let handle = pk1.user_handle_hex.clone();
+        let mut list = vec![pk1, pk2, pk3];
+
+        // signal_current_user_details updates all 3
+        let updated = signal_current_user_details(
+            &mut list,
+            "github.com",
+            &handle,
+            "alice.new@example.com",
+            "Alice Updated",
+            20_000,
+        )
+        .unwrap();
+        assert_eq!(updated, 3);
+        assert_eq!(list[0].user_display_name, "Alice Updated");
+        assert_eq!(list[0].user_name, "alice.new@example.com");
+
+        // signal_all_accepted_credentials trashes the 2 stale credentials
+        let removed = signal_all_accepted_credentials(
+            &mut list,
+            "github.com",
+            &handle,
+            &[keep_id.clone()],
+            21_000,
+        )
+        .unwrap();
+        assert_eq!(removed, 2);
+        assert!(!list[0].is_trashed());
+        assert!(list[1].is_trashed());
+        assert!(list[2].is_trashed());
+
+        // signal_unknown_credential trashes the remaining credential
+        assert!(signal_unknown_credential(&mut list, "github.com", &keep_id, 22_000).unwrap());
+        assert!(list[0].is_trashed());
+    }
+
+    #[test]
+    fn test_v1_passkey_json_backcompat_and_cose_es256_rs256() {
+        // Legacy V1 StoredPasskeyCredential JSON (without V2 fields) must deserialize cleanly
+        let pk_live = StoredPasskeyCredential::enroll_new("example.org", "alice");
+        let v1_json = serde_json::json!({
+            "credential_id_hex": pk_live.credential_id_hex,
+            "rp_id": pk_live.rp_id,
+            "user_handle_hex": pk_live.user_handle_hex,
+            "user_display_name": pk_live.user_display_name,
+            "public_key_hex": pk_live.public_key_hex,
+            "secret_seed_hex": pk_live.secret_seed_hex,
+            "sign_count": 3
+        })
+        .to_string();
+        let restored: StoredPasskeyCredential =
+            serde_json::from_str(&v1_json).expect("deserialize legacy V1 passkey");
+        assert_eq!(restored.algorithm, PasskeyAlgorithm::Ed25519);
+        assert_eq!(restored.sign_count, 3);
+        assert!(!restored.is_trashed());
+
+        // ES256 & RS256 COSE key encoders
+        let es256 = encode_cose_es256_public_key(&[0x11u8; 32], &[0x22u8; 32]);
+        assert_eq!(es256[0], 0xA5); // map(5)
+        assert_eq!(es256[3], 0x03); // key 3 (alg)
+        assert_eq!(es256[4], 0x26); // -7 (ES256)
+
+        let rs256 = encode_cose_rs256_public_key(&[0xAAu8; 32], &[0x01, 0x00, 0x01]);
+        assert_eq!(rs256[0], 0xA4); // map(4)
+        assert_eq!(PasskeyAlgorithm::from_cose_alg_id(-257), Some(PasskeyAlgorithm::Rs256));
     }
 }

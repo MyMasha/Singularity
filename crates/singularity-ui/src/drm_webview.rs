@@ -752,6 +752,7 @@ mod windows_drm {
         last_url: Arc<Mutex<String>>,
         can_back: Arc<AtomicBool>,
         can_fwd: Arc<AtomicBool>,
+        muted: AtomicBool,
     }
 
     impl DrmWebViewHandle {
@@ -955,6 +956,7 @@ mod windows_drm {
                 last_url,
                 can_back,
                 can_fwd,
+                muted: AtomicBool::new(false),
             })
         }
 
@@ -1064,6 +1066,26 @@ mod windows_drm {
             let _ = self.webview.set_visible(false);
             let _ = unsafe { self.webview.controller().Close() };
         }
+
+        pub fn open_devtools(&self) {
+            unsafe {
+                let _ = self.webview.webview().OpenDevToolsWindow();
+            }
+        }
+
+        pub fn set_audio_muted(&self, muted: bool) -> bool {
+            self.muted.store(muted, Ordering::Release);
+            let flag = if muted { "true" } else { "false" };
+            let js = format!(
+                "(function(){{try{{document.querySelectorAll('video,audio').forEach(function(m){{m.muted={};}});}}catch(_e){{}}}})();",
+                flag
+            );
+            self.webview.evaluate_script(&js).is_ok()
+        }
+
+        pub fn is_audio_muted(&self) -> bool {
+            self.muted.load(Ordering::Acquire)
+        }
     }
 
     impl Drop for DrmWebViewHandle {
@@ -1077,6 +1099,45 @@ mod windows_drm {
 pub use windows_drm::{
     create_drm_web_context, DrmNavigationPolicyFn, DrmWebContext, DrmWebViewHandle,
 };
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DrmSitePolicy {
+    pub domain: String,
+    pub allow_protected_content: bool,
+    pub force_signed_drm_engine: bool,
+    pub allow_hardware_playready: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WidevineStatusReport {
+    pub cef_widevine_ready: bool,
+    pub detected_version: Option<String>,
+    pub cdm_path: Option<String>,
+    pub supported_vmp_domains_count: usize,
+    pub playready_hybrid_available: bool,
+}
+
+/// Inspects the CEF profile directory and reports Widevine CDM readiness for `browser://components`
+/// and `browser://media-internals`.
+pub fn inspect_widevine_status(cef_profile_dir: &Path) -> WidevineStatusReport {
+    let cdm_root = cef_profile_dir.join("WidevineCdm");
+    let manifest_path = cdm_root.join("manifest.json");
+    let version = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()));
+    WidevineStatusReport {
+        cef_widevine_ready: version.is_some() || cdm_root.is_dir(),
+        detected_version: version,
+        cdm_path: if cdm_root.exists() {
+            Some(cdm_root.to_string_lossy().to_string())
+        } else {
+            None
+        },
+        supported_vmp_domains_count: VMP_DRM_DOMAINS.len(),
+        playready_hybrid_available: cfg!(target_os = "windows"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
