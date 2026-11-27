@@ -71,7 +71,7 @@ fn bump_state_revision() -> u64 {
 #[cfg(target_os = "windows")]
 const WINDOW_ICON_64_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
 #[cfg(target_os = "windows")]
-const APPLE_BAR_LOGICAL_HEIGHT: f64 = 46.0;
+const APPLE_BAR_LOGICAL_HEIGHT: f64 = 80.0;
 
 type AdoptTabCallback = Arc<Mutex<Option<Box<dyn Fn(TabHandoffPayload) + Send + Sync>>>>;
 type PrivateModeCallback = Arc<Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>>;
@@ -3565,7 +3565,9 @@ fn run_windows_frameless_browser(
     ) {
         let phys = st.window.inner_size();
         let scale = st.window.scale_factor();
-        let bar_h = ((APPLE_BAR_LOGICAL_HEIGHT * scale).round() as u32).min(phys.height.max(1));
+        let bar_h = (((APPLE_BAR_LOGICAL_HEIGHT + st.top_bar_extra_logical_px as f64) * scale)
+            .round() as u32)
+            .min(phys.height.max(1));
         let effective_url = resume_time_sec
             .filter(|&t| t >= 3)
             .map(|t| apply_media_timestamp_to_url(url, t))

@@ -12,6 +12,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 <title>Singularity</title>
 <style>
   :root {
+    color-scheme: dark;
     --void-0: #000000;
     --void-1: #06070b;
     --page-bg: #0c0d12;
@@ -21,7 +22,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-hover: rgba(255, 255, 255, 0.065);
     --bar-bg-top: rgba(12, 13, 18, 0.88);
     --bar-bg-bot: rgba(8, 9, 14, 0.74);
+    --bar-tabstrip-bg: rgba(7, 8, 12, 0.90);
+    --bar-toolbar-bg: rgba(15, 17, 24, 0.88);
     --bg-bar: #0b0c10;
+    --bg-tabstrip: #07080c;
+    --bg-toolbar: #10121a;
 
     --border-hairline: rgba(255, 255, 255, 0.08);
     --border-strong: rgba(255, 255, 255, 0.16);
@@ -40,7 +45,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --status-ok: #34d399;
     --status-danger: #f87171;
 
-    --bar-height: 46px;
+    --tab-row-height: 38px;
+    --nav-row-height: 42px;
+    --bar-height: 80px;
     --ease-cinema: cubic-bezier(0.16, 1, 0.3, 1);
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
     --font-mono: "SF Mono", "Cascadia Code", "Consolas", ui-monospace, monospace;
@@ -55,7 +62,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(22, 13, 6, 0.88);
     --bar-bg-top: rgba(24, 14, 6, 0.90);
     --bar-bg-bot: rgba(16, 9, 4, 0.78);
+    --bar-tabstrip-bg: rgba(14, 8, 3, 0.92);
+    --bar-toolbar-bg: rgba(26, 15, 7, 0.90);
     --bg-bar: #160c05;
+    --bg-tabstrip: #0f0803;
+    --bg-toolbar: #1b0f06;
     --border-warm: rgba(255, 176, 59, 0.48);
     --gold-bright: #ffe699;
     --gold-core: #ff9f2e;
@@ -74,7 +85,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(7, 15, 25, 0.88);
     --bar-bg-top: rgba(8, 17, 29, 0.90);
     --bar-bg-bot: rgba(5, 11, 20, 0.78);
+    --bar-tabstrip-bg: rgba(4, 9, 16, 0.92);
+    --bar-toolbar-bg: rgba(10, 20, 33, 0.90);
     --bg-bar: #07101b;
+    --bg-tabstrip: #050b13;
+    --bg-toolbar: #0b1624;
     --border-warm: rgba(56, 217, 245, 0.44);
     --gold-bright: #a8f3ff;
     --gold-core: #38d9f5;
@@ -93,7 +108,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(16, 10, 26, 0.88);
     --bar-bg-top: rgba(18, 11, 30, 0.90);
     --bar-bg-bot: rgba(11, 7, 20, 0.78);
+    --bar-tabstrip-bg: rgba(10, 6, 18, 0.92);
+    --bar-toolbar-bg: rgba(21, 13, 34, 0.90);
     --bg-bar: #110a1c;
+    --bg-tabstrip: #0b0613;
+    --bg-toolbar: #160e24;
     --border-warm: rgba(185, 117, 255, 0.44);
     --gold-bright: #e4c7ff;
     --gold-core: #b975ff;
@@ -112,7 +131,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(22, 8, 11, 0.88);
     --bar-bg-top: rgba(24, 9, 12, 0.90);
     --bar-bg-bot: rgba(15, 6, 8, 0.78);
+    --bar-tabstrip-bg: rgba(14, 5, 7, 0.92);
+    --bar-toolbar-bg: rgba(27, 10, 14, 0.90);
     --bg-bar: #16080b;
+    --bg-tabstrip: #0f0508;
+    --bg-toolbar: #1c0b0f;
     --border-warm: rgba(255, 77, 94, 0.46);
     --gold-bright: #ffadb6;
     --gold-core: #ff4d5e;
@@ -131,7 +154,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     --glass-panel: rgba(7, 19, 15, 0.88);
     --bar-bg-top: rgba(8, 22, 17, 0.90);
     --bar-bg-bot: rgba(5, 14, 11, 0.78);
+    --bar-tabstrip-bg: rgba(4, 13, 10, 0.92);
+    --bar-toolbar-bg: rgba(9, 25, 19, 0.90);
     --bg-bar: #07140f;
+    --bg-tabstrip: #040e0a;
+    --bg-toolbar: #0a1b14;
     --border-warm: rgba(52, 211, 153, 0.44);
     --gold-bright: #a7f3d0;
     --gold-core: #34d399;
@@ -147,6 +174,33 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     padding: 0;
     user-select: none;
     -webkit-user-select: none;
+  }
+
+  /* Sleek OLED dark scrollbars & native form controls across all panes/modals */
+  ::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.14);
+    border-radius: 999px;
+    border: 1.5px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.28);
+    background-clip: content-box;
+  }
+  select, option {
+    background-color: #0c0e15;
+    color: var(--text-primary);
+  }
+  input[type="range"] {
+    accent-color: var(--gold-core);
+    cursor: pointer;
   }
 
   html, body {
@@ -195,44 +249,100 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
 
   /* ==========================================================================
-   * UNIFIED APPLE MACOS SAFARI BAR WITH THREE COLORED TRAFFIC LIGHTS
-   * Centered URL bar by default; glides smoothly to the right when many tabs open!
+   * CLASSIC TWO-BAR COSMIC OLED HEADER (Row 1: Full-Width Tabs, Row 2: Nav/Omnibar/Tools)
+   * Preserves Singularity's OLED cosmic themes, glass surfaces & Apple traffic lights!
    * ========================================================================== */
   .apple-bar {
+    position: relative;
     height: var(--bar-height);
     min-height: var(--bar-height);
+    width: 100%;
     min-width: 0;
     overflow: hidden;
-    padding: 0 14px 0 16px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) clamp(230px, 27vw, 440px) minmax(0, 1fr);
-    align-items: center;
-    gap: 10px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
     background: linear-gradient(180deg, var(--bar-bg-top) 0%, var(--bar-bg-bot) 100%);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
     contain: layout style;
     z-index: 30;
-    app-region: drag;
-    -webkit-app-region: drag;
   }
   body.bar-only .apple-bar {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
-    background: var(--bg-bar, var(--page-sidebar, #0b0c10));
+    background: var(--bg-tabstrip, var(--bg-bar, #07080c));
   }
   .apple-bar.tabs-expanded {
-    grid-template-columns: minmax(0, 1fr) clamp(190px, 22vw, 330px) auto;
+    /* Dedicated full-width Row 1 holds 30+ tabs comfortably; Row 2 omnibar stays calmly anchored */
+    --tabs-expanded: 1;
   }
 
+  /* Row 1: Frameless Titlebar + Full-Width Tab Strip (Draggable on empty space) */
+  .tab-strip-row {
+    position: relative;
+    height: var(--tab-row-height);
+    min-height: var(--tab-row-height);
+    width: 100%;
+    min-width: 0;
+    padding: 0 10px 0 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bar-tabstrip-bg);
+    box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.075);
+    app-region: drag;
+    -webkit-app-region: drag;
+  }
+  body.bar-only .tab-strip-row {
+    background: var(--bg-tabstrip, #07080c);
+  }
+  .tab-strip-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding-left: 16px;
+    flex-shrink: 0;
+  }
+
+  /* Row 2: Classic Navigation + Wide Omnibar + Extensions & Action Controls */
+  .nav-toolbar-row {
+    position: relative;
+    height: var(--nav-row-height);
+    min-height: var(--nav-row-height);
+    width: 100%;
+    min-width: 0;
+    padding: 0 12px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(260px, 42vw, 700px) minmax(max-content, 1fr);
+    align-items: center;
+    gap: 10px;
+    background: var(--bar-toolbar-bg);
+    app-region: no-drag;
+    -webkit-app-region: no-drag;
+  }
+  body.bar-only .nav-toolbar-row {
+    background: var(--bg-toolbar, var(--bg-bar, #10121a));
+  }
+
+  .nav-left-group,
   .toolbar-left {
     min-width: 0;
     height: 100%;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 5px;
     overflow: hidden;
+  }
+
+  .toolbar-sep {
+    width: 1px;
+    height: 16px;
+    background: rgba(255, 255, 255, 0.10);
+    margin: 0 3px;
+    flex-shrink: 0;
   }
 
   .toolbar-right-wrap {
@@ -249,10 +359,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .apple-bar input,
   .apple-bar select,
   .apple-bar a,
+  .nav-toolbar-row,
   .traffic-lights,
   .safari-nav-group,
   .safari-nav-group *,
-  .tabs-bar-wrap,
+  .tabs-scroll-btn,
   .tabs-strip,
   .tab-pill,
   .tab-pill *,
@@ -376,23 +487,24 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     justify-content: center;
   }
 
-  /* Overflow-Proof Multi-Tab Bar (Classic Chrome/Brave readability + Tab Groups + Favicons) */
+  /* Overflow-Proof Full-Width Tab Strip (Row 1 — Brave/Chrome density + Singularity OLED craft) */
   .tabs-bar-wrap {
     flex: 1 1 auto;
     min-width: 0;
     height: 100%;
     display: flex;
-    align-items: center;
-    gap: 3px;
+    align-items: stretch;
+    gap: 4px;
     overflow: hidden;
   }
 
   .tabs-scroll-btn {
-    width: 20px;
+    width: 22px;
     height: 26px;
+    align-self: center;
     border: none;
-    border-radius: 5px;
-    background: rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.06);
     color: var(--text-secondary);
     display: none;
     align-items: center;
@@ -402,29 +514,38 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     transition: background 0.14s ease, color 0.14s ease;
   }
   .tabs-scroll-btn.visible { display: inline-flex; }
-  .tabs-scroll-btn:hover { background: rgba(255, 255, 255, 0.12); color: #ffffff; }
+  .tabs-scroll-btn:hover { background: rgba(255, 255, 255, 0.13); color: #ffffff; }
+
+  .tabs-bar-wrap #btn-new-tab {
+    align-self: center;
+    margin-left: 2px;
+  }
 
   .tabs-strip {
     flex: 0 1 auto;
     max-width: 100%;
+    height: 100%;
     display: flex;
-    align-items: center;
-    gap: 3px;
+    align-items: flex-end;
+    gap: 2px;
     min-width: 0;
     overflow-x: auto;
+    overflow-y: hidden;
     scrollbar-width: none;
-    padding: 2px 0;
+    padding: 0;
   }
   .tabs-strip::-webkit-scrollbar { display: none; }
 
   /* Colored Collapsible Tab Group Header Pill */
   .tab-group-pill {
     flex: 0 0 auto;
+    align-self: center;
     height: 22px;
     max-width: 120px;
     min-width: 22px;
     padding: 0 8px;
     margin-left: 3px;
+    margin-right: 2px;
     border-radius: 6px;
     border: none;
     background: var(--group-color, #f0b254);
@@ -467,13 +588,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     position: relative;
     flex: 0 1 172px;
     width: 172px;
-    height: 30px;
+    height: 29px;
+    margin-bottom: 4px;
     max-width: 172px;
     min-width: 72px;
     box-sizing: border-box;
     padding: 0 6px 0 8px;
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.028);
+    background: transparent;
     border: 1px solid transparent;
     color: var(--text-secondary);
     font-size: 11.5px;
@@ -508,11 +630,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .tab-pill::after {
     content: "";
     position: absolute;
-    right: -2px;
+    right: -1px;
     top: 7px;
     bottom: 7px;
     width: 1px;
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.10);
     pointer-events: none;
     transition: opacity 0.12s ease;
   }
@@ -523,24 +645,30 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .tab-pill:has(+ .tab-group-pill)::after {
     opacity: 0;
   }
-  .tab-pill:hover { background: rgba(255, 255, 255, 0.075); color: var(--text-primary); }
+  .tab-pill:hover { background: rgba(255, 255, 255, 0.068); color: var(--text-primary); }
+  /* Classic Two-Bar Active Tab: seamlessly rises out of Row 2 toolbar surface */
   .tab-pill.active {
-    background: rgba(255, 255, 255, 0.13);
-    border-color: rgba(255, 255, 255, 0.16);
+    height: 33px;
+    margin-bottom: 0;
+    border-radius: 9px 9px 0 0;
+    background: var(--bar-toolbar-bg);
+    border-color: rgba(255, 255, 255, 0.12);
+    border-bottom-color: transparent;
     color: #ffffff;
-    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.28);
+    z-index: 2;
+    box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.28);
+  }
+  body.bar-only .tab-pill.active {
+    background: var(--bg-toolbar, var(--bg-bar, #10121a));
   }
   .tab-pill.in-group {
-    border-bottom: 2px solid var(--group-color, #f0b254);
-    border-bottom-left-radius: 6px;
-    border-bottom-right-radius: 6px;
+    border-top: 2px solid var(--group-color, #f0b254);
   }
   .tab-pill.in-group.active {
-    background: rgba(255, 255, 255, 0.145);
-    border-bottom-color: var(--group-color, #f0b254);
+    border-top-color: var(--group-color, #f0b254);
   }
   .tab-pill.sleeping {
-    opacity: 0.72;
+    opacity: 0.68;
   }
   .tab-pill.sleeping:hover { opacity: 0.96; }
 
@@ -590,7 +718,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     height: 6px;
     border-radius: 50%;
     background: var(--gold-core);
-    border: 1.5px solid var(--bg-bar, #0b0c10);
+    border: 1.5px solid var(--bg-tabstrip, #07080c);
     pointer-events: none;
   }
 
@@ -612,13 +740,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
   .tab-close-btn:hover { background: rgba(255, 255, 255, 0.16); color: #ffffff; opacity: 1; }
 
-  /* Compact Brave/Chrome Tab Density when many tabs are open:
-     Identical widths for active & inactive pills prevent horizontal jitter on selection/hover! */
+  /* Multi-Tier Brave/Chrome Tab Density for 10, 18, and 28+ open tabs:
+     Uses top:0; bottom:0; margin:auto 0; on close button so hover scale NEVER jumps vertically! */
   .tabs-strip.compact-tabs .tab-pill {
     flex: 0 1 132px;
     width: 132px;
     max-width: 132px;
-    min-width: 48px;
+    min-width: 52px;
     padding: 0 6px 0 7px;
     gap: 5px;
   }
@@ -626,32 +754,37 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     display: none;
     position: absolute;
     right: 4px;
-    background: rgba(22, 24, 32, 0.94);
-    box-shadow: -4px 0 6px rgba(14, 16, 22, 0.9);
+    top: 0;
+    bottom: 0;
+    margin: auto 0;
+    background: rgba(18, 20, 28, 0.94);
+    box-shadow: -4px 0 6px rgba(10, 12, 18, 0.92);
   }
   .tabs-strip.compact-tabs .tab-pill:not(.active):hover .tab-close-btn {
     display: inline-flex;
     opacity: 0.95;
   }
   .tabs-strip.very-compact .tab-pill {
-    flex: 0 1 84px;
-    width: 84px;
-    max-width: 84px;
-    min-width: 44px;
+    flex: 0 1 82px;
+    width: 82px;
+    max-width: 82px;
+    min-width: 38px;
     padding: 0 5px 0 6px;
     gap: 4px;
     overflow: hidden;
   }
   .tabs-strip.very-compact .tab-pill.active {
+    min-width: 76px;
     padding-right: 22px;
   }
   .tabs-strip.very-compact .tab-pill .tab-close-btn {
     position: absolute;
     right: 3px;
-    top: 50%;
-    transform: translateY(-50%);
-    background: rgba(22, 24, 32, 0.94);
-    box-shadow: -4px 0 6px rgba(14, 16, 22, 0.9);
+    top: 0;
+    bottom: 0;
+    margin: auto 0;
+    background: rgba(18, 20, 28, 0.94);
+    box-shadow: -4px 0 6px rgba(10, 12, 18, 0.92);
   }
   .tabs-strip.very-compact .tab-pill:not(.active) .tab-close-btn {
     display: none;
@@ -659,6 +792,21 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .tabs-strip.very-compact .tab-pill:not(.active):hover .tab-close-btn,
   .tabs-strip.very-compact .tab-pill.active .tab-close-btn {
     display: inline-flex;
+  }
+  .tabs-strip.ultra-compact .tab-pill {
+    flex: 0 1 48px;
+    width: 48px;
+    max-width: 48px;
+    min-width: 32px;
+    padding: 0 5px;
+    gap: 4px;
+  }
+  .tabs-strip.ultra-compact .tab-pill.active {
+    flex: 0 1 92px;
+    width: 92px;
+    max-width: 92px;
+    min-width: 72px;
+    padding: 0 22px 0 7px;
   }
 
   /* Real-Time Update Download Progress Bar (Settings + Compact Floating Overlay) */
@@ -691,7 +839,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     position: fixed;
     right: 16px;
     bottom: 16px;
-    z-index: 260;
+    z-index: 9700;
     width: 320px;
     max-width: calc(100vw - 32px);
     padding: 11px 14px;
@@ -705,10 +853,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     backdrop-filter: blur(14px);
   }
   #update-floating-bar.visible { display: flex; }
-  /* In 46px bar-only webview mode, integrate as a compact 30px inline pill at the right edge
-     while reserving matching right padding on .apple-bar so no buttons are ever covered or clipped. */
+  /* In bar-only webview mode, integrate as a compact 30px inline pill at Row 2's right edge
+     while reserving matching right padding on .nav-toolbar-row so no buttons are ever covered. */
   body.bar-only #update-floating-bar {
-    top: 8px;
+    top: calc(var(--tab-row-height) + 6px);
     bottom: auto;
     right: 12px;
     left: auto;
@@ -751,8 +899,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   body.bar-only #update-floating-meta {
     display: none;
   }
-  body.bar-only.has-update-bar .apple-bar {
-    padding-right: 226px;
+  body.bar-only.has-update-bar .nav-toolbar-row {
+    padding-right: 224px;
   }
   #topbar-update-line {
     position: absolute;
@@ -775,18 +923,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     transition: width 0.22s ease;
   }
 
-  /* Inline Tab Group Name/Color Editor (Strictly fits inside 46px bar, never clipped!) */
+  /* Inline Tab Group Name/Color Editor (Fits strictly inside Row 1 tab strip, never clipped!) */
   #group-editor-bar {
     position: fixed;
-    top: 6px;
+    top: 2px;
     left: 50%;
     transform: translateX(-50%);
-    z-index: 160;
+    z-index: 9750;
     height: 34px;
     padding: 0 8px 0 10px;
     border-radius: 10px;
     background: rgba(14, 16, 24, 0.98);
-    border: 1px solid rgba(240, 178, 84, 0.45);
+    border: 1px solid var(--border-warm);
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.72);
     display: none;
     align-items: center;
@@ -842,7 +990,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   /* Non-native Linux/Chromium fallback HTML Tab Context Menu */
   #tab-context-menu {
     position: fixed;
-    z-index: 260;
+    z-index: 9800;
     min-width: 226px;
     padding: 5px;
     border-radius: 10px;
@@ -881,7 +1029,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .tctx-header { font-size: 10px; font-weight: 700; color: var(--text-muted); padding: 4px 10px 2px; text-transform: uppercase; letter-spacing: 0.05em; }
   .tctx-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; flex-shrink: 0; }
 
-  /* Center Unified Safari Omnibar (Always Mathematically Centered via 1fr / center / 1fr Grid) */
+  /* Row 2 Spacious Centered Omnibar */
   .omnibar-wrap {
     width: 100%;
     height: 100%;
@@ -894,10 +1042,10 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   .safari-omnibar {
     width: 100%;
-    max-width: 440px;
+    max-width: 700px;
     height: 30px;
-    padding: 0 5px 0 10px;
-    border-radius: 8px;
+    padding: 0 6px 0 11px;
+    border-radius: 10px;
     background: rgba(255, 255, 255, 0.055);
     border: 1px solid var(--border-hairline);
     display: flex;
@@ -906,8 +1054,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     transition: background 0.16s ease, border-color 0.16s ease;
   }
   .safari-omnibar:focus-within {
-    background: rgba(14, 16, 24, 0.92);
-    border-color: rgba(240, 178, 84, 0.42);
+    background: rgba(8, 10, 16, 0.96);
+    border-color: var(--border-warm);
   }
   .omnibar-lead-icon { color: var(--text-muted); display: inline-flex; align-items: center; flex-shrink: 0; }
   .omnibar-input {
@@ -1076,7 +1224,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   /* ==========================================================================
    * MAIN STAGE & NEW TAB PAGE (MATCHING IMAGE 1 EDITORIAL COMPOSITION)
    * ========================================================================== */
-  #stage-viewport { position: relative; flex: 1; min-height: 0; width: 100%; display: flex; }
+  #stage-viewport { position: relative; flex: 1; min-height: 0; width: 100%; display: flex; transition: padding-left 0.22s var(--ease-silk); }
 
   #ntp-view {
     width: 100%;
@@ -1279,7 +1427,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   #onboarding-overlay {
     position: fixed;
     inset: var(--bar-height) 0 0 0;
-    z-index: 95;
+    z-index: 9900;
     background: rgba(0, 0, 0, 0.70);
     backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
@@ -1615,8 +1763,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     display: none;
     flex-direction: row;
     overflow: hidden;
+    transition: left 0.22s var(--ease-silk);
   }
   #settings-modal.open { display: flex; }
+  body.v3-sb-open #stage-viewport { padding-left: 340px; }
+  body.v3-sb-open #settings-modal { left: 340px; }
+  body.vertical-tabs:not(.v3-sb-open) #stage-viewport { padding-left: 230px; }
+  body.vertical-tabs:not(.v3-sb-open) #settings-modal { left: 230px; }
 
   .glass-sheet {
     width: 100%;
@@ -1634,8 +1787,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     border-right: 1px solid rgba(255, 255, 255, 0.07);
     display: flex;
     flex-direction: column;
-    padding: 18px 12px 14px;
-    gap: 4px;
+    padding: 14px 10px 12px;
+    gap: 3px;
     overflow-y: auto;
     flex-shrink: 0;
   }
@@ -1643,7 +1796,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 4px 10px 14px;
+    padding: 4px 10px 12px;
     margin-bottom: 4px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   }
@@ -1653,25 +1806,27 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   .sheet-tabs {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
     flex: 1;
+    min-height: 0;
   }
   .sheet-tab-btn {
     width: 100%;
-    height: 36px;
-    padding: 0 12px;
+    height: 33px;
+    padding: 0 11px;
     border: 1px solid transparent;
-    border-radius: 9px;
+    border-radius: 8px;
     background: transparent;
     color: var(--text-secondary);
     font-family: inherit;
-    font-size: 12.5px;
+    font-size: 12.25px;
     font-weight: 500;
     cursor: pointer;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 9px;
     text-align: left;
+    flex-shrink: 0;
     transition: all 0.14s ease;
   }
   .sheet-tab-btn svg { width: 15px; height: 15px; opacity: 0.8; flex-shrink: 0; }
@@ -1721,6 +1876,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   .sheet-search {
     width: min(380px, 46vw);
+    min-width: 0;
     height: 34px;
     padding: 0 13px;
     border-radius: 9px;
@@ -1734,6 +1890,19 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     -webkit-user-select: text;
   }
   .sheet-search:focus { border-color: var(--border-warm); background: rgba(255, 255, 255, 0.075); }
+  .info-card .sheet-search,
+  #v3-sidebar .sheet-search {
+    width: 100%;
+    min-width: 0;
+  }
+  textarea.sheet-search {
+    width: 100%;
+    height: auto;
+    min-height: 78px;
+    padding: 9px 12px;
+    resize: vertical;
+    line-height: 1.45;
+  }
 
   .text-field {
     height: 32px;
@@ -1857,12 +2026,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     font-weight: 600;
   }
 
-  /* Toast Notification — Never Clipped (Adapts cleanly when bar-only 46px strip is active!) */
+  /* Toast Notification — Never Clipped & Always Above Overlays */
   #toast {
     position: fixed;
     bottom: 22px;
     right: 24px;
-    z-index: 200;
+    z-index: 10500;
     max-width: min(460px, calc(100vw - 48px));
     padding: 9px 15px;
     border-radius: 10px;
@@ -1893,8 +2062,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   #toast.show.clickable { pointer-events: auto; cursor: pointer; }
   #toast.show.clickable:hover { border-color: var(--gold-bright); }
 
-  /* When browsing a web page (`body.bar-only`), ui_webview is 46px tall:
-     render a crisp centered 32px pill strictly within y=7..39px so it is NEVER cut off! */
+  /* When browsing a web page (`body.bar-only`), render a crisp centered 32px pill strictly
+     within the top chrome so it is NEVER cut off! */
   body.bar-only #toast {
     top: 7px;
     bottom: auto;
@@ -1930,38 +2099,47 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   body.bar-only .rz-s, body.bar-only .rz-sw, body.bar-only .rz-se { display: none; }
   body.is-maximized .rz { display: none !important; pointer-events: none !important; }
 
-  /* Responsive top bar for narrow Windows 11 Snap Layout zones (down to 480px) */
+  /* Responsive two-bar chrome for laptops & narrow Windows 11 Snap Layout zones (down to 480px) */
+  @media (max-width: 1120px) {
+    .nav-toolbar-row {
+      grid-template-columns: auto minmax(180px, 1fr) auto;
+      gap: 8px;
+    }
+    .ext-toolbar-strip { max-width: 112px; }
+  }
   @media (max-width: 860px) {
-    .apple-bar {
-      padding: 0 10px;
+    .tab-strip-row { padding: 0 8px 0 10px; gap: 6px; }
+    .nav-toolbar-row {
+      padding: 0 8px;
       gap: 6px;
-      grid-template-columns: minmax(0, 1fr) clamp(175px, 28vw, 290px) minmax(0, 1fr);
+      grid-template-columns: auto minmax(140px, 1fr) auto;
     }
-    .apple-bar.tabs-expanded {
-      grid-template-columns: minmax(0, 1fr) clamp(145px, 24vw, 220px) auto;
-    }
-    .toolbar-left { gap: 5px; }
-    .tab-pill { min-width: 54px; max-width: 112px; padding: 0 5px 0 7px; }
+    .toolbar-sep { display: none; }
+    .tab-pill { min-width: 48px; max-width: 120px; padding: 0 5px 0 7px; }
     .status-pill { padding: 0 7px; }
     .status-pill #vpn-label { display: none; }
-    .ext-toolbar-strip { max-width: 84px; }
+    .ext-toolbar-strip { max-width: 64px; }
     .ram-mode-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .theme-gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .tuto-feature-grid { grid-template-columns: 1fr; }
     .settings-sidebar { width: 196px; min-width: 180px; }
-    body.bar-only.has-update-bar .apple-bar { padding-right: 10px; }
+    body.bar-only.has-update-bar .nav-toolbar-row { padding-right: 8px; }
     body.bar-only #update-floating-bar { display: none !important; }
   }
   @media (max-width: 640px) {
-    .apple-bar, .apple-bar.tabs-expanded {
-      padding: 0 8px;
+    .tab-strip-row { padding: 0 6px 0 8px; gap: 4px; }
+    .nav-toolbar-row {
+      padding: 0 6px;
       gap: 4px;
-      grid-template-columns: minmax(0, 1fr) clamp(110px, 30vw, 180px) auto;
+      grid-template-columns: auto minmax(110px, 1fr) auto;
     }
     .traffic-lights { gap: 6px; margin-right: 0; }
     .icon-btn, .brand-home-btn { width: 24px; height: 24px; }
-    .tab-pill { min-width: 46px; max-width: 84px; }
-    .ext-toolbar-strip { display: none; }
+    .tab-pill { min-width: 38px; max-width: 84px; }
+    .ext-toolbar-strip,
+    #btn-v3-split-view,
+    #btn-v3-media,
+    #btn-v3-palette { display: none; }
     body.bar-only #toast { max-width: calc(100vw - 24px); }
   }
   #crash-report-modal {
@@ -2077,15 +2255,29 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 /* ============================================================================
  * SINGULARITY v3.0 OLED PARITY SHELL COMPONENTS
  * ============================================================================ */
+#v3-overlay-scrim {
+  position: fixed;
+  inset: var(--bar-height) 0 0 0;
+  background: rgba(3, 4, 8, 0.68);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  z-index: 9350;
+  display: none;
+}
+#v3-overlay-scrim.open {
+  display: block;
+  animation: sgBackdropFade 0.16s var(--ease-silk) both;
+}
+
 #omnibox-dropdown {
   position: fixed;
-  top: 46px;
+  top: calc(var(--bar-height) + 4px);
   left: 50%;
   transform: translateX(-50%);
-  width: min(680px, 88vw);
-  max-height: 440px;
+  width: min(700px, 88vw);
+  max-height: min(440px, calc(100vh - var(--bar-height) - 24px));
   overflow-y: auto;
-  background: rgba(6, 6, 10, 0.97);
+  background: rgba(8, 10, 16, 0.98);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 14px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.92);
@@ -2130,12 +2322,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
 #v3-sidebar {
   position: fixed;
-  top: 46px;
+  top: var(--bar-height);
   left: 0;
   bottom: 0;
   width: 340px;
   max-width: 90vw;
-  background: #000000;
+  background: var(--page-sidebar, #090a0f);
   border-right: 1px solid rgba(255, 255, 255, 0.12);
   z-index: 8800;
   display: none;
@@ -2149,6 +2341,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   padding: 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   overflow-x: auto;
+  flex-shrink: 0;
 }
 .v3-sb-tab {
   position: relative;
@@ -2161,6 +2354,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   border-radius: 8px;
   cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
   transition: background 0.16s var(--ease-snappy), border-color 0.16s var(--ease-snappy), color 0.16s ease, transform 0.16s var(--ease-spring);
 }
 .v3-sb-tab:hover { background: rgba(255, 255, 255, 0.10); color: #ffffff; }
@@ -2172,6 +2366,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 }
 .v3-sb-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 10px;
   display: flex;
@@ -2189,7 +2384,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   display: none;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 72px;
+  padding-top: calc(var(--bar-height) + 18px);
 }
 #command-palette-modal.open, #tab-search-modal.open, #v3-internal-frame-modal.open {
   display: flex;
@@ -2203,7 +2398,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 .v3-modal-card {
   width: min(640px, 92vw);
   max-height: 76vh;
-  background: #050508;
+  background: #08090e;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 16px;
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.95);
@@ -2214,13 +2409,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 }
 .v3-modal-input {
   width: 100%;
-  background: #000000;
+  background: #05060a;
   color: #ffffff;
   border: none;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   padding: 14px 16px;
   font-size: 14px;
   outline: none;
+  user-select: text;
+  -webkit-user-select: text;
 }
 .v3-modal-list {
   overflow-y: auto;
@@ -2241,13 +2438,13 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
 #find-in-page-bar {
   position: fixed;
-  top: 50px;
+  top: calc(var(--bar-height) + 6px);
   right: 18px;
   z-index: 9500;
   display: none;
   align-items: center;
   gap: 6px;
-  background: #050508;
+  background: #090b11;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 11px;
   padding: 6px 10px;
@@ -2255,15 +2452,32 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   transform-origin: top right;
 }
 #find-in-page-bar.open { display: flex; animation: sgPopoverPop 0.2s var(--ease-spring) both; }
+/* In bar-only webview mode, dock as a sleek full-width 42px strip right below Row 2 so live page matches stay 100% visible! */
+body.bar-only #find-in-page-bar {
+  top: var(--bar-height);
+  left: 0;
+  right: 0;
+  height: 42px;
+  border-radius: 0;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+  background: var(--bg-toolbar, #10121a);
+  box-shadow: none;
+  padding: 0 14px;
+  justify-content: flex-end;
+  animation: none;
+}
 #find-in-page-input {
-  background: #000000;
+  background: rgba(0, 0, 0, 0.65);
   color: #ffffff;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 7px;
-  padding: 5px 8px;
+  padding: 5px 9px;
   font-size: 12px;
-  width: 200px;
+  width: 220px;
   outline: none;
+  user-select: text;
+  -webkit-user-select: text;
   transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 #find-in-page-input:focus {
@@ -2273,12 +2487,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
 #v3-popover-panel {
   position: fixed;
-  top: 48px;
+  top: calc(var(--bar-height) + 6px);
   right: 14px;
   width: min(400px, 92vw);
-  max-height: 75vh;
+  max-height: min(75vh, calc(100vh - var(--bar-height) - 24px));
   overflow-y: auto;
-  background: #050508;
+  background: #080a10;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 14px;
   padding: 14px;
@@ -2315,11 +2529,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.22s var(--ease-silk) both; }
 #v3-vertical-rail {
   position: fixed;
-  top: 46px;
+  top: var(--bar-height);
   left: 0;
   bottom: 0;
   width: 230px;
-  background: #000000;
+  background: var(--page-sidebar, #090a0f);
   border-right: 1px solid rgba(255, 255, 255, 0.11);
   z-index: 8600;
   display: none;
@@ -2332,8 +2546,8 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 7px 9px;
+  gap: 6px;
+  padding: 7px 8px;
   border-radius: 8px;
   cursor: pointer;
   color: var(--text-secondary);
@@ -2348,6 +2562,22 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   border-color: var(--border-warm);
   color: var(--gold-bright);
 }
+.v3-vtab-close {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.65;
+  transition: background 0.14s ease, color 0.14s ease, opacity 0.14s ease;
+}
+.v3-vtab-close:hover { background: rgba(255, 255, 255, 0.14); color: #ffffff; opacity: 1; }
 .v3-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
 .v3-chip-btn {
   position: relative;
@@ -2464,16 +2694,16 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
 /* Omnibox dropdown spring drop */
 #omnibox-dropdown.open { animation: sgOmniDrop 0.19s var(--ease-spring) both; }
 
-/* Satisfying zero-jitter tab entrance & active underline glide */
+/* Satisfying zero-jitter tab entrance & luminous top crown accent on active tab */
 .tab-pill.tab-entering { animation: sgTabEnter 0.22s var(--ease-spring) both; }
 .tab-pill::before {
   content: "";
   position: absolute;
   left: 10px;
   right: 10px;
-  bottom: 1px;
+  top: 0;
   height: 2px;
-  border-radius: 99px;
+  border-radius: 0 0 99px 99px;
   background: var(--gold-core);
   opacity: 0;
   transform: scaleX(0.25);
@@ -2481,7 +2711,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   transition: transform 0.24s var(--ease-spring), opacity 0.18s ease;
 }
 .tab-pill.active:not(.in-group)::before {
-  opacity: 0.85;
+  opacity: 0.92;
   transform: scaleX(1);
 }
 .tab-pill:active:not(.dragging) { transform: scale(0.985); }
@@ -2665,11 +2895,10 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   <div class="cinema-vignette" id="cinema-vignette"></div>
 
   <div id="app-shell">
-    <!-- UNIFIED APPLE SAFARI TOP BAR (3-column symmetric Grid keeps URL bar centered always) -->
+    <!-- CLASSIC TWO-BAR COSMIC OLED HEADER (Row 1: Full-Width Tabs, Row 2: Nav/Omnibar/Tools) -->
     <header class="apple-bar" id="apple-titlebar">
-      <div id="v3-load-progress" aria-hidden="true"></div>
-      <!-- Left Column: Traffic Lights + Navigation + Overflow-Proof Tabs -->
-      <div class="toolbar-left">
+      <!-- ROW 1: Traffic Lights + Studio Logo + Full-Width Multi-Tab Strip + Tab Search -->
+      <div class="tab-strip-row" id="tab-strip-row">
         <!-- Three Colored Apple Traffic Lights -->
         <div class="traffic-lights" role="group" aria-label="Window controls" data-i18n-aria="win_controls">
           <button type="button" class="tl-dot tl-close" title="Close" data-i18n-title="win_close" data-win-action="close">
@@ -2689,24 +2918,11 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
           </button>
         </div>
 
-        <!-- Studio Brand Logo + Safari Navigation Chevrons -->
-        <div class="safari-nav-group">
-          <button type="button" class="brand-home-btn" id="btn-brand-home" title="Singularity Home" data-i18n-title="nav_home">
-            <img src="/api/logo.png" alt="Singularity" />
-          </button>
-          <button type="button" class="icon-btn" id="btn-nav-back" title="Back" data-i18n-title="nav_back">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="15 18 9 12 15 6"/>
-            </svg>
-          </button>
-          <button type="button" class="icon-btn" id="btn-nav-fwd" title="Forward" data-i18n-title="nav_forward">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="9 18 15 12 9 6"/>
-            </svg>
-          </button>
-        </div>
+        <button type="button" class="brand-home-btn" id="btn-brand-home" title="Singularity Home" data-i18n-title="nav_home">
+          <img src="/api/logo.png" alt="Singularity" />
+        </button>
 
-        <!-- Overflow-Proof Multi-Tab Bar -->
+        <!-- Full-Width Overflow-Proof Multi-Tab Bar -->
         <div class="tabs-bar-wrap">
           <button type="button" class="tabs-scroll-btn" id="tabs-scroll-left" title="Scroll tabs left" data-i18n-title="tabs_scroll_left">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2726,115 +2942,147 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
             </svg>
           </button>
         </div>
-      </div>
 
-      <!-- Center Column: Always-Centered Unified Safari Omnibar -->
-      <div class="omnibar-wrap">
-        <div class="safari-omnibar">
-          <span class="omnibar-lead-icon">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="5" y="11" width="14" height="10" rx="2"/>
-              <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
-            </svg>
-          </span>
-          <input id="omnibar-input" class="omnibar-input" type="text" spellcheck="false"
-                 placeholder="Search or enter website address"
-                 data-i18n-placeholder="omnibar_placeholder" />
-          <button type="button" class="omnibar-drm-pill" id="btn-drm-mode" style="display:none" title="DRM Protected Playback Mode (PlayReady / Widevine VMP)">DRM</button>
-          <button type="button" class="omnibar-act-btn" id="btn-reader-mode" title="Reader Mode (F9)">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-          </button>
-          <button type="button" class="omnibar-act-btn" id="btn-qr-share" title="Share QR Code">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>
-          </button>
-          <button type="button" class="omnibar-act-btn" id="btn-bookmark-star" title="Bookmark this page (Ctrl+D)" data-i18n-title="nav_bookmark">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-            </svg>
-          </button>
-          <button type="button" class="omnibar-act-btn" id="btn-reload-page" title="Reload (Ctrl+R)" data-i18n-title="nav_reload">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
-              <polyline points="21 3 21 9 15 9"/>
+        <div class="tab-strip-right">
+          <button type="button" class="icon-btn" id="btn-tab-search-chevron" title="Search open tabs (Ctrl+Shift+A)">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"/>
             </svg>
           </button>
         </div>
       </div>
 
-      <!-- Right Column: Utility Actions & Chrome Extensions -->
-      <div class="toolbar-right-wrap">
-        <div class="toolbar-right">
-          <div class="ext-toolbar-strip" id="ext-toolbar-strip"></div>
-
+      <!-- ROW 2: Classic Navigation + Wide Centered Omnibar + Extensions & Actions -->
+      <div class="nav-toolbar-row" id="nav-toolbar-row">
+        <!-- Left Cluster: Back / Forward / Reload + Sidebar & Vertical Tabs -->
+        <div class="nav-left-group toolbar-left">
+          <div class="safari-nav-group">
+            <button type="button" class="icon-btn" id="btn-nav-back" title="Back" data-i18n-title="nav_back">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="15 18 9 12 15 6"/>
+              </svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-nav-fwd" title="Forward" data-i18n-title="nav_forward">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-reload-page" title="Reload (Ctrl+R)" data-i18n-title="nav_reload">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+                <polyline points="21 3 21 9 15 9"/>
+              </svg>
+            </button>
+          </div>
+          <span class="toolbar-sep" aria-hidden="true"></span>
           <button type="button" class="icon-btn" id="btn-v3-sidebar" title="Sidebar Panels (F4)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
           </button>
           <button type="button" class="icon-btn" id="btn-v3-vertical-tabs" title="Vertical Tabs &amp; Workspaces">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="14" y2="18"/></svg>
           </button>
-          <button type="button" class="icon-btn" id="btn-v3-split-view" title="Split View (Side-by-Side)">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
-          </button>
-          <button type="button" class="icon-btn" id="btn-v3-downloads" title="Downloads Manager (Ctrl+J)">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-          </button>
-          <button type="button" class="icon-btn" id="btn-v3-media" title="Global Media, 10-Band EQ 600%, TTS &amp; Cast (Alt+E)">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-          </button>
-          <button type="button" class="icon-btn" id="btn-v3-palette" title="Command Palette (Ctrl+K)">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-          </button>
+        </div>
 
-          <button type="button" class="icon-btn" id="btn-extensions" title="Chrome Extensions (Web Store & local)" data-i18n-title="nav_extensions" data-open-sheet="extensions">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>
-            </svg>
-            <span class="mini-badge" id="ext-count-badge">0</span>
-          </button>
+        <!-- Center Column: Wide Spacious Unified Omnibar -->
+        <div class="omnibar-wrap">
+          <div class="safari-omnibar">
+            <span class="omnibar-lead-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="5" y="11" width="14" height="10" rx="2"/>
+                <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+              </svg>
+            </span>
+            <input id="omnibar-input" class="omnibar-input" type="text" spellcheck="false"
+                   placeholder="Search or enter website address"
+                   data-i18n-placeholder="omnibar_placeholder" />
+            <button type="button" class="omnibar-drm-pill" id="btn-drm-mode" style="display:none" title="DRM Protected Playback Mode (PlayReady / Widevine VMP)">DRM</button>
+            <button type="button" class="omnibar-act-btn" id="btn-reader-mode" title="Reader Mode (F9)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+            </button>
+            <button type="button" class="omnibar-act-btn" id="btn-qr-share" title="Share QR Code">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>
+            </button>
+            <button type="button" class="omnibar-act-btn" id="btn-bookmark-star" title="Bookmark this page (Ctrl+D)" data-i18n-title="nav_bookmark">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+              </svg>
+            </button>
+          </div>
+        </div>
 
-          <button type="button" class="icon-btn" id="btn-private-mode" title="Private Browsing (ephemeral)" data-i18n-title="nav_private">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
-              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
-              <line x1="1" y1="1" x2="23" y2="23"/>
-            </svg>
-          </button>
+        <!-- Right Column: Pinned Extensions + Workspace Tools + Security & Settings -->
+        <div class="toolbar-right-wrap">
+          <div class="toolbar-right">
+            <div class="ext-toolbar-strip" id="ext-toolbar-strip"></div>
 
-          <button type="button" class="icon-btn" id="btn-roaming-tokens" title="Encrypted Sessions & Tokens (.singularity)" data-i18n-title="nav_tokens" data-open-sheet="tokens">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-            </svg>
-            <span class="mini-badge" id="tokens-count-badge">0</span>
-          </button>
+            <button type="button" class="icon-btn" id="btn-v3-split-view" title="Split View (Side-by-Side)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-v3-downloads" title="Downloads Manager (Ctrl+J)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-v3-media" title="Global Media, 10-Band EQ 600%, TTS &amp; Cast (Alt+E)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-v3-palette" title="Command Palette (Ctrl+K)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            </button>
 
-          <button type="button" class="status-pill" title="Network Shield & WireGuard" data-i18n-title="nav_shield" data-open-sheet="mullvad">
-            <span class="status-dot" id="vpn-dot"></span>
-            <span id="vpn-label">Shield</span>
-          </button>
+            <span class="toolbar-sep" aria-hidden="true"></span>
 
-          <button type="button" class="icon-btn" title="Argon2id Vault & 2FA" data-i18n-title="nav_vault" data-open-sheet="vault">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="7.5" cy="15.5" r="4.5"/>
-              <path d="M10.7 12.3 19 4"/>
-              <path d="M16 7l3 3"/>
-            </svg>
-          </button>
+            <button type="button" class="icon-btn" id="btn-extensions" title="Chrome Extensions (Web Store & local)" data-i18n-title="nav_extensions" data-open-sheet="extensions">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 2c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>
+              </svg>
+              <span class="mini-badge" id="ext-count-badge">0</span>
+            </button>
 
-          <button type="button" class="icon-btn" title="Control Center & Settings (Ctrl+,)" data-i18n-title="nav_settings" data-open-sheet="general">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="4" y1="21" x2="4" y2="14"/>
-              <line x1="4" y1="10" x2="4" y2="3"/>
-              <line x1="12" y1="21" x2="12" y2="12"/>
-              <line x1="12" y1="8" x2="12" y2="3"/>
-              <line x1="20" y1="21" x2="20" y2="16"/>
-              <line x1="20" y1="12" x2="20" y2="3"/>
-              <line x1="2" y1="14" x2="6" y2="14"/>
-              <line x1="10" y1="8" x2="14" y2="8"/>
-              <line x1="18" y1="16" x2="22" y2="16"/>
-            </svg>
-          </button>
+            <button type="button" class="icon-btn" id="btn-private-mode" title="Private Browsing (ephemeral)" data-i18n-title="nav_private">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                <line x1="1" y1="1" x2="23" y2="23"/>
+              </svg>
+            </button>
+
+            <button type="button" class="icon-btn" id="btn-roaming-tokens" title="Encrypted Sessions & Tokens (.singularity)" data-i18n-title="nav_tokens" data-open-sheet="tokens">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+              </svg>
+              <span class="mini-badge" id="tokens-count-badge">0</span>
+            </button>
+
+            <button type="button" class="status-pill" title="Network Shield & WireGuard" data-i18n-title="nav_shield" data-open-sheet="mullvad">
+              <span class="status-dot" id="vpn-dot"></span>
+              <span id="vpn-label">Shield</span>
+            </button>
+
+            <button type="button" class="icon-btn" title="Argon2id Vault & 2FA" data-i18n-title="nav_vault" data-open-sheet="vault">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="7.5" cy="15.5" r="4.5"/>
+                <path d="M10.7 12.3 19 4"/>
+                <path d="M16 7l3 3"/>
+              </svg>
+            </button>
+
+            <button type="button" class="icon-btn" title="Control Center & Settings (Ctrl+,)" data-i18n-title="nav_settings" data-open-sheet="general">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="4" y1="21" x2="4" y2="14"/>
+                <line x1="4" y1="10" x2="4" y2="3"/>
+                <line x1="12" y1="21" x2="12" y2="12"/>
+                <line x1="12" y1="8" x2="12" y2="3"/>
+                <line x1="20" y1="21" x2="20" y2="16"/>
+                <line x1="20" y1="12" x2="20" y2="3"/>
+                <line x1="2" y1="14" x2="6" y2="14"/>
+                <line x1="10" y1="8" x2="14" y2="8"/>
+                <line x1="18" y1="16" x2="22" y2="16"/>
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
+
+      <div id="v3-load-progress" aria-hidden="true"></div>
       <div id="topbar-update-line"><div id="topbar-update-fill" class="update-progress-fill"></div></div>
     </header>
 
@@ -3099,7 +3347,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.1</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.2</div>
         </div>
       </aside>
 
@@ -3590,6 +3838,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   </div>
 
   <!-- SINGULARITY v3.0 FLOATING OVERLAYS -->
+  <div id="v3-overlay-scrim" aria-hidden="true"></div>
   <div id="omnibox-dropdown" role="listbox" aria-label="Omnibox suggestions"></div>
   <aside id="v3-vertical-rail" aria-label="Vertical tabs rail"></aside>
   <aside id="v3-sidebar" aria-label="Singularity Sidebar">
@@ -4056,7 +4305,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   // directly for Win11 Snap Bar, Aero Snap, drag-from-maximized, and double-click maximize).
   const appleBar = document.getElementById("apple-titlebar");
   const TITLEBAR_INTERACTIVE_SELECTOR =
-    "button, input, select, a, .tab-pill, .tab-group-pill, #group-editor-bar, #tab-context-menu, .traffic-lights, .safari-nav-group, .safari-omnibar, .toolbar-right";
+    "button, input, select, a, .nav-toolbar-row, .tab-strip-right, .tab-pill, .tab-group-pill, #group-editor-bar, #tab-context-menu, .traffic-lights, .safari-nav-group, .safari-omnibar, .toolbar-right";
   let lastTitlebarClick = { time: 0, x: 0, y: 0 };
   let lastTitlebarToggleAt = 0;
 
@@ -4522,39 +4771,18 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     setTimeout(updateTabsScrollArrows, 220);
   }
 
-  // Smooth hardware-accelerated FLIP animation moving the URL bar from dead-center
-  // to the right ONLY when tab count or viewport width crosses the threshold (never on title updates!).
+  // In classic two-bar mode, tabs own the full-width Row 1 strip so the Row 2 omnibar stays
+  // calmly centered without jumping sideways when opening additional tabs.
   let isOmnibarDockedRight = false;
   function syncOmnibarLayout(allowAnimate) {
     if (!appleBar) return;
-    const omniWrap = appleBar.querySelector(".omnibar-wrap");
     const strip = document.getElementById("tabs-strip");
-    if (!omniWrap || !strip) return;
+    if (!strip) return;
 
-    const narrow = window.innerWidth < 960;
-    const wantRight = tabs.length >= 4 || (narrow && tabs.length >= 3);
-
-    if (wantRight === isOmnibarDockedRight) return;
-
-    const before = omniWrap.getBoundingClientRect();
-    isOmnibarDockedRight = wantRight;
-    appleBar.classList.toggle("tabs-expanded", wantRight);
-    const after = omniWrap.getBoundingClientRect();
-
-    if (allowAnimate && before.width > 0 && after.width > 0) {
-      const beforeCx = before.left + before.width * 0.5;
-      const afterCx = after.left + after.width * 0.5;
-      const dx = beforeCx - afterCx;
-      if (Math.abs(dx) > 2 && typeof omniWrap.animate === "function") {
-        omniWrap.getAnimations().forEach(a => a.cancel());
-        omniWrap.animate(
-          [
-            { transform: `translateX(${dx}px)` },
-            { transform: "translateX(0px)" }
-          ],
-          { duration: 380, easing: "cubic-bezier(0.22, 1, 0.36, 1)" }
-        );
-      }
+    const wantExpanded = tabs.length >= 10;
+    if (wantExpanded !== isOmnibarDockedRight) {
+      isOmnibarDockedRight = wantExpanded;
+      appleBar.classList.toggle("tabs-expanded", wantExpanded);
     }
     requestAnimationFrame(updateTabsScrollArrows);
   }
@@ -5628,8 +5856,9 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       if (!g || !g.collapsed) visibleTabCount++;
       if (t.groupId) groupMemberCounts.set(t.groupId, (groupMemberCounts.get(t.groupId) || 0) + 1);
     }
-    strip.classList.toggle("compact-tabs", visibleTabCount >= 6);
-    strip.classList.toggle("very-compact", visibleTabCount >= 12);
+    strip.classList.toggle("compact-tabs", visibleTabCount >= 10);
+    strip.classList.toggle("very-compact", visibleTabCount >= 18);
+    strip.classList.toggle("ultra-compact", visibleTabCount >= 28);
 
     const desiredNodes = [];
     const emittedGroupHeaders = new Set();
@@ -5716,6 +5945,9 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       }
     }
     requestAnimationFrame(updateTabsScrollArrows);
+    if (window.__v3 && window.__v3.renderVerticalRail && document.body.classList.contains("vertical-tabs")) {
+      window.__v3.renderVerticalRail();
+    }
     updateRamStatusUI();
   }
 
@@ -5749,6 +5981,16 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     const ob = document.getElementById("onboarding-overlay");
     const cr = document.getElementById("crash-report-modal");
     return (ob && ob.classList.contains("open")) || (cr && cr.classList.contains("open"));
+  }
+
+  function anyOverlayActive() {
+    if (anyModalOpen()) return true;
+    const ids = ["omnibox-dropdown", "command-palette-modal", "tab-search-modal", "v3-popover-panel", "v3-internal-frame-modal"];
+    for (let i = 0; i < ids.length; i++) {
+      const el = document.getElementById(ids[i]);
+      if (el && el.classList.contains("open")) return true;
+    }
+    return false;
   }
 
   async function checkNavigationAllowed(rawUrl) {
@@ -5802,6 +6044,9 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
   // `actionMode`: "navigate" (new URL in active tab), "activate" (zero-reload tab switch), or "view" (overlay/home)
   function syncViewportToActiveTab(actionMode, opts) {
     const syncSeq = ++viewportSyncSeq;
+    if (window.__v3 && window.__v3.closeAllV3Popups) {
+      window.__v3.closeAllV3Popups(true);
+    }
     const tab = getActiveTab();
     tab.lastActiveAt = Date.now();
     const grp = findTabGroup(tab.groupId);
@@ -5815,6 +6060,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     persistOpenTabsIfEnabled(false);
 
     const tutorialOpen = anyModalOpen();
+    const overlayOpen = anyOverlayActive();
     const settingsPageEl = document.getElementById("settings-modal");
 
     if (isInternalSettingsUrl(tab.url)) {
@@ -5825,12 +6071,13 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       settingsPageEl.classList.add("open");
       setBlackHoleSuspended(!tutorialOpen);
       if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
+      if (window.__v3 && window.__v3.syncChromeInsets) window.__v3.syncChromeInsets();
       sendNativeIpc({
         cmd: "activate_tab",
         tab_id: tab.id,
         url: "",
         web_visible: false,
-        overlay_open: tutorialOpen
+        overlay_open: overlayOpen
       });
       switchSheetTab(sectionFromInternalUrl(tab.url), true);
     } else if (!tab.url) {
@@ -5842,12 +6089,13 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       document.getElementById("web-frame").src = "about:blank";
       setBlackHoleSuspended(false);
       if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
+      if (window.__v3 && window.__v3.syncChromeInsets) window.__v3.syncChromeInsets();
       sendNativeIpc({
         cmd: "activate_tab",
         tab_id: tab.id,
         url: "",
         web_visible: false,
-        overlay_open: tutorialOpen
+        overlay_open: overlayOpen
       });
     } else {
       const commitWebViewport = (targetTab, checkedUrl) => {
@@ -5857,6 +6105,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
           if (targetTab.id === activeTabId) updateDrmBadge(targetTab);
         }
         const modalNow = anyModalOpen();
+        const overlayNow = anyOverlayActive();
         settingsPageEl.classList.remove("open");
         stopVaultTotpTicker();
         document.getElementById("ntp-view").style.display = "none";
@@ -5864,6 +6113,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
           document.body.classList.toggle("bar-only", !modalNow);
           setBlackHoleSuspended(!modalNow);
           if (typeof syncUpdateFloatingBarVisibility === "function") syncUpdateFloatingBarVisibility();
+          if (window.__v3 && window.__v3.syncChromeInsets) window.__v3.syncChromeInsets();
           if (actionMode === "navigate") {
             targetTab.unloaded = false;
             targetTab.startPaused = false;
@@ -5871,7 +6121,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
               cmd: "navigate_web",
               tab_id: targetTab.id,
               url: targetTab.url,
-              overlay_open: modalNow
+              overlay_open: overlayNow
             });
           } else {
             const shouldStartPaused = !!targetTab.startPaused;
@@ -5882,7 +6132,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
               tab_id: targetTab.id,
               url: targetTab.url,
               web_visible: true,
-              overlay_open: modalNow,
+              overlay_open: overlayNow,
               resume_time_sec: targetTab.mediaTimeSec >= 3 ? Math.floor(targetTab.mediaTimeSec) : null,
               resume_scroll_y: targetTab.scrollY >= 40 ? Math.floor(targetTab.scrollY) : null,
               start_paused: shouldStartPaused
@@ -10253,8 +10503,8 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     function syncCanvasSize() {
       const iw = Math.max(1, window.innerWidth);
       const ih = Math.max(1, window.innerHeight);
-      // Do not shrink the WebGL2 backing buffer while ui_webview is collapsed to the 46px top bar!
-      if (ih < 120) return false;
+      // Do not shrink or wake the WebGL2 backing buffer while browsing a webpage (bar-only / Find strip)!
+      if (document.body.classList.contains("bar-only") || ih < 160) return false;
       const dpr = Math.min(window.devicePixelRatio || 1, 1.0, 1280 / iw, 720 / ih);
       const w = Math.max(1, Math.floor(iw * dpr));
       const h = Math.max(1, Math.floor(ih * dpr));
@@ -10301,7 +10551,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     }
 
     function revealCanvasAfterDraw() {
-      if (document.hidden || window.innerHeight < 120) return;
+      if (document.hidden || document.body.classList.contains("bar-only") || window.innerHeight < 160) return;
       syncCanvasSize();
       drawScene(performance.now());
       canvas.style.visibility = "visible";
@@ -10309,14 +10559,14 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     }
 
     function scheduleNextFrame() {
-      if (!rafPending && !bhSuspended && !document.hidden && window.innerHeight >= 120) {
+      if (!rafPending && !bhSuspended && !document.hidden && !document.body.classList.contains("bar-only") && window.innerHeight >= 160) {
         rafPending = true;
         requestAnimationFrame(frame);
       }
     }
 
     window.addEventListener("resize", () => {
-      if (window.innerHeight < 120) return;
+      if (document.body.classList.contains("bar-only") || window.innerHeight < 160) return;
       syncCanvasSize();
       if (!bhSuspended && !document.hidden) {
         revealCanvasAfterDraw();
@@ -10325,7 +10575,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     });
 
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden && !bhSuspended && window.innerHeight >= 120) {
+      if (!document.hidden && !bhSuspended && !document.body.classList.contains("bar-only") && window.innerHeight >= 160) {
         lastFrameMs = performance.now();
         lastDrawMs = 0;
         revealCanvasAfterDraw();
@@ -10523,6 +10773,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     let sbTab = "bookmarks";
     let verticalMode = false;
     let splitActive = false;
+    let findBarOpen = false;
     let activeMuted = false;
     let omniTimer = null;
     let omniIdx = -1;
@@ -10548,13 +10799,24 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
 
     function syncChromeInsets() {
       const leftPx = (sbOpen ? 340 : 0) + (verticalMode && !sbOpen ? 230 : 0);
+      const topExtraPx = (findBarOpen && document.body.classList.contains("bar-only")) ? 42 : 0;
       sendNativeIpc({
         cmd: "set_chrome_layout",
-        top_bar_extra_px: 0,
+        top_bar_extra_px: topExtraPx,
         left_sidebar_px: leftPx,
         right_sidebar_px: 0,
         bottom_bar_px: 0
       });
+    }
+
+    function syncOverlayState(silent) {
+      const ddOpen = !!byId("omnibox-dropdown")?.classList.contains("open");
+      const popOpen = !!byId("v3-popover-panel")?.classList.contains("open");
+      const scrim = byId("v3-overlay-scrim");
+      if (scrim) scrim.classList.toggle("open", ddOpen || popOpen);
+      if (!silent) {
+        sendNativeIpc({ cmd: "set_overlay", open: anyOverlayActive() });
+      }
     }
 
     function openInternalPage(slug) {
@@ -10563,24 +10825,67 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       const iframe = byId("v3-internal-iframe");
       const title = byId("v3-internal-frame-title");
       if (!modal || !iframe) return;
+      closeAllV3Popups(true);
       if (title) title.textContent = "browser://" + clean;
       iframe.src = "/browser/" + encodeURIComponent(clean);
       modal.classList.add("open");
-      sendNativeIpc({ cmd: "set_overlay", open: true });
+      syncOverlayState(false);
     }
 
     function closeInternalPage() {
       const modal = byId("v3-internal-frame-modal");
       if (modal) modal.classList.remove("open");
-      sendNativeIpc({ cmd: "set_overlay", open: anyModalOpen() });
+      syncOverlayState(false);
     }
 
-    function closeAllV3Popups() {
+    function closeFindBar(silent) {
+      const bar = byId("find-in-page-bar");
+      if (bar) bar.classList.remove("open");
+      if (findBarOpen) {
+        findBarOpen = false;
+        sendNativeIpc({ cmd: "find_in_page", text: "", forward: true, match_case: false, find_next: false, stop: true });
+        if (!silent) syncChromeInsets();
+      }
+    }
+
+    function closeAllV3Popups(silent) {
       ["omnibox-dropdown", "command-palette-modal", "tab-search-modal", "v3-popover-panel"].forEach((id) => {
         const el = byId(id);
         if (el) el.classList.remove("open");
       });
-      sendNativeIpc({ cmd: "set_overlay", open: anyModalOpen() });
+      omniIdx = -1;
+      syncOverlayState(!!silent);
+    }
+
+    function activateOmniboxSuggestion(it) {
+      if (!it) return;
+      const dd = byId("omnibox-dropdown");
+      if (dd) dd.classList.remove("open");
+      omniIdx = -1;
+      syncOverlayState(false);
+      const targetUrl = it.url || it.target_url || "";
+      if (/^(browser|chrome):\/\//i.test(targetUrl)) {
+        openInternalPage(targetUrl);
+      } else if (it.kind === "open_tab" && it.tab_id) {
+        activateTab(Number(it.tab_id));
+      } else if (it.kind === "instant_answer" && it.subtitle) {
+        navigator.clipboard?.writeText(String(it.title || "")).catch(() => {});
+        showToast(L("Copied instant answer", "Réponse instantanée copiée"));
+      } else if (targetUrl) {
+        const inp = byId("omnibar-input");
+        if (inp) inp.value = targetUrl;
+        if (typeof submitOmnibar === "function") submitOmnibar(targetUrl);
+      }
+    }
+
+    function highlightOmniboxIdx(nextIdx) {
+      const dd = byId("omnibox-dropdown");
+      if (!dd || !omniItems.length) return;
+      const rows = dd.querySelectorAll(".omni-item");
+      if (!rows.length) return;
+      omniIdx = ((nextIdx % rows.length) + rows.length) % rows.length;
+      rows.forEach((r, idx) => r.classList.toggle("active", idx === omniIdx));
+      rows[omniIdx]?.scrollIntoView({ block: "nearest" });
     }
 
     // --- 1. OMNIBOX LIVE DROPDOWN (FRECENCY, BANGS, INSTANT ANSWERS, SCOPES) ---
@@ -10592,6 +10897,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       omniIdx = -1;
       if (!omniItems.length) {
         dd.classList.remove("open");
+        syncOverlayState(false);
         return;
       }
       omniItems.forEach((it, i) => {
@@ -10603,25 +10909,13 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
         row.appendChild(mk("span", "omni-badge", String(it.kind || "item").replace(/_/g, " ")));
         row.addEventListener("mousedown", (e) => {
           e.preventDefault();
-          dd.classList.remove("open");
-          const targetUrl = it.url || it.target_url || "";
-          if (/^(browser|chrome):\/\//i.test(targetUrl)) {
-            openInternalPage(targetUrl);
-          } else if (it.kind === "open_tab" && it.tab_id) {
-            activateTab(Number(it.tab_id));
-          } else if (it.kind === "instant_answer" && it.subtitle) {
-            navigator.clipboard?.writeText(String(it.title || "")).catch(() => {});
-            showToast(L("Copied instant answer", "Réponse instantanée copiée"));
-          } else if (targetUrl) {
-            const inp = byId("omnibar-input");
-            if (inp) inp.value = targetUrl;
-            if (typeof submitOmnibar === "function") submitOmnibar(targetUrl);
-          }
+          activateOmniboxSuggestion(it);
         });
         row.dataset.idx = String(i);
         dd.appendChild(row);
       });
       dd.classList.add("open");
+      syncOverlayState(false);
     }
 
     const omniInput = byId("omnibar-input");
@@ -10632,34 +10926,63 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
         if (!val.trim()) {
           const dd = byId("omnibox-dropdown");
           if (dd) dd.classList.remove("open");
+          omniItems = [];
+          omniIdx = -1;
+          syncOverlayState(false);
           return;
         }
         omniTimer = setTimeout(async () => {
           try {
             const resp = await apiJson("/api/omnibox/suggest?limit=10&q=" + encodeURIComponent(val));
-            renderOmniboxDropdown(resp);
+            if (document.activeElement === omniInput) {
+              renderOmniboxDropdown(resp);
+            }
           } catch (_) {}
         }, 70);
       });
       omniInput.addEventListener("keydown", (e) => {
+        const dd = byId("omnibox-dropdown");
+        const ddOpen = !!(dd && dd.classList.contains("open"));
+        if (e.key === "ArrowDown" && ddOpen && omniItems.length) {
+          e.preventDefault();
+          highlightOmniboxIdx(omniIdx + 1);
+          return;
+        }
+        if (e.key === "ArrowUp" && ddOpen && omniItems.length) {
+          e.preventDefault();
+          highlightOmniboxIdx(omniIdx <= 0 ? omniItems.length - 1 : omniIdx - 1);
+          return;
+        }
         if (e.key === "Enter") {
+          if (ddOpen && omniIdx >= 0 && omniIdx < omniItems.length) {
+            e.preventDefault();
+            e.stopPropagation();
+            activateOmniboxSuggestion(omniItems[omniIdx]);
+            return;
+          }
           const raw = (omniInput.value || "").trim();
+          if (dd) dd.classList.remove("open");
+          omniIdx = -1;
+          syncOverlayState(false);
           if (/^browser:\/\//i.test(raw)) {
             e.preventDefault();
             e.stopPropagation();
-            const dd = byId("omnibox-dropdown");
-            if (dd) dd.classList.remove("open");
             openInternalPage(raw);
           }
         } else if (e.key === "Escape") {
-          const dd = byId("omnibox-dropdown");
           if (dd) dd.classList.remove("open");
+          omniIdx = -1;
+          syncOverlayState(false);
         }
       }, true);
       omniInput.addEventListener("blur", () => {
         setTimeout(() => {
           const dd = byId("omnibox-dropdown");
-          if (dd) dd.classList.remove("open");
+          if (dd && dd.classList.contains("open")) {
+            dd.classList.remove("open");
+            omniIdx = -1;
+            syncOverlayState(false);
+          }
         }, 160);
       });
     }
@@ -10712,8 +11035,9 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       const m = byId("command-palette-modal");
       const inp = byId("command-palette-input");
       if (!m || !inp) return;
+      closeAllV3Popups(true);
       m.classList.add("open");
-      sendNativeIpc({ cmd: "set_overlay", open: true });
+      syncOverlayState(false);
       inp.value = "";
       inp.focus();
       queryPalette("");
@@ -10746,8 +11070,9 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       const m = byId("tab-search-modal");
       const inp = byId("tab-search-input");
       if (!m || !inp) return;
+      closeAllV3Popups(true);
       m.classList.add("open");
-      sendNativeIpc({ cmd: "set_overlay", open: true });
+      syncOverlayState(false);
       inp.value = "";
       inp.focus();
       renderTabSearch("");
@@ -10759,15 +11084,27 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       if (!rail) return;
       rail.textContent = "";
       const hdr = mk("div", "", "");
-      hdr.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:4px 6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);margin-bottom:4px;";
-      hdr.appendChild(mk("span", "", "Tabs (" + tabs.length + ")"));
+      hdr.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:4px 6px 8px;border-bottom:1px solid rgba(255,255,255,0.1);margin-bottom:4px;font-size:11.5px;font-weight:600;color:var(--text-secondary);";
+      hdr.appendChild(mk("span", "", L("Tabs", "Onglets") + " (" + tabs.length + ")"));
       const addBtn = mk("button", "v3-chip-btn", "+");
       addBtn.addEventListener("click", () => { createNewTab(); renderVerticalRail(); });
       hdr.appendChild(addBtn);
       rail.appendChild(hdr);
       tabs.forEach((t) => {
         const row = mk("div", "v3-vtab-row" + (t.id === activeTabId ? " active" : ""));
-        row.appendChild(mk("span", "omni-item-title", t.title || L("New Tab", "Nouvel onglet")));
+        const ttl = mk("span", "omni-item-title", t.title || L("New Tab", "Nouvel onglet"));
+        ttl.style.flex = "1";
+        ttl.style.minWidth = "0";
+        row.appendChild(ttl);
+        const cls = mk("button", "v3-vtab-close", "✕");
+        cls.type = "button";
+        cls.title = L("Close tab", "Fermer l'onglet");
+        cls.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          closeTab(t.id);
+          renderVerticalRail();
+        });
+        row.appendChild(cls);
         row.addEventListener("click", () => { activateTab(t.id); renderVerticalRail(); });
         rail.appendChild(row);
       });
@@ -10776,6 +11113,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     function toggleVerticalTabs() {
       verticalMode = !verticalMode;
       document.body.classList.toggle("vertical-tabs", verticalMode);
+      byId("btn-v3-vertical-tabs")?.classList.toggle("active-gold", verticalMode);
       if (verticalMode) renderVerticalRail();
       syncChromeInsets();
       showToast(verticalMode ? L("Vertical Tabs enabled", "Onglets verticaux activés") : L("Horizontal Tabs restored", "Onglets horizontaux restaurés"));
@@ -10791,9 +11129,11 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
           orientation: "horizontal",
           ratio: 0.5
         });
+        byId("btn-v3-split-view")?.classList.add("active-gold");
         showToast(L("Split View active (50/50)", "Vue scindée active (50/50)"));
       } else {
         splitActive = false;
+        byId("btn-v3-split-view")?.classList.remove("active-gold");
         sendNativeIpc({ cmd: "set_split_layout", tab_ids: [], orientation: "horizontal", ratio: 0.5 });
         showToast(L("Split View closed", "Vue scindée fermée"));
       }
@@ -10906,6 +11246,8 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       sbOpen = !sbOpen;
       const sb = byId("v3-sidebar");
       if (sb) sb.classList.toggle("open", sbOpen);
+      document.body.classList.toggle("v3-sb-open", sbOpen);
+      byId("btn-v3-sidebar")?.classList.toggle("active-gold", sbOpen);
       if (sbOpen) renderSidebarPanel(sbTab);
       syncChromeInsets();
     }
@@ -10914,14 +11256,20 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     async function openPopover(kind) {
       const pop = byId("v3-popover-panel");
       if (!pop) return;
+      if (pop.classList.contains("open") && pop.dataset.kind === kind) {
+        closeAllV3Popups();
+        return;
+      }
+      closeAllV3Popups(true);
+      pop.dataset.kind = kind;
       pop.textContent = "";
       pop.classList.add("open");
-      sendNativeIpc({ cmd: "set_overlay", open: true });
+      syncOverlayState(false);
       const head = mk("div", "");
       head.style.cssText = "display:flex;justify-content:space-between;align-items:center;";
       head.appendChild(mk("strong", "", kind.toUpperCase()));
       const closeBtn = mk("button", "v3-chip-btn", "✕");
-      closeBtn.addEventListener("click", closeAllV3Popups);
+      closeBtn.addEventListener("click", () => closeAllV3Popups(false));
       head.appendChild(closeBtn);
       pop.appendChild(head);
 
@@ -10994,19 +11342,22 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       const iframe = byId("v3-internal-iframe");
       const hdr = byId("v3-internal-frame-title");
       if (modal && iframe && r.html) {
+        closeAllV3Popups(true);
         if (hdr) hdr.textContent = "Reader Mode · " + title;
         iframe.srcdoc = r.html;
         modal.classList.add("open");
-        sendNativeIpc({ cmd: "set_overlay", open: true });
+        syncOverlayState(false);
       }
     }
 
-    // --- 7. FIND IN PAGE (Ctrl+F) ---
+    // --- 7. FIND IN PAGE (Ctrl+F — Docked 42px strip in bar-only mode so live page stays visible!) ---
     function openFindBar() {
       const bar = byId("find-in-page-bar");
       const inp = byId("find-in-page-input");
       if (!bar || !inp) return;
+      findBarOpen = true;
       bar.classList.add("open");
+      syncChromeInsets();
       inp.focus();
       inp.select();
     }
@@ -11118,6 +11469,8 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     }
 
     // Wire buttons & events
+    byId("v3-overlay-scrim")?.addEventListener("click", () => closeAllV3Popups(false));
+    byId("btn-tab-search-chevron")?.addEventListener("click", openTabSearch);
     byId("btn-v3-sidebar")?.addEventListener("click", toggleSidebar);
     byId("btn-v3-sb-close")?.addEventListener("click", toggleSidebar);
     byId("btn-v3-vertical-tabs")?.addEventListener("click", toggleVerticalTabs);
@@ -11130,15 +11483,17 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     byId("btn-v3-internal-close")?.addEventListener("click", closeInternalPage);
     byId("btn-find-prev")?.addEventListener("click", () => stepFind(false));
     byId("btn-find-next")?.addEventListener("click", () => stepFind(true));
-    byId("btn-find-close")?.addEventListener("click", () => {
-      byId("find-in-page-bar")?.classList.remove("open");
-      sendNativeIpc({ cmd: "find_in_page", text: "", forward: true, match_case: false, find_next: false, stop: true });
-    });
+    byId("btn-find-close")?.addEventListener("click", () => closeFindBar(false));
     byId("find-in-page-input")?.addEventListener("input", () => stepFind(true));
+    byId("find-in-page-input")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); stepFind(!e.shiftKey); }
+      else if (e.key === "Escape") { e.preventDefault(); closeFindBar(false); }
+    });
     byId("command-palette-input")?.addEventListener("input", (e) => queryPalette(e.currentTarget.value));
     byId("tab-search-input")?.addEventListener("input", (e) => renderTabSearch(e.currentTarget.value));
-    byId("command-palette-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(); });
-    byId("tab-search-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(); });
+    byId("command-palette-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(false); });
+    byId("tab-search-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(false); });
+    byId("v3-internal-frame-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeInternalPage(); });
     document.querySelectorAll(".v3-sb-tab[data-sb]").forEach((b) => b.addEventListener("click", () => renderSidebarPanel(b.dataset.sb)));
     document.querySelectorAll("[data-perf-preset]").forEach((b) => b.addEventListener("click", async () => {
       await apiJson("/api/performance/profile", "POST", { preset: b.dataset.perfPreset });
@@ -11220,7 +11575,8 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
 
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
-        closeAllV3Popups();
+        closeFindBar(false);
+        closeAllV3Popups(false);
         closeInternalPage();
       } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
@@ -11248,11 +11604,15 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       openTabSearch,
       toggleSidebar,
       openFindBar,
+      closeFindBar,
       stepFind,
       openPopover,
       openReaderPreview,
       openInternalPage,
       loadSettingsPane,
+      renderVerticalRail,
+      closeAllV3Popups,
+      syncChromeInsets,
       bookmarkAllTabs: async () => {
         const r = await apiJson("/api/bookmarks/bookmark_all_tabs", "POST", { folder_name: "Session " + new Date().toLocaleDateString() });
         showToast("Bookmarked " + (r.count || 0) + " tabs");

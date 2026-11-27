@@ -823,11 +823,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.2");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1220,7 +1220,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1472,7 +1472,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v3.0.1"));
+        assert!(txt.contains("v3.0.2"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1506,7 +1506,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
     }
 
     #[test]
@@ -1979,8 +1979,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.1");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.2");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -2089,8 +2089,8 @@ mod tests {
         assert!(prog_json.get("speed_bps").is_some());
 
         // 6. Verify v3.0.1 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.1");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.2");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
         assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
         assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
         assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));
@@ -2660,6 +2660,54 @@ mod tests {
                 marker
             );
         }
+    }
+
+    #[test]
+    fn test_two_bar_classic_layout_and_visual_bug_fixes() {
+        let server_src = include_str!("server.rs");
+        assert!(
+            server_src.contains("const APPLE_BAR_LOGICAL_HEIGHT: f64 = 80.0;"),
+            "server.rs must set APPLE_BAR_LOGICAL_HEIGHT to 80.0 for the two-bar classic layout"
+        );
+        assert!(
+            server_src.contains("APPLE_BAR_LOGICAL_HEIGHT + st.top_bar_extra_logical_px as f64"),
+            "spawn_content_tab must include top_bar_extra_logical_px in initial bar_h"
+        );
+
+        // Two-bar classic architecture preserving Singularity OLED cosmic aesthetic
+        for marker in [
+            "color-scheme: dark;",
+            "--tab-row-height: 38px;",
+            "--nav-row-height: 42px;",
+            "--bar-height: 80px;",
+            "--bar-tabstrip-bg:",
+            "--bar-toolbar-bg:",
+            "class=\"tab-strip-row\"",
+            "class=\"nav-toolbar-row\"",
+            "id=\"btn-tab-search-chevron\"",
+            "id=\"v3-overlay-scrim\"",
+            "top: var(--bar-height);",
+            "top: calc(var(--bar-height) + 4px);",
+            "top: calc(var(--bar-height) + 6px);",
+            "body.bar-only #find-in-page-bar",
+            "textarea.sheet-search",
+            "body.v3-sb-open #settings-modal",
+            "function anyOverlayActive()",
+            "syncOverlayState",
+            "ultra-compact",
+            "::-webkit-scrollbar-thumb",
+        ] {
+            assert!(
+                SINGULARITY_UI_HTML.contains(marker),
+                "SINGULARITY_UI_HTML missing two-bar/visual-fix marker: {}",
+                marker
+            );
+        }
+
+        // Zero stale hardcoded single-bar 46/48/50px overlay offsets
+        assert!(!SINGULARITY_UI_HTML.contains("top: 46px;"));
+        assert!(!SINGULARITY_UI_HTML.contains("top: 48px;"));
+        assert!(!SINGULARITY_UI_HTML.contains("top: 50px;"));
     }
 }
 
