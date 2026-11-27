@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (required when publishing, e.g. v3.0.2)"
+        description: "Release tag to build and publish assets for (required when publishing, e.g. v3.0.3)"
         required: false
         default: ""
       publish:

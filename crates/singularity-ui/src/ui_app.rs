@@ -302,8 +302,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    margin-left: auto;
-    padding-left: 16px;
+    margin-left: 0;
+    padding-left: 6px;
     flex-shrink: 0;
   }
 
@@ -316,7 +316,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     min-width: 0;
     padding: 0 12px;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) clamp(260px, 42vw, 700px) minmax(max-content, 1fr);
+    grid-template-columns: minmax(0, 1fr) clamp(280px, 50vw, 1080px) minmax(max-content, 1fr);
     align-items: center;
     gap: 10px;
     background: var(--bar-toolbar-bg);
@@ -740,13 +740,18 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   }
   .tab-close-btn:hover { background: rgba(255, 255, 255, 0.16); color: #ffffff; opacity: 1; }
 
-  /* Multi-Tier Brave/Chrome Tab Density for 10, 18, and 28+ open tabs:
-     Uses top:0; bottom:0; margin:auto 0; on close button so hover scale NEVER jumps vertically! */
+  /* Fluid full-width tab distribution in Row 1 (Chrome/Brave behavior: tabs always fill 100%
+     of available width up to 220px each, shrinking evenly only when needed down to 34px) */
+  .tab-strip-row .tab-pill {
+    flex: 1 1 220px;
+    width: 220px;
+    max-width: 220px;
+    min-width: 34px;
+  }
+
+  /* Width-driven Brave/Chrome Tab Chrome Density (NEVER caps max-width so tabs fill 100% space!):
+     Uses top:0; bottom:0; margin:auto 0; on close button so hover scale NEVER jumps vertically. */
   .tabs-strip.compact-tabs .tab-pill {
-    flex: 0 1 132px;
-    width: 132px;
-    max-width: 132px;
-    min-width: 52px;
     padding: 0 6px 0 7px;
     gap: 5px;
   }
@@ -765,16 +770,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     opacity: 0.95;
   }
   .tabs-strip.very-compact .tab-pill {
-    flex: 0 1 82px;
-    width: 82px;
-    max-width: 82px;
-    min-width: 38px;
     padding: 0 5px 0 6px;
     gap: 4px;
     overflow: hidden;
   }
   .tabs-strip.very-compact .tab-pill.active {
-    min-width: 76px;
+    min-width: 72px;
     padding-right: 22px;
   }
   .tabs-strip.very-compact .tab-pill .tab-close-btn {
@@ -794,18 +795,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     display: inline-flex;
   }
   .tabs-strip.ultra-compact .tab-pill {
-    flex: 0 1 48px;
-    width: 48px;
-    max-width: 48px;
-    min-width: 32px;
-    padding: 0 5px;
-    gap: 4px;
+    padding: 0 4px 0 5px;
+    gap: 3px;
   }
   .tabs-strip.ultra-compact .tab-pill.active {
-    flex: 0 1 92px;
-    width: 92px;
-    max-width: 92px;
-    min-width: 72px;
+    min-width: 76px;
     padding: 0 22px 0 7px;
   }
 
@@ -1042,7 +1036,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
 
   .safari-omnibar {
     width: 100%;
-    max-width: 700px;
+    max-width: 1080px;
     height: 30px;
     padding: 0 6px 0 11px;
     border-radius: 10px;
@@ -2115,7 +2109,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
       grid-template-columns: auto minmax(140px, 1fr) auto;
     }
     .toolbar-sep { display: none; }
-    .tab-pill { min-width: 48px; max-width: 120px; padding: 0 5px 0 7px; }
+    .tab-strip-row .tab-pill { min-width: 32px; max-width: 180px; padding: 0 5px 0 7px; }
     .status-pill { padding: 0 7px; }
     .status-pill #vpn-label { display: none; }
     .ext-toolbar-strip { max-width: 64px; }
@@ -2135,7 +2129,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
     }
     .traffic-lights { gap: 6px; margin-right: 0; }
     .icon-btn, .brand-home-btn { width: 24px; height: 24px; }
-    .tab-pill { min-width: 38px; max-width: 84px; }
+    .tab-strip-row .tab-pill { min-width: 30px; max-width: 140px; }
     .ext-toolbar-strip,
     #btn-v3-split-view,
     #btn-v3-media,
@@ -2274,7 +2268,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   top: calc(var(--bar-height) + 4px);
   left: 50%;
   transform: translateX(-50%);
-  width: min(700px, 88vw);
+  width: min(860px, 88vw);
   max-height: min(440px, calc(100vh - var(--bar-height) - 24px));
   overflow-y: auto;
   background: rgba(8, 10, 16, 0.98);
@@ -3347,7 +3341,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.2</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.3</div>
         </div>
       </aside>
 
@@ -5750,9 +5744,24 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     strip.addEventListener("scroll", updateTabsScrollArrows, { passive: true });
     window.addEventListener("resize", () => {
       syncOmnibarLayout(false);
+      syncTabDensityClasses();
       updateTabsScrollArrows();
     });
   })();
+
+  function syncTabDensityClasses(visibleTabCount) {
+    const strip = document.getElementById("tabs-strip");
+    const wrap = strip && strip.parentElement;
+    if (!strip || !wrap) return;
+    const count = typeof visibleTabCount === "number"
+      ? visibleTabCount
+      : strip.querySelectorAll(".tab-pill").length;
+    const availW = Math.max(200, (wrap.clientWidth || window.innerWidth) - 36);
+    const perTab = count > 0 ? availW / count : 220;
+    strip.classList.toggle("compact-tabs", perTab < 145);
+    strip.classList.toggle("very-compact", perTab < 96);
+    strip.classList.toggle("ultra-compact", perTab < 58);
+  }
 
   const TAB_CLOSE_SVG = `<svg width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 2l6 6M8 2L2 8"/></svg>`;
 
@@ -5856,9 +5865,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       if (!g || !g.collapsed) visibleTabCount++;
       if (t.groupId) groupMemberCounts.set(t.groupId, (groupMemberCounts.get(t.groupId) || 0) + 1);
     }
-    strip.classList.toggle("compact-tabs", visibleTabCount >= 10);
-    strip.classList.toggle("very-compact", visibleTabCount >= 18);
-    strip.classList.toggle("ultra-compact", visibleTabCount >= 28);
+    syncTabDensityClasses(visibleTabCount);
 
     const desiredNodes = [];
     const emittedGroupHeaders = new Set();

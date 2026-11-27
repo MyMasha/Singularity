@@ -823,11 +823,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.2");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.3");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1220,7 +1220,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1472,7 +1472,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v3.0.2"));
+        assert!(txt.contains("v3.0.3"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1506,7 +1506,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
     }
 
     #[test]
@@ -1979,8 +1979,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.2");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.3");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -2089,8 +2089,8 @@ mod tests {
         assert!(prog_json.get("speed_bps").is_some());
 
         // 6. Verify v3.0.1 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.2");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.2"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.3");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
         assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
         assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
         assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));
@@ -2708,6 +2708,15 @@ mod tests {
         assert!(!SINGULARITY_UI_HTML.contains("top: 46px;"));
         assert!(!SINGULARITY_UI_HTML.contains("top: 48px;"));
         assert!(!SINGULARITY_UI_HTML.contains("top: 50px;"));
+
+        // Fluid full-width tab sizing: tabs always expand to fill 100% of available bar width
+        // (no artificial 48px/82px/132px max-width caps leaving dead space on wide monitors)
+        assert!(SINGULARITY_UI_HTML.contains(".tab-strip-row .tab-pill"));
+        assert!(SINGULARITY_UI_HTML.contains("flex: 1 1 220px;"));
+        assert!(SINGULARITY_UI_HTML.contains("function syncTabDensityClasses("));
+        assert!(!SINGULARITY_UI_HTML.contains("max-width: 48px;"));
+        assert!(!SINGULARITY_UI_HTML.contains("max-width: 82px;"));
+        assert!(!SINGULARITY_UI_HTML.contains("max-width: 132px;"));
     }
 }
 
