@@ -1,2 +1,7 @@
 [target.x86_64-pc-windows-gnullvm]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "strip=symbols"]
+
+[env]
+# Default local Windows CEF 150 (OBS 7871, H.264/AAC) SDK staged via `python scripts/prepare-cef-win64.py .cef-sdk`.
+# Non-forced: CI workflows and explicit user `CEF_PATH` environment variables always take precedence.
+CEF_PATH = { value = ".cef-sdk", relative = true }

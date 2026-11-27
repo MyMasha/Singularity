@@ -15,6 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum single userscript size accepted on import (4 MiB).
 pub const MAX_USERSCRIPT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum number of entries accepted from a userscript ZIP backup.
+const MAX_ZIP_IMPORT_ENTRIES: usize = 256;
+/// Maximum cumulative decompressed bytes accepted from a userscript ZIP backup (16 MiB).
+const MAX_ZIP_IMPORT_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -485,22 +489,116 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+fn extract_url_host(url: &str) -> Option<&str> {
+    let sep = url.find("://")?;
+    let after_scheme = &url[sep + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#', '\\'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    if host_port.starts_with('[') {
+        let host = host_port
+            .find(']')
+            .map(|end| &host_port[..=end])
+            .unwrap_or(host_port);
+        Some(host)
+    } else {
+        Some(host_port.split(':').next().unwrap_or(host_port))
+    }
+}
+
+fn parse_single_int_ipv4(s: &str) -> Option<u32> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).ok()
+    } else if s.starts_with('0') && s.len() > 1 && s.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        u32::from_str_radix(s, 8).ok()
+    } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
+fn is_ipv6_mapped_loopback_or_unspecified(v6: std::net::Ipv6Addr) -> bool {
+    let segs = v6.segments();
+    if segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xffff {
+        let v4 = std::net::Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            (segs[6] & 0xff) as u8,
+            (segs[7] >> 8) as u8,
+            (segs[7] & 0xff) as u8,
+        );
+        return v4.is_loopback() || v4.is_unspecified();
+    }
+    false
+}
+
+fn is_loopback_or_local_host(raw_host: &str) -> bool {
+    let trimmed = raw_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bare = trimmed.trim_start_matches('[').trim_end_matches(']');
+    if bare == "localhost"
+        || bare.ends_with(".localhost")
+        || bare == "127.0.0.1"
+        || bare == "0.0.0.0"
+        || bare == "::1"
+        || bare == "::"
+        || bare.starts_with("127.")
+    {
+        return true;
+    }
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || is_ipv6_mapped_loopback_or_unspecified(v6)
+            }
+        };
+    }
+    if let Some(n) = parse_single_int_ipv4(bare) {
+        let v4 = std::net::Ipv4Addr::from(n);
+        if v4.is_loopback() || v4.is_unspecified() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Determines whether a userscript should run on `url` (respecting `@noframes`,
 /// `@exclude`, `@exclude-match`, `@match`, and `@include`).
 pub fn matches_url(meta: &UserScriptMeta, url: &str, is_main_frame: bool) -> bool {
     if meta.noframes && !is_main_frame {
         return false;
     }
-    // Never inject userscripts into internal browser pages or non-web schemes
-    let lower = url.trim().to_ascii_lowercase();
+    // Never inject userscripts into internal browser pages, non-web schemes,
+    // or local loopback origins (which host the privileged Singularity UI server).
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("browser://")
         || lower.starts_with("singularity://")
         || lower.starts_with("chrome://")
         || lower.starts_with("chrome-extension://")
+        || lower.starts_with("edge://")
+        || lower.starts_with("devtools://")
+        || lower.starts_with("view-source:")
         || lower.starts_with("javascript:")
         || lower.starts_with("data:")
+        || lower.starts_with("about:")
+        || lower.starts_with("blob:")
+        || lower.starts_with("file:")
+        || lower.starts_with("filesystem:")
     {
         return false;
+    }
+    if let Some(host) = extract_url_host(trimmed) {
+        if is_loopback_or_local_host(host) {
+            return false;
+        }
     }
 
     // Exclusions take absolute precedence
@@ -827,140 +925,273 @@ pub fn generate_isolated_wrapper_js(record: &UserScriptRecord) -> String {
         r#"/* Singularity Isolated-World Userscript Runtime */
 (function() {{
   "use strict";
-  const __SCRIPT_ID__ = {script_id_json};
-  const __GRANTS__ = new Set({grants_json});
-  const __CONNECT_ALLOW__ = {connects_json};
-  const __KV__ = Object.assign(Object.create(null), {kv_json});
-  const __BRIDGE__ = (typeof window !== "undefined" && window.__singularityUserscriptBridge) || null;
+  const __runtime = (function() {{
+    const __SCRIPT_ID__ = {script_id_json};
+    const __freeze = Object.freeze;
+    const __hasOwn = Object.prototype.hasOwnProperty;
+    const __arrayIncludes = Array.prototype.includes;
+    const __arraySome = Array.prototype.some;
+    const __jsonParse = JSON.parse;
+    const __jsonStringify = JSON.stringify;
+    const __promiseResolve = Promise.resolve.bind(Promise);
 
-  function __assertGrant(syncName, asyncName) {{
-    if (!__GRANTS__.has(syncName) && !__GRANTS__.has(asyncName)) {{
-      throw new Error("[Singularity Userscript] Missing @grant for " + syncName);
+    function __deepFreeze(obj) {{
+      if (obj && typeof obj === "object") {{
+        __freeze(obj);
+        const keys = Object.keys(obj);
+        for (let i = 0; i < keys.length; i += 1) {{
+          __deepFreeze(obj[keys[i]]);
+        }}
+      }}
+      return obj;
     }}
-  }}
 
-  function __postBridge(action, payload) {{
-    if (__BRIDGE__ && typeof __BRIDGE__.invoke === "function") {{
-      return __BRIDGE__.invoke(__SCRIPT_ID__, action, payload);
+    const __GRANTS__ = __freeze({grants_json}.slice());
+    const __CONNECT_ALLOW__ = __freeze({connects_json}.slice());
+    const __KV__ = Object.assign(Object.create(null), {kv_json});
+    const __RAW_WINDOW__ = typeof window !== "undefined" ? window : undefined;
+    const __BRIDGE__ = (__RAW_WINDOW__ && __RAW_WINDOW__.__singularityUserscriptBridge) || null;
+    const __BRIDGE_INVOKE__ = (__BRIDGE__ && typeof __BRIDGE__.invoke === "function")
+      ? __BRIDGE__.invoke.bind(__BRIDGE__)
+      : null;
+    const __BRIDGE_BIND_MENU__ = (__BRIDGE__ && typeof __BRIDGE__.bindMenuCallback === "function")
+      ? __BRIDGE__.bindMenuCallback.bind(__BRIDGE__)
+      : null;
+
+    function __hasGrant(name) {{
+      return __arrayIncludes.call(__GRANTS__, name);
     }}
-    return Promise.resolve(null);
-  }}
 
-  function __isHostAllowed(targetUrl) {{
-    try {{
-      const parsed = new URL(targetUrl, window.location.href);
-      const host = parsed.hostname.toLowerCase();
-      if (__CONNECT_ALLOW__.includes("*")) return true;
-      if (__CONNECT_ALLOW__.includes("self") && parsed.origin === window.location.origin) return true;
-      return __CONNECT_ALLOW__.some((rule) => {{
-        const r = String(rule).toLowerCase();
-        return host === r || host.endsWith("." + r);
+    function __assertGrant(syncName, asyncName) {{
+      if (!__hasGrant(syncName) && !__hasGrant(asyncName)) {{
+        throw new Error("[Singularity Userscript] Missing @grant for " + syncName);
+      }}
+    }}
+
+    function __postBridge(action, payload) {{
+      if (__BRIDGE_INVOKE__) {{
+        return __BRIDGE_INVOKE__(__SCRIPT_ID__, action, payload);
+      }}
+      return __promiseResolve(null);
+    }}
+
+    function __isHostAllowed(targetUrl) {{
+      try {{
+        const baseHref = (__RAW_WINDOW__ && __RAW_WINDOW__.location && __RAW_WINDOW__.location.href) || "about:blank";
+        const parsed = new URL(targetUrl, baseHref);
+        const host = parsed.hostname.toLowerCase();
+        if (__arrayIncludes.call(__CONNECT_ALLOW__, "*")) return true;
+        if (
+          __arrayIncludes.call(__CONNECT_ALLOW__, "self")
+          && __RAW_WINDOW__
+          && __RAW_WINDOW__.location
+          && parsed.origin === __RAW_WINDOW__.location.origin
+        ) {{
+          return true;
+        }}
+        return __arraySome.call(__CONNECT_ALLOW__, (rule) => {{
+          const r = String(rule).toLowerCase();
+          return host === r || host.endsWith("." + r);
+        }});
+      }} catch (_) {{
+        return false;
+      }}
+    }}
+
+    const GM_info = __deepFreeze({gm_info_json});
+
+    function GM_getValue(key, defaultValue) {{
+      __assertGrant("GM_getValue", "GM.getValue");
+      const k = String(key);
+      if (!__hasOwn.call(__KV__, k)) return defaultValue;
+      try {{ return __jsonParse(__KV__[k]); }} catch (_) {{ return __KV__[k]; }}
+    }}
+
+    function GM_setValue(key, value) {{
+      __assertGrant("GM_setValue", "GM.setValue");
+      const k = String(key);
+      const serialized = __jsonStringify(value);
+      __KV__[k] = serialized;
+      __postBridge("kv_set", {{ key: k, value: serialized }});
+    }}
+
+    function GM_deleteValue(key) {{
+      __assertGrant("GM_deleteValue", "GM.deleteValue");
+      const k = String(key);
+      delete __KV__[k];
+      __postBridge("kv_delete", {{ key: k }});
+    }}
+
+    function GM_listValues() {{
+      __assertGrant("GM_listValues", "GM.listValues");
+      return Object.keys(__KV__);
+    }}
+
+    function GM_addStyle(css) {{
+      __assertGrant("GM_addStyle", "GM.addStyle");
+      const style = document.createElement("style");
+      style.setAttribute("data-singularity-userscript", __SCRIPT_ID__);
+      style.textContent = String(css || "");
+      (document.head || document.documentElement).appendChild(style);
+      return style;
+    }}
+
+    function GM_xmlhttpRequest(details) {{
+      __assertGrant("GM_xmlhttpRequest", "GM.xmlHttpRequest");
+      if (!details || typeof details.url !== "string") {{
+        throw new Error("[Singularity Userscript] GM_xmlhttpRequest requires details.url");
+      }}
+      const reqUrl = String(details.url);
+      if (!__isHostAllowed(reqUrl)) {{
+        const err = new Error("[Singularity Userscript] Host blocked by @connect policy: " + reqUrl);
+        if (typeof details.onerror === "function") details.onerror(err);
+        return {{ abort() {{}} }};
+      }}
+      const reqPayload = Object.assign({{}}, details, {{ url: reqUrl }});
+      __postBridge("xhr", reqPayload).then((resp) => {{
+        if (typeof details.onload === "function") details.onload(resp);
+      }}).catch((err) => {{
+        if (typeof details.onerror === "function") details.onerror(err);
       }});
-    }} catch (_) {{
-      return false;
+      return {{ abort() {{ __postBridge("xhr_abort", {{ url: reqUrl }}); }} }};
     }}
-  }}
 
-  const GM_info = Object.freeze({gm_info_json});
-
-  function GM_getValue(key, defaultValue) {{
-    __assertGrant("GM_getValue", "GM.getValue");
-    const k = String(key);
-    if (!Object.prototype.hasOwnProperty.call(__KV__, k)) return defaultValue;
-    try {{ return JSON.parse(__KV__[k]); }} catch (_) {{ return __KV__[k]; }}
-  }}
-
-  function GM_setValue(key, value) {{
-    __assertGrant("GM_setValue", "GM.setValue");
-    const k = String(key);
-    const serialized = JSON.stringify(value);
-    __KV__[k] = serialized;
-    __postBridge("kv_set", {{ key: k, value: serialized }});
-  }}
-
-  function GM_deleteValue(key) {{
-    __assertGrant("GM_deleteValue", "GM.deleteValue");
-    const k = String(key);
-    delete __KV__[k];
-    __postBridge("kv_delete", {{ key: k }});
-  }}
-
-  function GM_listValues() {{
-    __assertGrant("GM_listValues", "GM.listValues");
-    return Object.keys(__KV__);
-  }}
-
-  function GM_addStyle(css) {{
-    __assertGrant("GM_addStyle", "GM.addStyle");
-    const style = document.createElement("style");
-    style.setAttribute("data-singularity-userscript", __SCRIPT_ID__);
-    style.textContent = String(css || "");
-    (document.head || document.documentElement).appendChild(style);
-    return style;
-  }}
-
-  function GM_xmlhttpRequest(details) {{
-    __assertGrant("GM_xmlhttpRequest", "GM.xmlHttpRequest");
-    if (!details || typeof details.url !== "string") {{
-      throw new Error("[Singularity Userscript] GM_xmlhttpRequest requires details.url");
+    function GM_registerMenuCommand(caption, callback, accessKey) {{
+      __assertGrant("GM_registerMenuCommand", "GM.registerMenuCommand");
+      const cmdId = __SCRIPT_ID__ + ":menu:" + String(caption);
+      __postBridge("register_menu", {{ id: cmdId, caption: String(caption), accessKey: accessKey || null }});
+      if (__BRIDGE_BIND_MENU__) {{
+        __BRIDGE_BIND_MENU__(cmdId, callback);
+      }}
+      return cmdId;
     }}
-    if (!__isHostAllowed(details.url)) {{
-      const err = new Error("[Singularity Userscript] Host blocked by @connect policy: " + details.url);
-      if (typeof details.onerror === "function") details.onerror(err);
-      return {{ abort() {{}} }};
+
+    function GM_notification(textOrOpts, title, image, onclick) {{
+      __assertGrant("GM_notification", "GM.notification");
+      const opts = typeof textOrOpts === "object" && textOrOpts !== null
+        ? textOrOpts
+        : {{ text: String(textOrOpts || ""), title: title || GM_info.script.name, image: image || null }};
+      __postBridge("notification", opts).then(() => {{
+        if (typeof onclick === "function") onclick();
+        else if (typeof opts.onclick === "function") opts.onclick();
+      }});
     }}
-    __postBridge("xhr", details).then((resp) => {{
-      if (typeof details.onload === "function") details.onload(resp);
-    }}).catch((err) => {{
-      if (typeof details.onerror === "function") details.onerror(err);
+
+    function GM_setClipboard(data, info) {{
+      __assertGrant("GM_setClipboard", "GM.setClipboard");
+      __postBridge("clipboard_set", {{ data: String(data || ""), info: info || "text/plain" }});
+    }}
+
+    const gmAsync = Object.create(null);
+    gmAsync.info = GM_info;
+    if (__hasGrant("GM_getValue") || __hasGrant("GM.getValue")) {{
+      gmAsync.getValue = (k, d) => __promiseResolve(GM_getValue(k, d));
+    }}
+    if (__hasGrant("GM_setValue") || __hasGrant("GM.setValue")) {{
+      gmAsync.setValue = (k, v) => __promiseResolve(GM_setValue(k, v));
+    }}
+    if (__hasGrant("GM_deleteValue") || __hasGrant("GM.deleteValue")) {{
+      gmAsync.deleteValue = (k) => __promiseResolve(GM_deleteValue(k));
+    }}
+    if (__hasGrant("GM_listValues") || __hasGrant("GM.listValues")) {{
+      gmAsync.listValues = () => __promiseResolve(GM_listValues());
+    }}
+    if (__hasGrant("GM_addStyle") || __hasGrant("GM.addStyle")) {{
+      gmAsync.addStyle = (css) => __promiseResolve(GM_addStyle(css));
+    }}
+    if (__hasGrant("GM_xmlhttpRequest") || __hasGrant("GM.xmlHttpRequest")) {{
+      gmAsync.xmlHttpRequest = (details) => GM_xmlhttpRequest(details);
+    }}
+    if (__hasGrant("GM_registerMenuCommand") || __hasGrant("GM.registerMenuCommand")) {{
+      gmAsync.registerMenuCommand = (c, cb, ak) => __promiseResolve(GM_registerMenuCommand(c, cb, ak));
+    }}
+    if (__hasGrant("GM_notification") || __hasGrant("GM.notification")) {{
+      gmAsync.notification = (o, t, i, fn) => __promiseResolve(GM_notification(o, t, i, fn));
+    }}
+    if (__hasGrant("GM_setClipboard") || __hasGrant("GM.setClipboard")) {{
+      gmAsync.setClipboard = (d, info) => __promiseResolve(GM_setClipboard(d, info));
+    }}
+    const GM = __freeze(gmAsync);
+
+    const __hasUnsafeWindow = __hasGrant("unsafeWindow");
+    const __sandboxGlobals = Object.create(null);
+    const __sandboxWindow = (__RAW_WINDOW__ && typeof Proxy === "function")
+      ? new Proxy(__sandboxGlobals, {{
+          get(target, prop) {{
+            if (prop === "__singularityUserscriptBridge") return undefined;
+            if (prop === "window" || prop === "self" || prop === "globalThis") return __sandboxWindow;
+            if (__hasOwn.call(target, prop)) return target[prop];
+            const val = Reflect.get(__RAW_WINDOW__, prop, __RAW_WINDOW__);
+            return (typeof val === "function" && !("prototype" in val)) ? val.bind(__RAW_WINDOW__) : val;
+          }},
+          set(target, prop, value) {{
+            if (prop === "__singularityUserscriptBridge") return false;
+            target[prop] = value;
+            return true;
+          }},
+          has(target, prop) {{
+            if (prop === "__singularityUserscriptBridge") return false;
+            return __hasOwn.call(target, prop) || Reflect.has(__RAW_WINDOW__, prop);
+          }},
+        }})
+      : undefined;
+
+    return __freeze({{
+      GM,
+      GM_info,
+      GM_getValue: (__hasGrant("GM_getValue") || __hasGrant("GM.getValue")) ? GM_getValue : undefined,
+      GM_setValue: (__hasGrant("GM_setValue") || __hasGrant("GM.setValue")) ? GM_setValue : undefined,
+      GM_deleteValue: (__hasGrant("GM_deleteValue") || __hasGrant("GM.deleteValue")) ? GM_deleteValue : undefined,
+      GM_listValues: (__hasGrant("GM_listValues") || __hasGrant("GM.listValues")) ? GM_listValues : undefined,
+      GM_addStyle: (__hasGrant("GM_addStyle") || __hasGrant("GM.addStyle")) ? GM_addStyle : undefined,
+      GM_xmlhttpRequest: (__hasGrant("GM_xmlhttpRequest") || __hasGrant("GM.xmlHttpRequest")) ? GM_xmlhttpRequest : undefined,
+      GM_registerMenuCommand: (__hasGrant("GM_registerMenuCommand") || __hasGrant("GM.registerMenuCommand")) ? GM_registerMenuCommand : undefined,
+      GM_notification: (__hasGrant("GM_notification") || __hasGrant("GM.notification")) ? GM_notification : undefined,
+      GM_setClipboard: (__hasGrant("GM_setClipboard") || __hasGrant("GM.setClipboard")) ? GM_setClipboard : undefined,
+      unsafeWindow: __hasUnsafeWindow ? __RAW_WINDOW__ : undefined,
+      window: __hasUnsafeWindow ? __RAW_WINDOW__ : __sandboxWindow,
     }});
-    return {{ abort() {{ __postBridge("xhr_abort", {{ url: details.url }}); }} }};
-  }}
+  }})();
 
-  function GM_registerMenuCommand(caption, callback, accessKey) {{
-    __assertGrant("GM_registerMenuCommand", "GM.registerMenuCommand");
-    const cmdId = __SCRIPT_ID__ + ":menu:" + String(caption);
-    __postBridge("register_menu", {{ id: cmdId, caption: String(caption), accessKey: accessKey || null }});
-    if (__BRIDGE__ && typeof __BRIDGE__.bindMenuCallback === "function") {{
-      __BRIDGE__.bindMenuCallback(cmdId, callback);
-    }}
-    return cmdId;
-  }}
-
-  function GM_notification(textOrOpts, title, image, onclick) {{
-    __assertGrant("GM_notification", "GM.notification");
-    const opts = typeof textOrOpts === "object" && textOrOpts !== null
-      ? textOrOpts
-      : {{ text: String(textOrOpts || ""), title: title || GM_info.script.name, image: image || null }};
-    __postBridge("notification", opts).then(() => {{
-      if (typeof onclick === "function") onclick();
-      else if (typeof opts.onclick === "function") opts.onclick();
-    }});
-  }}
-
-  function GM_setClipboard(data, info) {{
-    __assertGrant("GM_setClipboard", "GM.setClipboard");
-    __postBridge("clipboard_set", {{ data: String(data || ""), info: info || "text/plain" }});
-  }}
-
-  const GM = Object.freeze({{
-    info: GM_info,
-    getValue: (k, d) => Promise.resolve(GM_getValue(k, d)),
-    setValue: (k, v) => Promise.resolve(GM_setValue(k, v)),
-    deleteValue: (k) => Promise.resolve(GM_deleteValue(k)),
-    listValues: () => Promise.resolve(GM_listValues()),
-    addStyle: (css) => Promise.resolve(GM_addStyle(css)),
-    xmlHttpRequest: (details) => GM_xmlhttpRequest(details),
-    registerMenuCommand: (c, cb, ak) => Promise.resolve(GM_registerMenuCommand(c, cb, ak)),
-    notification: (o, t, i, fn) => Promise.resolve(GM_notification(o, t, i, fn)),
-    setClipboard: (d, info) => Promise.resolve(GM_setClipboard(d, info)),
-  }});
-
-  const unsafeWindow = __GRANTS__.has("unsafeWindow") ? window : undefined;
-
-  // --- Begin UserScript Body ---
+  (function(
+    GM,
+    GM_info,
+    GM_getValue,
+    GM_setValue,
+    GM_deleteValue,
+    GM_listValues,
+    GM_addStyle,
+    GM_xmlhttpRequest,
+    GM_registerMenuCommand,
+    GM_notification,
+    GM_setClipboard,
+    unsafeWindow,
+    window,
+    self,
+    globalThis,
+    __runtime
+  ) {{
+    "use strict";
+    // --- Begin UserScript Body ---
 {source}
-  // --- End UserScript Body ---
+    // --- End UserScript Body ---
+  }})(
+    __runtime.GM,
+    __runtime.GM_info,
+    __runtime.GM_getValue,
+    __runtime.GM_setValue,
+    __runtime.GM_deleteValue,
+    __runtime.GM_listValues,
+    __runtime.GM_addStyle,
+    __runtime.GM_xmlhttpRequest,
+    __runtime.GM_registerMenuCommand,
+    __runtime.GM_notification,
+    __runtime.GM_setClipboard,
+    __runtime.unsafeWindow,
+    __runtime.window,
+    __runtime.window,
+    __runtime.window
+  );
 }})();
 "#,
         script_id_json = script_id_json,
@@ -1208,11 +1439,19 @@ impl UserscriptManager {
         if let Ok(bundle) = serde_json::from_str::<UserscriptExportBundle>(raw_json) {
             let mut imported = 0usize;
             for rec in bundle.scripts {
+                let meta = parse_userscript_metadata(&rec.source)?;
+                let existing_grants = self
+                    .scripts
+                    .get(&meta.compute_id())
+                    .map(|prev| prev.granted_connect_hosts.clone())
+                    .unwrap_or_default();
                 let installed = self.install_source(&rec.source)?;
                 if let Some(entry) = self.scripts.get_mut(&installed.id) {
                     entry.enabled = rec.enabled;
                     entry.kv_storage.extend(rec.kv_storage);
-                    entry.granted_connect_hosts = rec.granted_connect_hosts;
+                    // Never trust `granted_connect_hosts` from an imported JSON export;
+                    // preserve only hosts already granted locally on this device.
+                    entry.granted_connect_hosts = existing_grants;
                 }
                 imported += 1;
             }
@@ -1297,24 +1536,51 @@ impl UserscriptManager {
         let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
             .map_err(|e| format!("Invalid ZIP archive: {}", e))?;
 
+        if archive.len() > MAX_ZIP_IMPORT_ENTRIES {
+            return Err(format!(
+                "ZIP archive exceeds maximum entry limit ({})",
+                MAX_ZIP_IMPORT_ENTRIES
+            ));
+        }
+
         let mut user_js_files: BTreeMap<String, String> = BTreeMap::new();
         let mut storage_files: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let mut options_enabled: BTreeMap<String, bool> = BTreeMap::new();
         let mut native_manifest: Option<String> = None;
+        let mut total_decompressed: usize = 0;
 
         for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+            let file = archive.by_index(i).map_err(|e| e.to_string())?;
             if file.is_dir() {
                 continue;
             }
-            if file.size() as usize > MAX_USERSCRIPT_BYTES {
-                continue;
-            }
             let name = file.name().to_string();
-            let mut text = String::new();
-            if file.read_to_string(&mut text).is_err() {
+            let remaining_budget = MAX_ZIP_IMPORT_TOTAL_BYTES.saturating_sub(total_decompressed);
+            let per_entry_limit = MAX_USERSCRIPT_BYTES.min(remaining_budget);
+            let mut raw_buf = Vec::new();
+            if file
+                .take((per_entry_limit as u64).saturating_add(1))
+                .read_to_end(&mut raw_buf)
+                .is_err()
+            {
                 continue;
             }
+            if raw_buf.len() > MAX_USERSCRIPT_BYTES {
+                return Err(format!(
+                    "ZIP entry '{}' exceeds maximum userscript size ({} bytes)",
+                    name, MAX_USERSCRIPT_BYTES
+                ));
+            }
+            if total_decompressed.saturating_add(raw_buf.len()) > MAX_ZIP_IMPORT_TOTAL_BYTES {
+                return Err(format!(
+                    "ZIP archive exceeds cumulative decompressed size limit ({} bytes)",
+                    MAX_ZIP_IMPORT_TOTAL_BYTES
+                ));
+            }
+            total_decompressed += raw_buf.len();
+            let Ok(text) = String::from_utf8(raw_buf) else {
+                continue;
+            };
 
             if name == "singularity-userscripts.json" {
                 native_manifest = Some(text);
@@ -1574,5 +1840,160 @@ GM_addStyle("body { background: #000 !important; }");
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_matches_url_blocks_loopback_and_non_web_schemes() {
+        let broad_script = r#"// ==UserScript==
+// @name         Broad Script
+// @match        *://*/*
+// @match        <all_urls>
+// @match        http://127.0.0.1/*
+// @include      *
+// ==/UserScript==
+console.log("hi");
+"#;
+        let meta = parse_userscript_metadata(broad_script).unwrap();
+
+        // Legitimate public web pages still match
+        assert!(matches_url(&meta, "https://example.com/page", true));
+
+        // Privileged local UI server / loopback origins are unconditionally excluded
+        assert!(!matches_url(&meta, "http://127.0.0.1:8080/", true));
+        assert!(!matches_url(&meta, "http://127.0.0.1:8080/browser/settings", true));
+        assert!(!matches_url(&meta, "http://127.0.0.2:9000/", true));
+        assert!(!matches_url(&meta, "http://localhost:3000/api", true));
+        assert!(!matches_url(&meta, "https://sub.localhost/app", true));
+        assert!(!matches_url(&meta, "http://[::1]:8080/", true));
+        assert!(!matches_url(&meta, "http://0.0.0.0:8080/", true));
+
+        // Non-web schemes are unconditionally excluded
+        assert!(!matches_url(&meta, "about:blank", true));
+        assert!(!matches_url(&meta, "blob:https://example.com/uuid", true));
+        assert!(!matches_url(&meta, "file:///etc/passwd", true));
+    }
+
+    #[test]
+    fn test_isolated_wrapper_separates_runtime_state_from_userscript_scope() {
+        let meta = parse_userscript_metadata(SAMPLE_SCRIPT).unwrap();
+        let rec = UserScriptRecord {
+            id: meta.compute_id(),
+            meta,
+            source: "console.log('isolated-body');".into(),
+            enabled: true,
+            kv_storage: BTreeMap::new(),
+            granted_connect_hosts: vec![],
+            installed_unix: 100,
+            updated_unix: 100,
+        };
+        let wrapped = generate_isolated_wrapper_js(&rec);
+
+        // Policy snapshots are frozen inside the closed outer IIFE
+        assert!(wrapped.contains("const __runtime = (function() {"));
+        assert!(wrapped.contains("const __GRANTS__ = __freeze("));
+        assert!(wrapped.contains("const __CONNECT_ALLOW__ = __freeze("));
+        assert!(wrapped.contains("const GM = __freeze(gmAsync);"));
+
+        // UserScript body executes in a separate sibling function scope with __runtime shadowed
+        let runtime_close_idx = wrapped
+            .find("})();\n\n  (function(")
+            .expect("closed outer runtime IIFE before sibling userscript scope");
+        let body_idx = wrapped
+            .find("console.log('isolated-body');")
+            .expect("userscript body present");
+        assert!(body_idx > runtime_close_idx);
+        assert!(wrapped[runtime_close_idx..body_idx].contains("__runtime"));
+    }
+
+    #[test]
+    fn test_import_json_strips_untrusted_connect_grants_and_preserves_local_grants() {
+        let dir = std::env::temp_dir().join(format!(
+            "singularity_us_grants_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut mgr = UserscriptManager::open_at(&dir).expect("open mgr");
+        let rec = mgr.install_source(SAMPLE_SCRIPT).expect("install");
+        mgr.grant_connect_host(&rec.id, "trusted.local.test")
+            .expect("grant local host");
+
+        // Craft an untrusted JSON bundle attempting to grant wildcard "*"
+        let mut exported: serde_json::Value =
+            serde_json::from_str(&mgr.export_json().expect("export")).expect("parse export");
+        exported["scripts"][0]["granted_connect_hosts"] = serde_json::json!(["*", "evil.test"]);
+        let tampered_json = serde_json::to_string(&exported).expect("serialize tampered");
+
+        // Updating an already-installed script keeps ONLY its pre-existing local grants
+        assert_eq!(mgr.import_json(&tampered_json).expect("reimport"), 1);
+        assert_eq!(
+            mgr.get(&rec.id).unwrap().granted_connect_hosts,
+            vec!["trusted.local.test".to_string()]
+        );
+
+        // Fresh import into a clean manager resets granted_connect_hosts to empty
+        mgr.remove(&rec.id).expect("remove");
+        assert_eq!(mgr.import_json(&tampered_json).expect("fresh import"), 1);
+        assert!(mgr.get(&rec.id).unwrap().granted_connect_hosts.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_import_zip_enforces_entry_and_decompressed_size_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "singularity_us_zip_limits_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut mgr = UserscriptManager::open_at(&dir).expect("open mgr");
+
+        // 1. Entry count > MAX_ZIP_IMPORT_ENTRIES (256) is rejected
+        let mut many_buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut many_buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..=MAX_ZIP_IMPORT_ENTRIES {
+                zw.start_file(format!("f{}.txt", i), opts).unwrap();
+                zw.write_all(b"x").unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        assert!(mgr.import_zip(&many_buf).is_err());
+
+        // 2. Single entry exceeding MAX_USERSCRIPT_BYTES (4 MiB) is rejected via bounded read
+        let mut big_entry_buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut big_entry_buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("bomb.user.js", opts).unwrap();
+            let chunk = vec![b'a'; 64 * 1024];
+            for _ in 0..((MAX_USERSCRIPT_BYTES / (64 * 1024)) + 1) {
+                zw.write_all(&chunk).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        assert!(mgr.import_zip(&big_entry_buf).is_err());
+
+        // 3. Cumulative decompressed size exceeding MAX_ZIP_IMPORT_TOTAL_BYTES (16 MiB) is rejected
+        let mut cumulative_buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut cumulative_buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            let chunk = vec![b'b'; 64 * 1024];
+            for idx in 0..5 {
+                zw.start_file(format!("part_{}.txt", idx), opts).unwrap();
+                for _ in 0..(MAX_USERSCRIPT_BYTES / (64 * 1024)) {
+                    zw.write_all(&chunk).unwrap();
+                }
+            }
+            zw.finish().unwrap();
+        }
+        assert!(mgr.import_zip(&cumulative_buf).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

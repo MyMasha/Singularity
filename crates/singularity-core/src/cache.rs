@@ -165,7 +165,10 @@ pub fn decompress_lossless(encoded: &[u8]) -> Result<Vec<u8>, String> {
         return Err("SLZ1 payload exceeds maximum allowed decompressed size".into());
     }
 
-    let mut out = Vec::with_capacity(expected_len);
+    let initial_cap = expected_len
+        .min(64 * 1024)
+        .min(encoded.len().saturating_mul(16).max(64));
+    let mut out = Vec::with_capacity(initial_cap);
     let mut pos = 8usize;
 
     while pos < encoded.len() {
@@ -173,8 +176,11 @@ pub fn decompress_lossless(encoded: &[u8]) -> Result<Vec<u8>, String> {
         pos += 1;
         if tag < 0x80 {
             let lit_len = (tag as usize) + 1;
-            if pos + lit_len > encoded.len() {
+            if !matches!(pos.checked_add(lit_len), Some(end) if end <= encoded.len()) {
                 return Err("Truncated SLZ1 literal run".into());
+            }
+            if !matches!(out.len().checked_add(lit_len), Some(new_len) if new_len <= expected_len) {
+                return Err("SLZ1 literal run exceeds declared output size".into());
             }
             out.extend_from_slice(&encoded[pos..pos + lit_len]);
             pos += lit_len;
@@ -652,5 +658,21 @@ mod tests {
         assert!(cache
             .get("example.com", "https://example.com/fresh.json", 2500)
             .is_some());
+    }
+
+    #[test]
+    fn test_slz1_rejects_oom_header_and_literal_overflow() {
+        // 8-byte header claiming 256 MiB output must fail cleanly without pre-allocating 256 MiB
+        let mut bomb = Vec::from(*b"SLZ1");
+        bomb.extend_from_slice(&(MAX_DECOMPRESSED_BYTES as u32).to_le_bytes());
+        assert!(decompress_lossless(&bomb).is_err());
+
+        // Literal run exceeding declared expected_len must fail immediately
+        let mut lit_overflow = Vec::from(*b"SLZ1");
+        lit_overflow.extend_from_slice(&2u32.to_le_bytes());
+        lit_overflow.push(0x04); // 5 literal bytes
+        lit_overflow.extend_from_slice(b"abcde");
+        let err = decompress_lossless(&lit_overflow).unwrap_err();
+        assert!(err.contains("exceeds declared output size"));
     }
 }

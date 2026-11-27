@@ -12,9 +12,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
-#[cfg(any(target_os = "windows", test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Domains whose EME DRM streams require Google VMP signing or Windows Hardware PlayReady.
@@ -316,7 +314,6 @@ fn ensure_cef_preferences_protected_media(cef_profile_dir: &Path) -> bool {
     atomic_write_regular_file(&prefs_path, &serialized)
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn parse_numeric_version(raw: &str) -> Option<Vec<u64>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 64 {
@@ -335,7 +332,6 @@ fn parse_numeric_version(raw: &str) -> Option<Vec<u64>> {
     Some(parts)
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn is_valid_widevine_cdm_dir(dir: &Path) -> bool {
     let Ok(dir_meta) = std::fs::symlink_metadata(dir) else {
         return false;
@@ -379,7 +375,6 @@ fn is_valid_widevine_cdm_dir(dir: &Path) -> bool {
     !is_symlink_or_reparse(&dll_meta) && dll_meta.file_type().is_file() && dll_meta.len() > 0
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn read_manifest_version(dir: &Path) -> Option<(String, Vec<u64>)> {
     let manifest = dir.join("manifest.json");
     let meta = std::fs::symlink_metadata(&manifest).ok()?;
@@ -393,7 +388,6 @@ fn read_manifest_version(dir: &Path) -> Option<(String, Vec<u64>)> {
     Some((ver_str, parsed))
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn find_newest_widevine_candidate(roots: &[PathBuf]) -> Option<(String, PathBuf)> {
     let mut best: Option<(Vec<u64>, String, PathBuf)> = None;
 
@@ -503,20 +497,29 @@ fn copy_widevine_tree_no_symlinks(
                 return false;
             }
         } else if meta.file_type().is_file() {
+            use std::io::Read;
             if *files_copied >= MAX_FILES || meta.len() > MAX_FILE_BYTES {
                 return false;
             }
-            let Ok(mut reader) = std::fs::File::open(&src_path) else {
-                return false;
+            let copy_ok = {
+                let Ok(reader) = std::fs::File::open(&src_path) else {
+                    return false;
+                };
+                let Ok(mut writer) = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dst_path)
+                else {
+                    return false;
+                };
+                let mut limited = reader.take(MAX_FILE_BYTES + 1);
+                match std::io::copy(&mut limited, &mut writer) {
+                    Ok(copied) if copied <= MAX_FILE_BYTES => writer.sync_all().is_ok(),
+                    _ => false,
+                }
             };
-            let Ok(mut writer) = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&dst_path)
-            else {
-                return false;
-            };
-            if std::io::copy(&mut reader, &mut writer).is_err() || writer.sync_all().is_err() {
+            if !copy_ok {
+                let _ = std::fs::remove_file(&dst_path);
                 return false;
             }
             *files_copied += 1;
@@ -573,29 +576,43 @@ fn collect_windows_widevine_search_roots() -> Vec<PathBuf> {
     roots
 }
 
-#[cfg(target_os = "windows")]
-fn existing_cef_widevine_is_valid(widevine_root: &Path) -> bool {
+fn resolve_valid_cef_widevine_hint_dir(widevine_root: &Path) -> Option<PathBuf> {
+    let root_meta = std::fs::symlink_metadata(widevine_root).ok()?;
+    if is_symlink_or_reparse(&root_meta) || !root_meta.is_dir() {
+        return None;
+    }
+    let canon_root = std::fs::canonicalize(widevine_root).ok()?;
+
     let hint_path = widevine_root.join("latest-component-updated-widevine-cdm");
-    let Ok(meta) = std::fs::symlink_metadata(&hint_path) else {
-        return false;
-    };
+    let meta = std::fs::symlink_metadata(&hint_path).ok()?;
     if is_symlink_or_reparse(&meta) || !meta.file_type().is_file() || meta.len() > 65_536 {
-        return false;
+        return None;
     }
-    let Ok(raw) = std::fs::read_to_string(&hint_path) else {
-        return false;
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
-    else {
-        return false;
-    };
-    let Some(path_str) = val.get("Path").and_then(|v| v.as_str()) else {
-        return false;
-    };
+    let raw = std::fs::read_to_string(&hint_path).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok()?;
+    let path_str = val.get("Path").and_then(|v| v.as_str())?;
     if path_str.trim().is_empty() {
-        return false;
+        return None;
     }
-    is_valid_widevine_cdm_dir(Path::new(path_str))
+
+    let candidate = Path::new(path_str);
+    let cand_meta = std::fs::symlink_metadata(candidate).ok()?;
+    if is_symlink_or_reparse(&cand_meta) || !cand_meta.is_dir() {
+        return None;
+    }
+    let canon_candidate = std::fs::canonicalize(candidate).ok()?;
+    // Strictly confine the hint `Path` beneath the canonical `widevine_root` directory.
+    if !canon_candidate.starts_with(&canon_root) {
+        return None;
+    }
+    if !is_valid_widevine_cdm_dir(&canon_candidate) {
+        return None;
+    }
+    Some(canon_candidate)
+}
+
+fn existing_cef_widevine_is_valid(widevine_root: &Path) -> bool {
+    resolve_valid_cef_widevine_hint_dir(widevine_root).is_some()
 }
 
 #[cfg(target_os = "windows")]
@@ -723,7 +740,10 @@ pub fn clear_drm_webview_storage(roaming_root: &Path) {
 #[cfg(target_os = "windows")]
 mod windows_drm {
     use super::*;
-    use crate::cef_runtime::{is_blocked_local_ipc_url, CefCallbackEvent, CefEventSink};
+    use crate::cef_runtime::{
+        is_blocked_local_ipc_url, is_dangerous_download_name, is_dangerous_download_url,
+        CefCallbackEvent, CefEventSink,
+    };
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use wry::{WebViewBuilderExtWindows, WebViewExtWindows};
@@ -731,6 +751,94 @@ mod windows_drm {
     /// Fail-closed navigation policy callback evaluated on every navigation and new-window request
     /// (enforces Kill-Switch, Lockdown, and ad/tracker filtering before WebView2 connects).
     pub type DrmNavigationPolicyFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+    /// Normalizes HTTP(S)/WS(S) scheme prefixes to lowercase `http://`/`https://` so
+    /// `check_navigation_policy` (which requires lowercase `http://`/`https://`) enforces
+    /// Mullvad Kill-Switch, Emergency Lockdown, and Adblocker uniformly across subresources & WS.
+    fn normalize_drm_policy_url(trimmed: &str) -> Option<String> {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "https://") {
+            Some(format!("https://{rest}"))
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "http://") {
+            Some(format!("http://{rest}"))
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "wss://") {
+            Some(format!("https://{rest}"))
+        } else if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "ws://") {
+            Some(format!("http://{rest}"))
+        } else {
+            None
+        }
+    }
+
+    /// Fail-closed gate for WebView2 `<iframe>` navigations (`add_FrameNavigationStarting`) and
+    /// subresource requests (`add_WebResourceRequested`).
+    /// Blocks `file://`, local loopback IPC, unknown schemes, and any HTTP(S)/WS(S) target denied
+    /// by `nav_policy` (Mullvad Kill-Switch, Emergency Lockdown, Adblocker), while preserving
+    /// non-network in-memory schemes (`about:blank`, `about:srcdoc`, `data:`, `blob:`, `javascript:`)
+    /// needed by signed MSE/EME streaming players after `is_blocked_local_ipc_url` screening.
+    pub(super) fn is_allowed_drm_frame_or_resource_url(
+        url: &str,
+        bind_port: u16,
+        nav_policy: &DrmNavigationPolicyFn,
+    ) -> bool {
+        let trimmed = url.trim();
+        if trimmed.is_empty()
+            || trimmed.bytes().any(|b| b < 0x20 || b == 0x7F)
+            || strip_prefix_ignore_ascii_case(trimmed, "file:").is_some()
+            || is_blocked_local_ipc_url(trimmed, bind_port)
+        {
+            return false;
+        }
+        if trimmed.eq_ignore_ascii_case("about:blank")
+            || trimmed.eq_ignore_ascii_case("about:srcdoc")
+            || strip_prefix_ignore_ascii_case(trimmed, "data:").is_some()
+            || strip_prefix_ignore_ascii_case(trimmed, "blob:").is_some()
+            || strip_prefix_ignore_ascii_case(trimmed, "javascript:").is_some()
+        {
+            return true;
+        }
+        match normalize_drm_policy_url(trimmed) {
+            Some(policy_url) => (nav_policy)(&policy_url),
+            None => false,
+        }
+    }
+
+    /// Fail-closed gate for downloads initiated inside a WebView2 DRM tab
+    /// (invoked via `ICoreWebView2_4::add_DownloadStarting` through `with_download_started_handler`).
+    /// Blocks loopback/local-IPC/file downloads, non-HTTP(S) smuggling (`blob:`/`data:`),
+    /// `nav_policy` denials (Kill-Switch/Lockdown/Adblocker), and dangerous executable extensions.
+    pub(super) fn is_allowed_drm_download(
+        dl_url: &str,
+        dest_path: &Path,
+        bind_port: u16,
+        nav_policy: &DrmNavigationPolicyFn,
+    ) -> bool {
+        let trimmed = dl_url.trim();
+        if trimmed.is_empty()
+            || trimmed.bytes().any(|b| b < 0x20 || b == 0x7F)
+            || strip_prefix_ignore_ascii_case(trimmed, "file:").is_some()
+            || is_blocked_local_ipc_url(trimmed, bind_port)
+        {
+            return false;
+        }
+        if extract_http_host(trimmed).is_none() {
+            return false;
+        }
+        let Some(policy_url) = normalize_drm_policy_url(trimmed) else {
+            return false;
+        };
+        if !(nav_policy)(&policy_url) {
+            return false;
+        }
+        if is_dangerous_download_url(trimmed) {
+            return false;
+        }
+        if let Some(file_name) = dest_path.file_name().and_then(|n| n.to_str()) {
+            if is_dangerous_download_name(file_name) {
+                return false;
+            }
+        }
+        true
+    }
 
     /// Shared WebView2 browser context backed by `<roaming_root>/drm-webview2`.
     pub type DrmWebContext = wry::WebContext;
@@ -786,6 +894,7 @@ mod windows_drm {
 
             let nw_sink = Arc::clone(&sink);
             let nw_policy_cb = Arc::clone(&nav_policy);
+            let dl_policy_cb = Arc::clone(&nav_policy);
 
             let pl_sink = Arc::clone(&sink);
             let pl_last_url = Arc::clone(&last_url);
@@ -835,6 +944,7 @@ mod windows_drm {
                         (nw_sink)(CefCallbackEvent::OpenNewTab {
                             url: req_url,
                             background: false,
+                            from_ui: false,
                         });
                     }
                     wry::NewWindowResponse::Deny
@@ -871,15 +981,100 @@ mod windows_drm {
                         (title_sink)(CefCallbackEvent::TitleChanged { tab_id, title });
                     }
                 })
+                // Registers `ICoreWebView2_4::add_DownloadStarting` natively via `wry`:
+                // cancels loopback/IPC, Kill-Switch/Lockdown/Adblocker, non-HTTP(S), and dangerous downloads.
+                .with_download_started_handler(move |dl_url, dest_path| {
+                    is_allowed_drm_download(&dl_url, dest_path.as_path(), bind_port, &dl_policy_cb)
+                })
                 .build_as_child(window)
                 .map_err(|e| format!("Failed to spawn DRM WebView2 tab: {}", e))?;
 
             // Attach native WebView2 COM handlers directly on `ICoreWebView2` (zero JS injection!).
             let core_wv = webview.webview();
+            let core_env = webview.environment();
             unsafe {
                 if let Ok(settings) = core_wv.Settings() {
                     let _ = settings.SetIsStatusBarEnabled(false);
                 }
+
+                // 1. Subframe (`<iframe>`) navigation filter enforcing local-IPC guard + `nav_policy`
+                //    (Mullvad Kill-Switch, Emergency Lockdown, Singularity Shield adblocker).
+                let frame_policy_cb = Arc::clone(&nav_policy);
+                let mut frame_nav_token: i64 = 0;
+                let frame_nav_handler =
+                    webview2_com::NavigationStartingEventHandler::create(Box::new(
+                        move |_sender, args| {
+                            if let Some(args) = args {
+                                let mut uri_pwstr = Default::default();
+                                let allowed = if args.Uri(&mut uri_pwstr).is_ok() {
+                                    let frame_url = webview2_com::take_pwstr(uri_pwstr);
+                                    is_allowed_drm_frame_or_resource_url(
+                                        &frame_url,
+                                        bind_port,
+                                        &frame_policy_cb,
+                                    )
+                                } else {
+                                    false
+                                };
+                                if !allowed {
+                                    let _ = args.SetCancel(true);
+                                }
+                            }
+                            Ok(())
+                        },
+                    ));
+                let _ = core_wv.add_FrameNavigationStarting(&frame_nav_handler, &mut frame_nav_token);
+
+                // 2. Network-layer subresource filter across ALL resource contexts (fetch, XHR,
+                //    scripts, media, images, iframes, WebSockets) — short-circuits disallowed
+                //    requests with a synthetic 403 before WebView2 opens any socket.
+                let wildcard_filter = webview2_com::CoTaskMemPWSTR::from("*");
+                let _ = core_wv.AddWebResourceRequestedFilter(
+                    *wildcard_filter.as_ref().as_pcwstr(),
+                    webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                );
+                let res_policy_cb = Arc::clone(&nav_policy);
+                let mut res_token: i64 = 0;
+                let res_handler = webview2_com::WebResourceRequestedEventHandler::create(Box::new(
+                    move |_sender, args| {
+                        if let Some(args) = args {
+                            let allowed = match args.Request() {
+                                Ok(req) => {
+                                    let mut uri_pwstr = Default::default();
+                                    if req.Uri(&mut uri_pwstr).is_ok() {
+                                        let req_url = webview2_com::take_pwstr(uri_pwstr);
+                                        is_allowed_drm_frame_or_resource_url(
+                                            &req_url,
+                                            bind_port,
+                                            &res_policy_cb,
+                                        )
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Err(_) => false,
+                            };
+                            if !allowed {
+                                let reason = webview2_com::CoTaskMemPWSTR::from(
+                                    "Blocked by Singularity Policy",
+                                );
+                                let headers = webview2_com::CoTaskMemPWSTR::from(
+                                    "Content-Type: text/plain; charset=utf-8\r\nCache-Control: no-store",
+                                );
+                                if let Ok(resp) = core_env.CreateWebResourceResponse(
+                                    None,
+                                    403,
+                                    *reason.as_ref().as_pcwstr(),
+                                    *headers.as_ref().as_pcwstr(),
+                                ) {
+                                    let _ = args.SetResponse(&resp);
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                ));
+                let _ = core_wv.add_WebResourceRequested(&res_handler, &mut res_token);
 
                 let fs_sink = Arc::clone(&sink);
                 let mut fs_token: i64 = 0;
@@ -1117,23 +1312,66 @@ pub struct WidevineStatusReport {
     pub playready_hybrid_available: bool,
 }
 
-/// Inspects the CEF profile directory and reports Widevine CDM readiness for `browser://components`
-/// and `browser://media-internals`.
+/// Inspects either the Singularity roaming root (`<dir>/cef-profile`) or a direct CEF profile
+/// directory (`<dir>`) and reports Widevine CDM readiness for `browser://components` and
+/// `browser://media-internals`.
 pub fn inspect_widevine_status(cef_profile_dir: &Path) -> WidevineStatusReport {
-    let cdm_root = cef_profile_dir.join("WidevineCdm");
-    let manifest_path = cdm_root.join("manifest.json");
-    let version = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()));
+    let direct_root = cef_profile_dir.join("WidevineCdm");
+    let nested_root = cef_profile_dir.join("cef-profile").join("WidevineCdm");
+
+    let mut ready_dir: Option<PathBuf> = None;
+    let mut detected_version: Option<String> = None;
+
+    for cdm_root in [&direct_root, &nested_root] {
+        if existing_cef_widevine_is_valid(cdm_root) {
+            if let Some(valid_dir) = resolve_valid_cef_widevine_hint_dir(cdm_root) {
+                if let Some((ver, _)) = read_manifest_version(&valid_dir) {
+                    detected_version = Some(ver);
+                    ready_dir = Some(valid_dir);
+                    break;
+                }
+            }
+        } else if std::fs::symlink_metadata(
+            cdm_root.join("latest-component-updated-widevine-cdm"),
+        )
+        .is_err()
+        {
+            if let Some((ver, valid_dir)) = find_newest_widevine_candidate(&[cdm_root.clone()]) {
+                if read_manifest_version(&valid_dir).is_some() {
+                    detected_version = Some(ver);
+                    ready_dir = Some(valid_dir);
+                    break;
+                }
+            }
+        }
+    }
+
+    let cdm_path = ready_dir
+        .as_ref()
+        .map(|p| {
+            #[cfg(target_os = "windows")]
+            {
+                strip_win_verbatim_prefix(p)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                p.to_string_lossy().to_string()
+            }
+        })
+        .or_else(|| {
+            if nested_root.is_dir() {
+                Some(nested_root.to_string_lossy().to_string())
+            } else if direct_root.is_dir() {
+                Some(direct_root.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        });
+
     WidevineStatusReport {
-        cef_widevine_ready: version.is_some() || cdm_root.is_dir(),
-        detected_version: version,
-        cdm_path: if cdm_root.exists() {
-            Some(cdm_root.to_string_lossy().to_string())
-        } else {
-            None
-        },
+        cef_widevine_ready: ready_dir.is_some() && detected_version.is_some(),
+        detected_version,
+        cdm_path,
         supported_vmp_domains_count: VMP_DRM_DOMAINS.len(),
         playready_hybrid_available: cfg!(target_os = "windows"),
     }
@@ -1429,5 +1667,200 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&roaming);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_drm_frame_subresource_and_download_security_gates() {
+        use std::sync::Arc;
+
+        let allow_public_no_ads: DrmNavigationPolicyFn = Arc::new(|u: &str| {
+            !u.contains("doubleclick.net") && !u.contains("blocked-by-killswitch.test")
+        });
+        let deny_all_lockdown: DrmNavigationPolicyFn = Arc::new(|_u: &str| false);
+        let bind_port: u16 = 54321;
+
+        // 1. Subframe & subresource gate
+        assert!(windows_drm::is_allowed_drm_frame_or_resource_url(
+            "https://www.netflix.com/watch/123",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(windows_drm::is_allowed_drm_frame_or_resource_url(
+            "wss://push.netflix.com/socket",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(windows_drm::is_allowed_drm_frame_or_resource_url(
+            "blob:https://www.netflix.com/550e8400-e29b-41d4-a716-446655440000",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(windows_drm::is_allowed_drm_frame_or_resource_url(
+            "about:blank",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(windows_drm::is_allowed_drm_frame_or_resource_url(
+            "about:srcdoc",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(windows_drm::is_allowed_drm_frame_or_resource_url(
+            "data:image/svg+xml,<svg/>",
+            bind_port,
+            &allow_public_no_ads
+        ));
+
+        // Local IPC, file://, blob targeting local IPC, ad domains, and Lockdown/Kill-Switch MUST be blocked
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "http://127.0.0.1:54321/api/state",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "ws://127.0.0.1:54321/ws",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "blob:http://127.0.0.1:54321/550e8400",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "file:///C:/Windows/win.ini",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "https://ads.doubleclick.net/pixel.js",
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "https://www.netflix.com/watch/123",
+            bind_port,
+            &deny_all_lockdown
+        ));
+        assert!(!windows_drm::is_allowed_drm_frame_or_resource_url(
+            "wss://push.netflix.com/socket",
+            bind_port,
+            &deny_all_lockdown
+        ));
+
+        // 2. Download gate
+        assert!(windows_drm::is_allowed_drm_download(
+            "https://cdn.example.com/subtitles.vtt",
+            Path::new("C:\\Users\\test\\Downloads\\subtitles.vtt"),
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_download(
+            "http://127.0.0.1:54321/api/export",
+            Path::new("C:\\Users\\test\\Downloads\\export.json"),
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_download(
+            "file:///C:/Windows/System32/cmd.exe",
+            Path::new("C:\\Users\\test\\Downloads\\cmd.exe"),
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_download(
+            "https://cdn.example.com/update.exe",
+            Path::new("C:\\Users\\test\\Downloads\\update.bin"),
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_download(
+            "https://cdn.example.com/download?id=1",
+            Path::new("C:\\Users\\test\\Downloads\\dropper.ps1"),
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_download(
+            "blob:https://www.netflix.com/550e8400",
+            Path::new("C:\\Users\\test\\Downloads\\smuggled.html"),
+            bind_port,
+            &allow_public_no_ads
+        ));
+        assert!(!windows_drm::is_allowed_drm_download(
+            "https://cdn.example.com/subtitles.vtt",
+            Path::new("C:\\Users\\test\\Downloads\\subtitles.vtt"),
+            bind_port,
+            &deny_all_lockdown
+        ));
+    }
+
+    #[test]
+    fn test_inspect_widevine_status_and_hint_path_confinement() {
+        let make_cdm = |dir: &Path, ver: &str| {
+            let dll_dir = dir.join("_platform_specific").join("win_x64");
+            std::fs::create_dir_all(&dll_dir).expect("mkdir win_x64");
+            std::fs::write(
+                dir.join("manifest.json"),
+                serde_json::json!({ "version": ver }).to_string(),
+            )
+            .expect("write manifest");
+            std::fs::write(dll_dir.join("widevinecdm.dll"), b"MZ-dummy-cdm")
+                .expect("write dummy dll");
+        };
+
+        // 1. Empty WidevineCdm directory MUST NOT report ready
+        let empty_profile = unique_test_dir("wv_empty_dir");
+        std::fs::create_dir_all(empty_profile.join("WidevineCdm")).expect("mkdir WidevineCdm");
+        let rep = inspect_widevine_status(&empty_profile);
+        assert!(!rep.cef_widevine_ready);
+        assert!(rep.detected_version.is_none());
+
+        // 2. Manifest without DLL MUST NOT report ready
+        let no_dll_profile = unique_test_dir("wv_no_dll");
+        let no_dll_ver = no_dll_profile.join("WidevineCdm").join("4.10.2891.0");
+        std::fs::create_dir_all(&no_dll_ver).expect("mkdir ver");
+        std::fs::write(no_dll_ver.join("manifest.json"), r#"{"version":"4.10.2891.0"}"#)
+            .expect("write manifest");
+        let rep = inspect_widevine_status(&no_dll_profile);
+        assert!(!rep.cef_widevine_ready);
+
+        // 3. Roaming root (`<roaming>/cef-profile/WidevineCdm/<ver>`) with valid hint reports ready
+        let roaming = unique_test_dir("wv_roaming_valid");
+        let wv_root = roaming.join("cef-profile").join("WidevineCdm");
+        let ver_dir = wv_root.join("4.10.2934.0");
+        make_cdm(&ver_dir, "4.10.2934.0");
+        let hint_path = wv_root.join("latest-component-updated-widevine-cdm");
+        std::fs::write(
+            &hint_path,
+            serde_json::json!({ "Path": ver_dir.to_string_lossy() }).to_string(),
+        )
+        .expect("write valid hint");
+
+        assert!(existing_cef_widevine_is_valid(&wv_root));
+        let rep_roaming = inspect_widevine_status(&roaming);
+        assert!(rep_roaming.cef_widevine_ready);
+        assert_eq!(rep_roaming.detected_version.as_deref(), Some("4.10.2934.0"));
+
+        // Direct cef_profile_dir also works
+        let rep_direct = inspect_widevine_status(&roaming.join("cef-profile"));
+        assert!(rep_direct.cef_widevine_ready);
+        assert_eq!(rep_direct.detected_version.as_deref(), Some("4.10.2934.0"));
+
+        // 4. Hint pointing OUTSIDE widevine_root (even to a valid CDM dir) MUST be rejected
+        let outside = unique_test_dir("wv_outside_escape");
+        make_cdm(&outside, "4.10.9999.0");
+        std::fs::write(
+            &hint_path,
+            serde_json::json!({ "Path": outside.to_string_lossy() }).to_string(),
+        )
+        .expect("write escaped hint");
+        assert!(!existing_cef_widevine_is_valid(&wv_root));
+        let rep_escaped = inspect_widevine_status(&roaming);
+        assert!(!rep_escaped.cef_widevine_ready);
+
+        let _ = std::fs::remove_dir_all(&empty_profile);
+        let _ = std::fs::remove_dir_all(&no_dll_profile);
+        let _ = std::fs::remove_dir_all(&roaming);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -255,10 +255,18 @@ impl SingularityBrowserShell {
         let customization =
             CustomizationStore::load_from_path(&root_dir.join("customization.json"))
                 .unwrap_or_default();
-        let userscripts = UserscriptManager::open_at(&root_dir)
-            .unwrap_or_else(|_| UserscriptManager::open_at(&std::env::temp_dir().join("singularity-userscripts")).expect("temp userscripts"));
+        let userscripts = UserscriptManager::open_at(&root_dir).or_else(|_| {
+            quarantine_corrupt_store_file(&root_dir.join("userscripts").join("index.json"));
+            UserscriptManager::open_at(&root_dir)
+                .or_else(|_| UserscriptManager::open_at(&root_dir.join("recovery-userscripts")))
+        })?;
         let pwas = PwaRegistry::open_at(&root_dir)
-            .unwrap_or_else(|_| PwaRegistry::open_at(&std::env::temp_dir().join("singularity-pwas")).expect("temp pwas"));
+            .or_else(|_| {
+                quarantine_corrupt_store_file(&root_dir.join("apps").join("registry.json"));
+                PwaRegistry::open_at(&root_dir)
+                    .or_else(|_| PwaRegistry::open_at(&root_dir.join("recovery-pwas")))
+            })
+            .map_err(|e| format!("Failed to initialize PWA registry: {e}"))?;
         let mut translate_prefs = TranslationPrefs::default();
         if !roaming.profile.language.trim().is_empty() {
             translate_prefs.target_lang = roaming.profile.language.trim().to_ascii_lowercase();
@@ -591,5 +599,60 @@ impl SingularityBrowserShell {
 
     pub fn verified_vault_master_bytes(&self) -> Option<&[u8]> {
         self.verified_vault_master.as_deref().map(|v| v.as_slice())
+    }
+}
+
+fn quarantine_corrupt_store_file(path: &std::path::Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_file() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("store.json");
+            let backup = path.with_file_name(format!("{file_name}.corrupt.{ts}"));
+            let _ = std::fs::rename(path, backup);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_launch_at_dir_recovers_corrupt_userscripts_and_pwas_without_temp_fallback() {
+        let unique = format!(
+            "singularity_shell_corrupt_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("userscripts")).expect("mkdir userscripts");
+        std::fs::create_dir_all(root.join("apps")).expect("mkdir apps");
+        std::fs::write(root.join("userscripts").join("index.json"), b"{corrupt json")
+            .expect("write corrupt userscripts index");
+        std::fs::write(root.join("apps").join("registry.json"), b"{corrupt json")
+            .expect("write corrupt pwa registry");
+
+        let shell = SingularityBrowserShell::launch_at_dir(root.clone())
+            .expect("launch_at_dir must recover corrupt JSON stores without panicking");
+        assert!(
+            shell.userscripts.storage_dir().starts_with(&root),
+            "userscripts store must remain inside root_dir"
+        );
+        assert!(
+            shell.pwas.registry_path().starts_with(&root),
+            "pwa registry must remain inside root_dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

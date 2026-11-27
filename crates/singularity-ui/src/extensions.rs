@@ -22,7 +22,42 @@ use subtle::ConstantTimeEq;
 
 const MAX_CRX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB compressed package cap
 const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB total uncompressed cap
+const MAX_MANIFEST_JSON_BYTES: usize = 1024 * 1024; // 1 MiB manifest.json cap
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
+
+fn read_file_bounded(path: &Path, max_bytes: usize, size_err: &str) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed opening file: {}", e))?;
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > max_bytes as u64 {
+            return Err(size_err.to_string());
+        }
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Failed reading file: {}", e))?;
+    if buf.len() > max_bytes {
+        return Err(size_err.to_string());
+    }
+    Ok(buf)
+}
+
+fn read_reader_bounded_utf8<R: Read>(
+    reader: R,
+    max_bytes: usize,
+    size_err: &str,
+    read_err_prefix: &str,
+) -> Result<String, String> {
+    let mut buf = Vec::new();
+    reader
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: {}", read_err_prefix, e))?;
+    if buf.len() > max_bytes {
+        return Err(size_err.to_string());
+    }
+    String::from_utf8(buf).map_err(|e| format!("{}: invalid UTF-8 ({})", read_err_prefix, e))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -2524,9 +2559,13 @@ pub fn install_from_chrome_web_store(
         }
     }
 
-    let raw_bytes = std::fs::read(&tmp_crx)
-        .map_err(|e| format!("Failed reading downloaded CRX package: {}", e))?;
+    let raw_bytes = read_file_bounded(
+        &tmp_crx,
+        MAX_CRX_BYTES,
+        "Downloaded CRX package exceeds 32 MiB limit.",
+    );
     let _ = std::fs::remove_file(&tmp_crx);
+    let raw_bytes = raw_bytes?;
 
     if !raw_bytes.starts_with(b"Cr24") {
         return Err("Chrome Web Store download is not a signed CRX2/CRX3 package.".into());
@@ -2944,7 +2983,11 @@ pub fn install_from_local_path(
                 .map(Path::to_path_buf)
                 .ok_or_else(|| "Invalid manifest.json path (no parent folder).".to_string())?
         } else {
-            let raw = std::fs::read(&src).map_err(|e| format!("Failed reading file: {}", e))?;
+            let raw = read_file_bounded(
+                &src,
+                MAX_CRX_BYTES,
+                "Extension package is too large (> 32 MiB).",
+            )?;
             let id = if raw.starts_with(b"Cr24") {
                 let expected = explicit_id.filter(|s| is_chrome_store_id(s));
                 let verified = verify_crx_package(&raw, expected)?;
@@ -3495,23 +3538,36 @@ pub fn describe_extension_permissions(
 /// summary without permanently enabling the extension.
 pub fn stage_extension_for_review(source: &Path) -> Result<StagedExtensionReview, String> {
     let manifest_raw = if source.is_dir() {
-        std::fs::read_to_string(source.join("manifest.json"))
-            .map_err(|e| format!("Cannot read manifest.json: {}", e))?
+        let mf_path = source.join("manifest.json");
+        let mf_file = std::fs::File::open(&mf_path)
+            .map_err(|e| format!("Cannot read manifest.json: {}", e))?;
+        read_reader_bounded_utf8(
+            mf_file,
+            MAX_MANIFEST_JSON_BYTES,
+            "manifest.json exceeds 1 MiB limit",
+            "Cannot read manifest.json",
+        )?
     } else if source.is_file() {
-        let bytes = std::fs::read(source).map_err(|e| format!("Cannot read archive: {}", e))?;
-        if bytes.len() > MAX_CRX_BYTES {
-            return Err("Archive exceeds 32 MiB limit".to_string());
-        }
+        let bytes = read_file_bounded(source, MAX_CRX_BYTES, "Archive exceeds 32 MiB limit")
+            .map_err(|e| {
+                if e == "Archive exceeds 32 MiB limit" {
+                    e
+                } else {
+                    format!("Cannot read archive: {}", e)
+                }
+            })?;
         let zip_slice = extract_zip_slice_from_crx(&bytes).unwrap_or(&bytes);
         let mut archive = zip::ZipArchive::new(Cursor::new(zip_slice))
             .map_err(|e| format!("Invalid extension archive (.crx/.zip/.xpi): {}", e))?;
-        let mut mf = archive
+        let mf = archive
             .by_name("manifest.json")
             .map_err(|_| "Archive does not contain a root manifest.json".to_string())?;
-        let mut s = String::new();
-        mf.read_to_string(&mut s)
-            .map_err(|e| format!("Failed to read manifest.json from archive: {}", e))?;
-        s
+        read_reader_bounded_utf8(
+            mf,
+            MAX_MANIFEST_JSON_BYTES,
+            "manifest.json inside archive exceeds 1 MiB limit",
+            "Failed to read manifest.json from archive",
+        )?
     } else {
         return Err("Extension source path does not exist".to_string());
     };
@@ -3718,6 +3774,10 @@ pub fn parse_omaha_update_xml(xml: &str) -> Vec<ExtensionUpdateAvailable> {
         let app_tag = &rest[..app_tag_end];
         let app_id = extract_attr(app_tag, "appid").unwrap_or_default();
         let next_section_end = rest.find("</app>").unwrap_or(rest.len());
+        if app_tag_end > next_section_end {
+            rest = &rest[(app_tag_end + 1).min(rest.len())..];
+            continue;
+        }
         let app_body = &rest[app_tag_end..next_section_end];
         if let Some(uc_pos) = app_body.find("<updatecheck") {
             let uc_rest = &app_body[uc_pos..];
@@ -3728,9 +3788,13 @@ pub fn parse_omaha_update_xml(xml: &str) -> Vec<ExtensionUpdateAvailable> {
                     if let (Some(version), Some(codebase)) =
                         (extract_attr(uc_tag, "version"), extract_attr(uc_tag, "codebase"))
                     {
+                        let codebase = codebase.trim().to_string();
                         let sha256 = extract_attr(uc_tag, "hash_sha256")
                             .or_else(|| extract_attr(uc_tag, "fp"));
-                        if !app_id.is_empty() && !codebase.is_empty() {
+                        if !app_id.is_empty()
+                            && codebase.starts_with("https://")
+                            && codebase.len() > "https://".len()
+                        {
                             out.push(ExtensionUpdateAvailable {
                                 id: app_id,
                                 version,
@@ -4100,6 +4164,66 @@ mod tests {
             compare_extension_version_names("2.0.0_12", "2.0.0_2"),
             std::cmp::Ordering::Greater
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_parse_omaha_update_xml_malformed_tags_and_https_only() {
+        // Malformed tag where </app> appears before '>' must never panic
+        let malformed = r#"<gupdate><app appid="foo"</app>><updatecheck status="ok" version="1.0" codebase="https://clients2.googleusercontent.com/crx/a.crx"/></app></gupdate>"#;
+        let _ = parse_omaha_update_xml(malformed);
+
+        // Non-HTTPS codebase URLs (http, file, javascript) must be rejected; only https:// is accepted
+        let xml = r#"
+            <gupdate>
+                <app appid="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">
+                    <updatecheck status="ok" version="2.0" codebase="http://insecure.example.com/ext.crx"/>
+                </app>
+                <app appid="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb">
+                    <updatecheck status="ok" version="2.1" codebase="file:///etc/passwd"/>
+                </app>
+                <app appid="cccccccccccccccccccccccccccccccc">
+                    <updatecheck status="ok" version="2.2" codebase="https://clients2.googleusercontent.com/crx/ext.crx" hash_sha256="deadbeef"/>
+                </app>
+            </gupdate>
+        "#;
+        let updates = parse_omaha_update_xml(xml);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id, "cccccccccccccccccccccccccccccccc");
+        assert_eq!(
+            updates[0].codebase_url,
+            "https://clients2.googleusercontent.com/crx/ext.crx"
+        );
+        assert_eq!(updates[0].sha256.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn test_stage_extension_for_review_blocks_oversized_manifest_zip_bomb() {
+        let tmp = std::env::temp_dir().join(format!(
+            "singularity-ext-bomb-{}-{}",
+            std::process::id(),
+            random_hex_nonce()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let bomb_zip_path = tmp.join("bomb.zip");
+        {
+            let file = std::fs::File::create(&bomb_zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("manifest.json", opts).unwrap();
+            // Highly compressible > 1 MiB manifest payload (tiny on disk, > 1 MiB decompressed)
+            let oversized = vec![b' '; MAX_MANIFEST_JSON_BYTES + 64];
+            zw.write_all(&oversized).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let err = stage_extension_for_review(&bomb_zip_path)
+            .expect_err("oversized manifest.json inside ZIP must be rejected");
+        assert!(err.contains("1 MiB"), "unexpected error: {err}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

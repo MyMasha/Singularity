@@ -7,10 +7,39 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const PACK_SIGNING_DOMAIN: &[u8] = b"SINGULARITY-TRANSLATE-PACK-V1";
+const MAX_PACK_MANIFEST_BYTES: u64 = 1024 * 1024; // 1 MiB
+const MAX_PACK_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+
+fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, TranslateError> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(TranslateError::InvalidPackJson(
+            "Refused symlink or non-regular translation pack file".to_string(),
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(TranslateError::PackSizeMismatch {
+            expected: max_bytes,
+            actual: meta.len(),
+        });
+    }
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if (buf.len() as u64) > max_bytes {
+        return Err(TranslateError::PackSizeMismatch {
+            expected: max_bytes,
+            actual: buf.len() as u64,
+        });
+    }
+    Ok(buf)
+}
 
 #[derive(Debug, Error)]
 pub enum TranslateError {
@@ -457,22 +486,29 @@ impl OfflineTranslationEngine {
 
     /// Scans `<root>/models/translate/` and loads all `.pack.json` packs that pass
     /// strict Ed25519 + SHA-256 verification against `trusted_pubkey_hex`.
+    /// Symlinks, oversized files, and individually corrupted/untrusted packs are skipped
+    /// without aborting loading of remaining valid packs.
     pub fn load_verified_packs_from_disk(
         &mut self,
         root: &Path,
         trusted_pubkey_hex: &str,
     ) -> Result<usize, TranslateError> {
         let dir = OfflineLanguagePack::models_translate_dir(root);
-        if !dir.exists() {
+        let dir_meta = match fs::symlink_metadata(&dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(TranslateError::Io(e)),
+        };
+        if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
             return Ok(0);
         }
+
         let mut loaded = 0usize;
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
+        for entry_res in fs::read_dir(&dir)? {
+            let Ok(entry) = entry_res else {
                 continue;
-            }
+            };
+            let path = entry.path();
             let is_manifest = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -480,13 +516,27 @@ impl OfflineTranslationEngine {
             if !is_manifest {
                 continue;
             }
-            let manifest_bytes = fs::read(&path)?;
-            let pack: OfflineLanguagePack = serde_json::from_slice(&manifest_bytes)
-                .map_err(|e| TranslateError::InvalidPackJson(e.to_string()))?;
-            let payload_path = pack.payload_path(root)?;
-            let payload_bytes = fs::read(&payload_path)?;
-            pack.verify_payload(&payload_bytes, trusted_pubkey_hex)?;
-            self.load_table_json(&payload_bytes)?;
+            let Ok(manifest_bytes) = read_regular_file_bounded(&path, MAX_PACK_MANIFEST_BYTES)
+            else {
+                continue;
+            };
+            let Ok(pack) = serde_json::from_slice::<OfflineLanguagePack>(&manifest_bytes) else {
+                continue;
+            };
+            let Ok(payload_path) = pack.payload_path(root) else {
+                continue;
+            };
+            let Ok(payload_bytes) =
+                read_regular_file_bounded(&payload_path, MAX_PACK_PAYLOAD_BYTES)
+            else {
+                continue;
+            };
+            if pack.verify_payload(&payload_bytes, trusted_pubkey_hex).is_err() {
+                continue;
+            }
+            if self.load_table_json(&payload_bytes).is_err() {
+                continue;
+            }
             self.installed_packs.insert(pack.id.clone(), pack);
             loaded += 1;
         }
@@ -570,17 +620,29 @@ fn split_inline_markup(input: &str) -> Vec<MarkupSegment<'_>> {
 
     while i < bytes.len() {
         if bytes[i] == b'<' {
-            // Check if this looks like an inline HTML/XML tag: `<tag...>` or `</tag>`
-            if let Some(rel_end) = input[i + 1..].find('>') {
-                let candidate = &input[i..=i + 1 + rel_end];
-                if is_inline_html_tag(candidate) {
-                    if i > text_start {
-                        segments.push(MarkupSegment::Text(&input[text_start..i]));
+            // Pre-check that the character after optional '/' is ASCII alphabetic before scanning
+            // for '>' so inputs like `"<<<<<...>"` stay strictly O(N).
+            let maybe_tag_start = input[i + 1..]
+                .trim_start_matches('/')
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphabetic());
+            if maybe_tag_start {
+                // Check if this looks like an inline HTML/XML tag: `<tag...>` or `</tag>`
+                if let Some(rel_end) = input[i + 1..].find('>') {
+                    let candidate = &input[i..=i + 1 + rel_end];
+                    if is_inline_html_tag(candidate) {
+                        if i > text_start {
+                            segments.push(MarkupSegment::Text(&input[text_start..i]));
+                        }
+                        segments.push(MarkupSegment::Tag(candidate));
+                        i = i + 1 + rel_end + 1;
+                        text_start = i;
+                        continue;
                     }
-                    segments.push(MarkupSegment::Tag(candidate));
-                    i = i + 1 + rel_end + 1;
-                    text_start = i;
-                    continue;
+                } else {
+                    // No closing '>' remains anywhere in the input: consume the rest in O(N).
+                    break;
                 }
             }
         }
@@ -1488,4 +1550,122 @@ fn builtin_en_de() -> LexiconPair {
             ("encrypted", "verschlüsselt"),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "singularity_translate_engine_{label}_{}_{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn split_inline_markup_handles_unclosed_angle_brackets_in_linear_time() {
+        let unclosed_tags = "<a".repeat(25_000);
+        let segs = split_inline_markup(&unclosed_tags);
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(segs[0], MarkupSegment::Text(t) if t.len() == 50_000));
+
+        let repeated_lt_then_gt = format!("{}>", "<".repeat(25_000));
+        let segs2 = split_inline_markup(&repeated_lt_then_gt);
+        assert_eq!(segs2.len(), 1);
+        assert!(matches!(segs2[0], MarkupSegment::Text(t) if t.len() == 25_001));
+
+        let mixed = "Bonjour <b>monde</b> <unclosed <still unclosed";
+        let segs3 = split_inline_markup(mixed);
+        assert_eq!(segs3.len(), 5);
+        assert!(matches!(segs3[1], MarkupSegment::Tag("<b>")));
+        assert!(matches!(segs3[3], MarkupSegment::Tag("</b>")));
+        assert!(matches!(segs3[4], MarkupSegment::Text(" <unclosed <still unclosed")));
+    }
+
+    #[test]
+    fn load_verified_packs_skips_corrupted_and_oversized_packs_individually() {
+        let root = unique_temp_root("skip_bad");
+        let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let trusted_pub = hex::encode(signing_key.verifying_key().as_bytes());
+        let untrusted_key = SigningKey::from_bytes(&[0x99u8; 32]);
+
+        let mut words = BTreeMap::new();
+        words.insert("ciao".to_string(), "hello".to_string());
+        let valid_table = LocalTranslationTable {
+            source_lang: "it".to_string(),
+            target_lang: "en".to_string(),
+            phrases: BTreeMap::new(),
+            words,
+        };
+        let valid_payload = serde_json::to_vec(&valid_table).unwrap();
+        let valid_pack = OfflineLanguagePack::create_signed(
+            "it",
+            "en",
+            "1.0.0",
+            &valid_payload,
+            &signing_key,
+        )
+        .unwrap();
+
+        // Install a valid pack first
+        let mut installer = OfflineTranslationEngine::default();
+        installer
+            .install_and_load_verified_pack(&root, valid_pack, &valid_payload, &trusted_pub)
+            .unwrap();
+
+        let dir = OfflineLanguagePack::models_translate_dir(&root);
+
+        // Drop a corrupted JSON manifest
+        fs::write(dir.join("00-corrupt.pack.json"), b"{not valid json").unwrap();
+
+        // Drop an untrusted signed pack
+        let mut bad_words = BTreeMap::new();
+        bad_words.insert("ola".to_string(), "hi".to_string());
+        let bad_table = LocalTranslationTable {
+            source_lang: "pt".to_string(),
+            target_lang: "en".to_string(),
+            phrases: BTreeMap::new(),
+            words: bad_words,
+        };
+        let bad_payload = serde_json::to_vec(&bad_table).unwrap();
+        let bad_pack = OfflineLanguagePack::create_signed(
+            "pt",
+            "en",
+            "1.0.0",
+            &bad_payload,
+            &untrusted_key,
+        )
+        .unwrap();
+        fs::write(dir.join("pt-en.json"), &bad_payload).unwrap();
+        fs::write(
+            dir.join("pt-en.pack.json"),
+            serde_json::to_vec(&bad_pack).unwrap(),
+        )
+        .unwrap();
+
+        // Drop an oversized manifest (> 1 MiB)
+        fs::write(
+            dir.join("zz-oversized.pack.json"),
+            vec![b' '; (MAX_PACK_MANIFEST_BYTES as usize) + 64],
+        )
+        .unwrap();
+
+        let mut reloaded = OfflineTranslationEngine::default();
+        let count = reloaded
+            .load_verified_packs_from_disk(&root, &trusted_pub)
+            .expect("must skip invalid packs and load valid ones");
+        assert_eq!(count, 1);
+        assert_eq!(reloaded.translate_text("it", "en", "ciao").unwrap(), "hello");
+        assert!(reloaded.translate_text("pt", "en", "ola").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

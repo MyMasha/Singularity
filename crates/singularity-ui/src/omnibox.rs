@@ -1696,7 +1696,9 @@ pub fn parse_opensearch_xml(xml: &str) -> Result<SearchEngineEntry, OmniboxError
         let mut inner_params = Vec::new();
         let next_cursor = if self_closing {
             open_tag_end + 1
-        } else if let Some(rel_close) = find_xml_close_tag(&xml[open_tag_end + 1..], "Url") {
+        } else if let Some((rel_close, close_len)) =
+            find_xml_close_tag(&xml[open_tag_end + 1..], "Url")
+        {
             let body = &xml[open_tag_end + 1..open_tag_end + 1 + rel_close];
             let mut pcur = 0usize;
             while let Some(ps) = find_xml_open_tag(&body[pcur..], "Param") {
@@ -1714,7 +1716,7 @@ pub fn parse_opensearch_xml(xml: &str) -> Result<SearchEngineEntry, OmniboxError
                     break;
                 }
             }
-            open_tag_end + 1 + rel_close + 6
+            open_tag_end + 1 + rel_close + close_len
         } else {
             open_tag_end + 1
         };
@@ -1829,18 +1831,25 @@ fn find_xml_open_tag(haystack: &str, tag_name: &str) -> Option<usize> {
     None
 }
 
-fn find_xml_close_tag(haystack: &str, tag_name: &str) -> Option<usize> {
+fn find_xml_close_tag(haystack: &str, tag_name: &str) -> Option<(usize, usize)> {
     let lower = haystack.to_ascii_lowercase();
     let target = format!("</{}>", tag_name.to_ascii_lowercase());
     if let Some(pos) = lower.find(&target) {
-        return Some(pos);
+        return Some((pos, target.len()));
     }
     // Also check namespace-prefixed close tags like </os:ShortName>
     let suff = format!(":{}>", tag_name.to_ascii_lowercase());
-    if let Some(pos) = lower.find(&suff) {
+    let mut search_from = 0usize;
+    while let Some(rel_pos) = lower[search_from..].find(&suff) {
+        let pos = search_from + rel_pos;
         if let Some(open) = lower[..pos].rfind("</") {
-            return Some(open);
+            let prefix = &lower[open + 2..pos];
+            if !prefix.is_empty() && !prefix.contains(['<', '>', '/', ' ', '\t', '\r', '\n']) {
+                let end = pos + suff.len();
+                return Some((open, end - open));
+            }
         }
+        search_from = pos + suff.len();
     }
     None
 }
@@ -1852,7 +1861,7 @@ fn extract_xml_tag_text<'a>(xml: &'a str, tag_name: &str) -> Option<&'a str> {
         return Some("");
     }
     let body = &xml[open_end + 1..];
-    let close_rel = find_xml_close_tag(body, tag_name)?;
+    let (close_rel, _) = find_xml_close_tag(body, tag_name)?;
     Some(&body[..close_rel])
 }
 
@@ -3419,7 +3428,14 @@ enum MathToken {
     Comma,
 }
 
+const MAX_MATH_INPUT_BYTES: usize = 512;
+const MAX_MATH_TOKENS: usize = 256;
+const MAX_MATH_DEPTH: usize = 64;
+
 fn tokenize_math(input: &str) -> Option<Vec<MathToken>> {
+    if input.len() > MAX_MATH_INPUT_BYTES {
+        return None;
+    }
     let chars: Vec<char> = input.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -3429,6 +3445,9 @@ fn tokenize_math(input: &str) -> Option<Vec<MathToken>> {
         if c.is_whitespace() {
             i += 1;
             continue;
+        }
+        if tokens.len() >= MAX_MATH_TOKENS {
+            return None;
         }
         if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
         {
@@ -3516,16 +3535,28 @@ impl<'a> MathParser<'a> {
 
     /// Additive expression, including `85 + 20%` -> `85 * 1.2` and `100 - 15%` -> `85`.
     fn parse_expr(&mut self) -> Option<f64> {
-        self.depth += 1;
-        if self.depth > 64 {
+        if self.depth >= MAX_MATH_DEPTH {
             return None;
         }
-        let mut lhs = self.parse_term()?;
+        self.depth += 1;
+        let mut lhs = match self.parse_term() {
+            Some(v) => v,
+            None => {
+                self.depth -= 1;
+                return None;
+            }
+        };
         while let Some(tok) = self.peek().cloned() {
             match tok {
                 MathToken::Plus | MathToken::Minus => {
                     self.next_tok();
-                    let (rhs, was_pct) = self.parse_term_with_pct_flag()?;
+                    let (rhs, was_pct) = match self.parse_term_with_pct_flag() {
+                        Some(pair) => pair,
+                        None => {
+                            self.depth -= 1;
+                            return None;
+                        }
+                    };
                     if was_pct {
                         if tok == MathToken::Plus {
                             lhs += lhs * rhs;
@@ -3608,28 +3639,43 @@ impl<'a> MathParser<'a> {
     }
 
     fn parse_power_with_pct_flag(&mut self) -> Option<(f64, bool)> {
-        let (base, is_pct) = self.parse_unary_with_pct_flag()?;
-        if matches!(self.peek(), Some(MathToken::Caret)) {
-            self.next_tok();
-            let exp = self.parse_power()?; // right-associative
-            return Some((base.powf(exp), false));
+        if self.depth >= MAX_MATH_DEPTH {
+            return None;
         }
-        Some((base, is_pct))
+        self.depth += 1;
+        let res = match self.parse_unary_with_pct_flag() {
+            Some((base, is_pct)) => {
+                if matches!(self.peek(), Some(MathToken::Caret)) {
+                    self.next_tok();
+                    self.parse_power().map(|exp| (base.powf(exp), false))
+                } else {
+                    Some((base, is_pct))
+                }
+            }
+            None => None,
+        };
+        self.depth -= 1;
+        res
     }
 
     fn parse_unary_with_pct_flag(&mut self) -> Option<(f64, bool)> {
-        match self.peek() {
+        if self.depth >= MAX_MATH_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let res = match self.peek() {
             Some(MathToken::Plus) => {
                 self.next_tok();
                 self.parse_unary_with_pct_flag()
             }
             Some(MathToken::Minus) => {
                 self.next_tok();
-                let (v, p) = self.parse_unary_with_pct_flag()?;
-                Some((-v, p))
+                self.parse_unary_with_pct_flag().map(|(v, p)| (-v, p))
             }
             _ => self.parse_postfix(),
-        }
+        };
+        self.depth -= 1;
+        res
     }
 
     fn parse_postfix(&mut self) -> Option<(f64, bool)> {
@@ -4994,6 +5040,25 @@ mod tests {
             parse_search_suggestions_json(ddg_json),
             vec!["singularity browser", "singularity physics"]
         );
+
+        // Prefixed close tag with multi-byte UTF-8 namespace prefix (`</abcé:Url>`: byte +6 is mid-UTF-8!)
+        let prefixed_utf8_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <os:OpenSearchDescription xmlns:abcé="http://a9.com/-/spec/opensearch/1.1/">
+            <abcé:ShortName>UTF8 Prefixed</abcé:ShortName>
+            <abcé:Url type="text/html" method="POST" template="https://utf8.singularity.test/search">
+                <abcé:Param name="q" value="{searchTerms}"/>
+            </abcé:Url>
+            <abcé:Url type="application/x-suggestions+json" template="https://utf8.singularity.test/ac?q={searchTerms}"/>
+        </os:OpenSearchDescription>"#;
+        let prefixed_entry =
+            parse_opensearch_xml(prefixed_utf8_xml).expect("valid UTF-8 prefixed OpenSearch XML");
+        assert_eq!(prefixed_entry.name, "UTF8 Prefixed");
+        assert_eq!(prefixed_entry.method, SearchHttpMethod::Post);
+        assert_eq!(prefixed_entry.post_params.len(), 1);
+        assert_eq!(
+            prefixed_entry.suggest_url_template.as_deref(),
+            Some("https://utf8.singularity.test/ac?q={searchTerms}")
+        );
     }
 
     #[test]
@@ -5225,5 +5290,24 @@ mod tests {
 
         let tts = engine.query("github.com", &ctx);
         assert!(tts.tab_to_search_hint.is_some());
+    }
+
+    #[test]
+    fn test_math_parser_depth_and_input_bounds_prevent_stack_overflow() {
+        // Legitimate unary & right-associative power still work
+        assert_eq!(eval_math_expr("---5"), Some(-5.0));
+        assert_eq!(eval_math_expr("2^3^2"), Some(512.0));
+
+        // Excessive unary chain within input byte cap is stopped by depth guard
+        let deep_unary = format!("{}1", "-".repeat(120));
+        assert!(eval_math_expr(&deep_unary).is_none());
+
+        // Huge unary chain is rejected immediately by input byte cap
+        let huge_unary = format!("{}1", "-".repeat(20_000));
+        assert!(eval_math_expr(&huge_unary).is_none());
+
+        // Excessive right-associative exponent chain is stopped by depth guard
+        let deep_power = format!("{}2", "2^".repeat(80));
+        assert!(eval_math_expr(&deep_power).is_none());
     }
 }

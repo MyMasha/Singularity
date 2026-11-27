@@ -3341,7 +3341,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.3</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.4</div>
         </div>
       </aside>
 
@@ -10834,6 +10834,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       if (!modal || !iframe) return;
       closeAllV3Popups(true);
       if (title) title.textContent = "browser://" + clean;
+      iframe.removeAttribute("srcdoc");
       iframe.src = "/browser/" + encodeURIComponent(clean);
       modal.classList.add("open");
       syncOverlayState(false);
@@ -10881,7 +10882,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       } else if (targetUrl) {
         const inp = byId("omnibar-input");
         if (inp) inp.value = targetUrl;
-        if (typeof submitOmnibar === "function") submitOmnibar(targetUrl);
+        if (typeof navigateInput === "function") navigateInput(targetUrl);
       }
     }
 
@@ -11169,7 +11170,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
           (r.children || []).forEach((n) => {
             const row = mk("div", "omni-item");
             row.appendChild(mk("div", "omni-item-title", (n.kind === "folder" ? "📁 " : "★ ") + (n.title || n.url || "")));
-            row.addEventListener("click", () => { if (n.url && typeof submitOmnibar === "function") submitOmnibar(n.url); });
+            row.addEventListener("click", () => { if (n.url && typeof navigateInput === "function") navigateInput(n.url); });
             body.appendChild(row);
           });
         } else if (sbTab === "history") {
@@ -11181,7 +11182,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
             main.appendChild(mk("div", "omni-item-title", h.title || h.url));
             main.appendChild(mk("div", "omni-item-sub", h.domain || h.url));
             row.appendChild(main);
-            row.addEventListener("click", () => { if (typeof submitOmnibar === "function") submitOmnibar(h.url); });
+            row.addEventListener("click", () => { if (typeof navigateInput === "function") navigateInput(h.url); });
             body.appendChild(row);
           });
         } else if (sbTab === "downloads") {
@@ -11343,7 +11344,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       const t = getActiveTab();
       const title = (t && t.title) || "Singularity Reader Mode";
       const url = (t && t.url) || "https://singularity.browser";
-      const sampleHtml = "<article><h1>" + title + "</h1><p>Distraction-free OLED Pure Black Reader Mode with WCAG AAA contrast, OpenDyslexic support, and Line Focus.</p></article>";
+      const sampleHtml = "<article><h1>" + escapeHtml(title) + "</h1><p>Distraction-free OLED Pure Black Reader Mode with WCAG AAA contrast, OpenDyslexic support, and Line Focus.</p></article>";
       const r = await apiJson("/api/reader/extract", "POST", { url, html: sampleHtml, theme: "oled" });
       const modal = byId("v3-internal-frame-modal");
       const iframe = byId("v3-internal-iframe");
@@ -11501,6 +11502,54 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
     byId("command-palette-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(false); });
     byId("tab-search-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeAllV3Popups(false); });
     byId("v3-internal-frame-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeInternalPage(); });
+
+    // Authenticated postMessage relay for sandboxed browser:// pages inside #v3-internal-iframe
+    window.addEventListener("message", async (ev) => {
+      const iframe = byId("v3-internal-iframe");
+      if (!iframe || !iframe.contentWindow || ev.source !== iframe.contentWindow) return;
+      if (iframe.hasAttribute("srcdoc")) return;
+      const msg = ev.data;
+      if (!msg || typeof msg !== "object" || msg.type !== "sg-internal-api") return;
+      if (typeof msg.path !== "string" || !msg.path.startsWith("/api/")) return;
+      const reqId = msg.reqId;
+      const reply = (payload) => {
+        try {
+          ev.source.postMessage(Object.assign({ type: "sg-internal-api-reply", reqId }, payload), "*");
+        } catch (_) {}
+      };
+      try {
+        const method = (typeof msg.method === "string" && msg.method.trim())
+          ? msg.method.trim().toUpperCase()
+          : "POST";
+        const bodyData = msg.payload !== undefined ? msg.payload : msg.body;
+        let res;
+        if (method === "GET" || method === "HEAD") {
+          res = await apiFetch(msg.path, { method });
+        } else if (method === "POST" && typeof bodyData !== "string") {
+          res = await apiPost(msg.path, bodyData !== undefined ? bodyData : {});
+        } else {
+          const opts = { method };
+          if (bodyData !== undefined) {
+            opts.headers = { "Content-Type": "application/json" };
+            opts.body = typeof bodyData === "string" ? bodyData : JSON.stringify(bodyData);
+          }
+          res = await apiFetch(msg.path, opts);
+        }
+        const rawText = await res.text();
+        let data = rawText;
+        try {
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch (_) {
+          data = rawText;
+        }
+        const errMsg = res.ok
+          ? null
+          : ((data && typeof data === "object" && data.error) ? String(data.error) : (rawText || ("HTTP " + res.status)));
+        reply({ ok: res.ok, status: res.status, data, error: errMsg });
+      } catch (err) {
+        reply({ ok: false, status: 0, data: null, error: String(err) });
+      }
+    });
     document.querySelectorAll(".v3-sb-tab[data-sb]").forEach((b) => b.addEventListener("click", () => renderSidebarPanel(b.dataset.sb)));
     document.querySelectorAll("[data-perf-preset]").forEach((b) => b.addEventListener("click", async () => {
       await apiJson("/api/performance/profile", "POST", { preset: b.dataset.perfPreset });
@@ -11723,6 +11772,110 @@ body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.2
       spinReload: () => triggerOneShot(document.getElementById("btn-reload-page"), "spinning", 640),
       popBookmarkStar: () => triggerOneShot(document.getElementById("btn-bookmark-star"), "star-pop", 560),
     };
+  })();
+
+  // Hard drop guard on `ui_browser`: prevents Chromium's default drop-to-navigate from ever
+  // replacing the chrome shell (tabs, omnibar, window controls) when a link/file/image is dropped.
+  // Tab drag-and-drop uses Pointer Events and is completely unaffected.
+  (function wireUiBrowserDropGuard() {
+    function isEditableDropTarget(target) {
+      if (!target || target.nodeType !== 1) return false;
+      const el = target.closest ? target.closest("input, textarea, [contenteditable]") : target;
+      if (!el) return false;
+      const tag = (el.tagName || "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA") {
+        return !el.disabled && !el.readOnly;
+      }
+      return el.isContentEditable === true || el.getAttribute("contenteditable") === "true";
+    }
+
+    function isFileInputTarget(target) {
+      return !!(target && target.nodeType === 1 && target.tagName === "INPUT" && target.type === "file");
+    }
+
+    function isSafeExternalHttpUrl(raw) {
+      if (!raw || !/^https?:\/\//i.test(raw)) return false;
+      try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+        if (window.location && window.location.origin && parsed.origin === window.location.origin) {
+          return false;
+        }
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function extractDroppedHttpUrl(dt) {
+      if (!dt) return "";
+      try {
+        const uriList = dt.getData("text/uri-list") || "";
+        if (uriList) {
+          const lines = uriList.split(/\r?\n/);
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line || line.startsWith("#")) continue;
+            return isSafeExternalHttpUrl(line) ? line : "";
+          }
+        }
+        const plain = (dt.getData("text/plain") || "").trim();
+        if (plain && /^https?:\/\/\S+$/i.test(plain) && isSafeExternalHttpUrl(plain)) {
+          return plain;
+        }
+      } catch (_) {}
+      return "";
+    }
+
+    window.addEventListener("dragover", (e) => {
+      const target = e.target;
+      if (isFileInputTarget(target)) return;
+      const dt = e.dataTransfer;
+      const types = dt && dt.types ? Array.from(dt.types) : [];
+      const hasFiles = types.includes("Files");
+      const hasTextOrUri = types.includes("text/uri-list") || types.includes("text/plain");
+      if (isEditableDropTarget(target) && !(hasFiles && !hasTextOrUri)) {
+        return;
+      }
+      e.preventDefault();
+      if (dt) {
+        try {
+          dt.dropEffect = (hasFiles && !hasTextOrUri) ? "none" : (hasTextOrUri ? "link" : "none");
+        } catch (_) {}
+      }
+    }, true);
+
+    window.addEventListener("drop", (e) => {
+      const target = e.target;
+      if (isFileInputTarget(target)) return;
+      const dt = e.dataTransfer;
+      const droppedUrl = extractDroppedHttpUrl(dt);
+      const isOmni = !!(target && target.closest && target.closest("#omnibar-input"));
+      const hasFiles = !!(dt && dt.files && dt.files.length > 0);
+
+      if (isEditableDropTarget(target)) {
+        if (isOmni && droppedUrl) {
+          e.preventDefault();
+          e.stopPropagation();
+          const omniEl = target.closest("#omnibar-input");
+          if (omniEl) omniEl.value = droppedUrl;
+          navigateInput(droppedUrl);
+          return;
+        }
+        if (hasFiles && !droppedUrl) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        return;
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      if (droppedUrl) {
+        createNewTab(droppedUrl);
+      }
+    }, true);
   })();
 
   sendNativeIpc({ cmd: "ui_ready" });

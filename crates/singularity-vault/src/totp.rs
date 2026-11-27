@@ -13,7 +13,7 @@ use sha2::{Sha256, Sha512};
 use std::fmt;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
@@ -626,7 +626,7 @@ fn read_protobuf_varint(buf: &[u8], pos: &mut usize) -> Result<u64, TotpError> {
         }
         let byte = buf[*pos];
         *pos += 1;
-        if shift >= 64 {
+        if shift >= 64 || (shift == 63 && (byte & 0x7F) > 1) {
             return Err(TotpError::InvalidMigrationPayload(
                 "Protobuf varint overflow".into(),
             ));
@@ -639,6 +639,26 @@ fn read_protobuf_varint(buf: &[u8], pos: &mut usize) -> Result<u64, TotpError> {
     }
 }
 
+fn read_protobuf_len_delimited<'a>(
+    buf: &'a [u8],
+    pos: &mut usize,
+    field_label: &str,
+) -> Result<&'a [u8], TotpError> {
+    let raw_len = read_protobuf_varint(buf, pos)?;
+    let len = usize::try_from(raw_len).map_err(|_| {
+        TotpError::InvalidMigrationPayload(format!("Overflowing length in {}", field_label))
+    })?;
+    let end = pos
+        .checked_add(len)
+        .filter(|&end| end <= buf.len())
+        .ok_or_else(|| {
+            TotpError::InvalidMigrationPayload(format!("Truncated {}", field_label))
+        })?;
+    let slice = &buf[*pos..end];
+    *pos = end;
+    Ok(slice)
+}
+
 fn skip_protobuf_field(buf: &[u8], pos: &mut usize, wire_type: u64) -> Result<(), TotpError> {
     match wire_type {
         0 => {
@@ -646,31 +666,27 @@ fn skip_protobuf_field(buf: &[u8], pos: &mut usize, wire_type: u64) -> Result<()
             Ok(())
         }
         1 => {
-            if *pos + 8 > buf.len() {
-                return Err(TotpError::InvalidMigrationPayload(
-                    "Truncated 64-bit protobuf field".into(),
-                ));
-            }
-            *pos += 8;
+            let end = pos
+                .checked_add(8)
+                .filter(|&end| end <= buf.len())
+                .ok_or_else(|| {
+                    TotpError::InvalidMigrationPayload("Truncated 64-bit protobuf field".into())
+                })?;
+            *pos = end;
             Ok(())
         }
         2 => {
-            let len = read_protobuf_varint(buf, pos)? as usize;
-            if *pos + len > buf.len() {
-                return Err(TotpError::InvalidMigrationPayload(
-                    "Truncated length-delimited protobuf field".into(),
-                ));
-            }
-            *pos += len;
+            let _ = read_protobuf_len_delimited(buf, pos, "length-delimited protobuf field")?;
             Ok(())
         }
         5 => {
-            if *pos + 4 > buf.len() {
-                return Err(TotpError::InvalidMigrationPayload(
-                    "Truncated 32-bit protobuf field".into(),
-                ));
-            }
-            *pos += 4;
+            let end = pos
+                .checked_add(4)
+                .filter(|&end| end <= buf.len())
+                .ok_or_else(|| {
+                    TotpError::InvalidMigrationPayload("Truncated 32-bit protobuf field".into())
+                })?;
+            *pos = end;
             Ok(())
         }
         other => Err(TotpError::InvalidMigrationPayload(format!(
@@ -682,7 +698,7 @@ fn skip_protobuf_field(buf: &[u8], pos: &mut usize, wire_type: u64) -> Result<()
 
 fn decode_migration_otp_parameters(buf: &[u8]) -> Result<OtpAuthConfig, TotpError> {
     let mut pos = 0usize;
-    let mut secret_bytes: Vec<u8> = Vec::new();
+    let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     let mut name = String::new();
     let mut issuer = String::new();
     let mut algorithm = TotpAlgorithm::Sha1;
@@ -697,41 +713,25 @@ fn decode_migration_otp_parameters(buf: &[u8]) -> Result<OtpAuthConfig, TotpErro
 
         match (field_number, wire_type) {
             (1, 2) => {
-                let len = read_protobuf_varint(buf, &mut pos)? as usize;
-                if pos + len > buf.len() {
-                    secret_bytes.zeroize();
-                    return Err(TotpError::InvalidMigrationPayload(
-                        "Truncated secret bytes".into(),
-                    ));
-                }
-                secret_bytes = buf[pos..pos + len].to_vec();
-                pos += len;
+                let slice = read_protobuf_len_delimited(buf, &mut pos, "secret bytes")?;
+                secret_bytes.zeroize();
+                secret_bytes.extend_from_slice(slice);
             }
             (2, 2) => {
-                let len = read_protobuf_varint(buf, &mut pos)? as usize;
-                if pos + len > buf.len() {
-                    secret_bytes.zeroize();
-                    return Err(TotpError::InvalidMigrationPayload(
-                        "Truncated account name".into(),
-                    ));
-                }
-                name = String::from_utf8(buf[pos..pos + len].to_vec()).map_err(|_| {
-                    TotpError::InvalidMigrationPayload("Invalid UTF-8 in account name".into())
-                })?;
-                pos += len;
+                let slice = read_protobuf_len_delimited(buf, &mut pos, "account name")?;
+                name = std::str::from_utf8(slice)
+                    .map_err(|_| {
+                        TotpError::InvalidMigrationPayload("Invalid UTF-8 in account name".into())
+                    })?
+                    .to_string();
             }
             (3, 2) => {
-                let len = read_protobuf_varint(buf, &mut pos)? as usize;
-                if pos + len > buf.len() {
-                    secret_bytes.zeroize();
-                    return Err(TotpError::InvalidMigrationPayload(
-                        "Truncated issuer".into(),
-                    ));
-                }
-                issuer = String::from_utf8(buf[pos..pos + len].to_vec()).map_err(|_| {
-                    TotpError::InvalidMigrationPayload("Invalid UTF-8 in issuer".into())
-                })?;
-                pos += len;
+                let slice = read_protobuf_len_delimited(buf, &mut pos, "issuer")?;
+                issuer = std::str::from_utf8(slice)
+                    .map_err(|_| {
+                        TotpError::InvalidMigrationPayload("Invalid UTF-8 in issuer".into())
+                    })?
+                    .to_string();
             }
             (4, 0) => {
                 let alg = read_protobuf_varint(buf, &mut pos)?;
@@ -740,7 +740,6 @@ fn decode_migration_otp_parameters(buf: &[u8]) -> Result<OtpAuthConfig, TotpErro
                     2 => TotpAlgorithm::Sha256,
                     3 => TotpAlgorithm::Sha512,
                     other => {
-                        secret_bytes.zeroize();
                         return Err(TotpError::UnsupportedAlgorithm(format!(
                             "Google Authenticator algorithm enum {}",
                             other
@@ -754,8 +753,9 @@ fn decode_migration_otp_parameters(buf: &[u8]) -> Result<OtpAuthConfig, TotpErro
                     0 | 1 => 6,
                     2 => 8,
                     other => {
-                        secret_bytes.zeroize();
-                        return Err(TotpError::InvalidDigits(other as u32));
+                        return Err(TotpError::InvalidDigits(
+                            u32::try_from(other).unwrap_or(u32::MAX),
+                        ));
                     }
                 };
             }
@@ -839,14 +839,16 @@ pub fn parse_otpauth_migration_uri(uri: &str) -> Result<Vec<OtpAuthConfig>, Totp
     })?;
     let cleaned: String = b64_str.chars().filter(|c| !c.is_whitespace()).collect();
 
-    let mut proto_bytes = BASE64_STD
-        .decode(&cleaned)
-        .or_else(|_| BASE64_STD_NO_PAD.decode(&cleaned))
-        .or_else(|_| URL_SAFE.decode(&cleaned))
-        .or_else(|_| URL_SAFE_NO_PAD.decode(&cleaned))
-        .map_err(|_| {
-            TotpError::InvalidMigrationPayload("Invalid Base64 data parameter".into())
-        })?;
+    let proto_bytes = Zeroizing::new(
+        BASE64_STD
+            .decode(&cleaned)
+            .or_else(|_| BASE64_STD_NO_PAD.decode(&cleaned))
+            .or_else(|_| URL_SAFE.decode(&cleaned))
+            .or_else(|_| URL_SAFE_NO_PAD.decode(&cleaned))
+            .map_err(|_| {
+                TotpError::InvalidMigrationPayload("Invalid Base64 data parameter".into())
+            })?,
+    );
 
     let mut pos = 0usize;
     let mut accounts = Vec::new();
@@ -856,21 +858,14 @@ pub fn parse_otpauth_migration_uri(uri: &str) -> Result<Vec<OtpAuthConfig>, Totp
         let wire_type = tag & 0x07;
         match (field_number, wire_type) {
             (1, 2) => {
-                let len = read_protobuf_varint(&proto_bytes, &mut pos)? as usize;
-                if pos + len > proto_bytes.len() {
-                    proto_bytes.zeroize();
-                    return Err(TotpError::InvalidMigrationPayload(
-                        "Truncated OtpParameters entry".into(),
-                    ));
-                }
-                let entry = decode_migration_otp_parameters(&proto_bytes[pos..pos + len])?;
+                let entry_bytes =
+                    read_protobuf_len_delimited(&proto_bytes, &mut pos, "OtpParameters entry")?;
+                let entry = decode_migration_otp_parameters(entry_bytes)?;
                 accounts.push(entry);
-                pos += len;
             }
             _ => skip_protobuf_field(&proto_bytes, &mut pos, wire_type)?,
         }
     }
-    proto_bytes.zeroize();
 
     if accounts.is_empty() {
         return Err(TotpError::InvalidMigrationPayload(
@@ -1082,5 +1077,53 @@ mod tests {
         assert_eq!(imported[1].account_name, "bob@corp.example");
         assert_eq!(imported[1].kind, OtpKind::Hotp { counter: 42 });
         assert_eq!(imported[1].digits, 6);
+    }
+
+    #[test]
+    fn test_migration_protobuf_rejects_varint_length_overflow_without_panic() {
+        // 0x0A (field 1, wire type 2) + 10-byte varint encoding u64::MAX
+        let poc_uri = "otpauth-migration://offline?data=Cv//////////AQ==";
+        assert!(matches!(
+            parse_otpauth_migration_uri(poc_uri),
+            Err(TotpError::InvalidMigrationPayload(_))
+        ));
+
+        // Unknown length-delimited field (0x12) with u64::MAX length exercises skip_protobuf_field
+        let mut unknown_overflow = vec![0x12];
+        encode_varint(u64::MAX, &mut unknown_overflow);
+        let skip_uri = format!(
+            "otpauth-migration://offline?data={}",
+            percent_encode(&BASE64_STD.encode(&unknown_overflow))
+        );
+        assert!(matches!(
+            parse_otpauth_migration_uri(&skip_uri),
+            Err(TotpError::InvalidMigrationPayload(_))
+        ));
+
+        // Truncated 64-bit (wire type 1) and 32-bit (wire type 5) unknown fields
+        for raw in [vec![0x11, 0x01], vec![0x15, 0x01]] {
+            let uri = format!(
+                "otpauth-migration://offline?data={}",
+                percent_encode(&BASE64_STD.encode(&raw))
+            );
+            assert!(matches!(
+                parse_otpauth_migration_uri(&uri),
+                Err(TotpError::InvalidMigrationPayload(_))
+            ));
+        }
+
+        // Overflowing secret length inside an OtpParameters submessage
+        let mut inner = vec![0x0A];
+        encode_varint(u64::MAX, &mut inner);
+        let mut outer = Vec::new();
+        encode_len_delim(1, &inner, &mut outer);
+        let inner_uri = format!(
+            "otpauth-migration://offline?data={}",
+            percent_encode(&BASE64_STD.encode(&outer))
+        );
+        assert!(matches!(
+            parse_otpauth_migration_uri(&inner_uri),
+            Err(TotpError::InvalidMigrationPayload(_))
+        ));
     }
 }

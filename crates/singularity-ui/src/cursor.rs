@@ -143,17 +143,19 @@ impl CustomCursorEngine {
     }
 
     fn is_safe_cursor_uri(uri: &str) -> bool {
-        let trimmed = uri.trim();
-        if trimmed.is_empty() || trimmed.len() > 2048 {
+        if uri.is_empty() || uri.len() > 2048 {
             return false;
         }
-        if trimmed.chars().any(|c| {
-            matches!(c, '\'' | '"' | '(' | ')' | '\\' | '{' | '}' | '\r' | '\n' | '\0')
-                || c.is_control()
+        if uri.chars().any(|c| {
+            matches!(
+                c,
+                '<' | '>' | '\'' | '"' | '(' | ')' | '\\' | '{' | '}' | '\r' | '\n' | '\0'
+            ) || c.is_control()
+                || c.is_whitespace()
         }) {
             return false;
         }
-        let lower = trimmed.to_ascii_lowercase();
+        let lower = uri.to_ascii_lowercase();
         if lower.starts_with("data:image/") {
             const ALLOWED_DATA_PREFIXES: &[&str] = &[
                 "data:image/png;base64,",
@@ -169,7 +171,7 @@ impl CustomCursorEngine {
             else {
                 return false;
             };
-            let payload = &trimmed[prefix.len()..];
+            let payload = &uri[prefix.len()..];
             return !payload.is_empty()
                 && payload
                     .bytes()
@@ -179,7 +181,7 @@ impl CustomCursorEngine {
         if !allowed_scheme {
             return false;
         }
-        !trimmed.contains(';')
+        !uri.contains(';')
     }
 
     /// Registers a per-domain custom cursor override rule (rejects unsafe CSS-injectable URIs).
@@ -227,5 +229,56 @@ impl CustomCursorEngine {
 
     pub fn trail_samples(&self) -> &VecDeque<CursorTrailSample> {
         &self.trail_ring_buffer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_cursor_uri_rejects_css_injection_and_whitespace() {
+        // Valid URIs
+        assert!(CustomCursorEngine::is_safe_cursor_uri(
+            "https://cdn.example.com/cursors/pointer_v2.cur"
+        ));
+        assert!(CustomCursorEngine::is_safe_cursor_uri(
+            "singularity://cursors/active.svg"
+        ));
+        assert!(CustomCursorEngine::is_safe_cursor_uri(
+            "data:image/png;base64,iVBORw0KGgo="
+        ));
+
+        // Forbidden characters in https:// and singularity:// URIs
+        for bad in [
+            "https://example.com/a<b.cur",
+            "https://example.com/a>b.cur",
+            "https://example.com/a\"b.cur",
+            "https://example.com/a'b.cur",
+            "https://example.com/a\\b.cur",
+            "https://example.com/a(b.cur",
+            "https://example.com/a)b.cur",
+            "https://example.com/a;b.cur",
+            "https://example.com/a b.cur",
+            "https://example.com/a\tb.cur",
+            "https://example.com/a\u{00A0}b.cur",
+            "https://example.com/a\u{3000}b.cur",
+            " https://example.com/a.cur",
+            "singularity://cursors/a<style>.svg",
+            "singularity://cursors/a>b.svg",
+            "singularity://cursors/a;b.svg",
+            "singularity://cursors/a b.svg",
+            "singularity://cursors/a\u{2003}b.svg",
+            "singularity://cursors/a\"b.svg",
+            "singularity://cursors/a'b.svg",
+            "singularity://cursors/a\\b.svg",
+            "singularity://cursors/a(b).svg",
+        ] {
+            assert!(
+                !CustomCursorEngine::is_safe_cursor_uri(bad),
+                "URI must be rejected: {:?}",
+                bad
+            );
+        }
     }
 }

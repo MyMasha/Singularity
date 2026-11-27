@@ -23,6 +23,7 @@ $AllowedDownloadHosts = @(
     "release-assets.githubusercontent.com",
     "github-releases.githubusercontent.com"
 )
+$MaxUpdateRedirects = 5
 
 function Test-ReparsePoint {
     param([Parameter(Mandatory = $true)][string]$PathToCheck)
@@ -45,6 +46,9 @@ function Assert-AllowedHttpsUrl {
     if ($uri.Scheme -ne "https") {
         throw "Refused non-HTTPS URL for ${Label}: $Url"
     }
+    if (-not $uri.IsDefaultPort -and $uri.Port -ne 443) {
+        throw "Refused non-443 HTTPS port '$($uri.Port)' for ${Label}: $Url"
+    }
     if (-not [string]::IsNullOrEmpty($uri.UserInfo)) {
         throw "Refused URL containing embedded credentials for ${Label}."
     }
@@ -52,6 +56,123 @@ function Assert-AllowedHttpsUrl {
     if ($AllowedDownloadHosts -notcontains $hostLower) {
         throw "Refused untrusted download host '$hostLower' for ${Label}."
     }
+}
+
+function Resolve-AllowedRedirectUrl {
+    param(
+        [Parameter(Mandatory = $true)][string]$CurrentUrl,
+        [Parameter(Mandatory = $true)][string]$Location,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if ([string]::IsNullOrWhiteSpace($Location) -or $Location -match '[\x00-\x1F\x7F]') {
+        throw "Refused malformed redirect Location header for ${Label}."
+    }
+    $baseUri = [System.Uri]$CurrentUrl
+    $nextUri = $null
+    if (-not [System.Uri]::TryCreate($baseUri, $Location.Trim(), [ref]$nextUri)) {
+        throw "Refused unparseable redirect Location '$Location' for ${Label}."
+    }
+    $resolved = $nextUri.AbsoluteUri
+    Assert-AllowedHttpsUrl -Url $resolved -Label "${Label} redirect"
+    return $resolved
+}
+
+function Invoke-AllowedHttpsRequest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [hashtable]$Headers = @{},
+        [string]$OutFile = "",
+        [int]$TimeoutSec = 30
+    )
+    Assert-AllowedHttpsUrl -Url $Url -Label $Label
+    $initialUri = [System.Uri]$Url
+    $currentUrl = $Url
+
+    for ($hop = 0; $hop -le $MaxUpdateRedirects; $hop++) {
+        Assert-AllowedHttpsUrl -Url $currentUrl -Label $Label
+        $curUri = [System.Uri]$currentUrl
+        $sameOrigin = ($curUri.Scheme -eq $initialUri.Scheme) -and
+            ($curUri.Host.ToLowerInvariant() -eq $initialUri.Host.ToLowerInvariant()) -and
+            ($curUri.Port -eq $initialUri.Port)
+
+        $req = [System.Net.HttpWebRequest]::Create($currentUrl)
+        $req.Method = "GET"
+        $req.AllowAutoRedirect = $false
+        $req.Timeout = $TimeoutSec * 1000
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.UserAgent = $Ua
+
+        foreach ($k in $Headers.Keys) {
+            if ($k -ieq "User-Agent") {
+                $req.UserAgent = [string]$Headers[$k]
+            } elseif ($k -ieq "Accept") {
+                $req.Accept = [string]$Headers[$k]
+            } elseif ($k -ieq "Authorization") {
+                if ($sameOrigin) {
+                    $req.Headers.Add("Authorization", [string]$Headers[$k])
+                }
+            } else {
+                $req.Headers.Add($k, [string]$Headers[$k])
+            }
+        }
+
+        $resp = $null
+        try {
+            try {
+                $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+            } catch [System.Net.WebException] {
+                if ($null -ne $_.Exception.Response) {
+                    $resp = [System.Net.HttpWebResponse]$_.Exception.Response
+                } else {
+                    throw
+                }
+            }
+
+            $status = [int]$resp.StatusCode
+            if ($status -in @(301, 302, 303, 307, 308)) {
+                $loc = $resp.Headers["Location"]
+                if ([string]::IsNullOrWhiteSpace($loc)) {
+                    throw "Redirect response ($status) missing Location header for ${Label}."
+                }
+                if ($hop -ge $MaxUpdateRedirects) {
+                    throw "Too many HTTP redirects (exceeded maximum of $MaxUpdateRedirects hops) for ${Label}."
+                }
+                $currentUrl = Resolve-AllowedRedirectUrl -CurrentUrl $currentUrl -Location $loc -Label $Label
+                continue
+            }
+
+            if ($status -lt 200 -or $status -ge 300) {
+                throw "HTTP request failed with status $status for ${Label}."
+            }
+
+            $stream = $resp.GetResponseStream()
+            try {
+                if (-not [string]::IsNullOrEmpty($OutFile)) {
+                    $fs = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                    try {
+                        $stream.CopyTo($fs)
+                    } finally {
+                        $fs.Dispose()
+                    }
+                    return $null
+                } else {
+                    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                    try {
+                        return $reader.ReadToEnd()
+                    } finally {
+                        $reader.Dispose()
+                    }
+                }
+            } finally {
+                if ($null -ne $stream) { $stream.Dispose() }
+            }
+        } finally {
+            if ($null -ne $resp) { $resp.Close() }
+        }
+    }
+
+    throw "Too many HTTP redirects (exceeded maximum of $MaxUpdateRedirects hops) for ${Label}."
 }
 
 function Resolve-SafeInstallDir {
@@ -107,28 +228,114 @@ function ConvertTo-Win32QuotedArg {
     return $sb.ToString()
 }
 
-function Parse-SemVer {
-    param([Parameter(Mandatory = $true)][string]$VerText)
-    if ($VerText -match 'v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?') {
-        return @{
-            Major = [int]$Matches[1]
-            Minor = [int]$Matches[2]
-            Patch = [int]$Matches[3]
-            Pre   = if ($Matches[4]) { $Matches[4] } else { "" }
+function Parse-StrictSemVer {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$VerText)
+    $trimmed = $VerText.Trim()
+    if ($trimmed -match '^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$') {
+        [uint64]$maj = 0; [uint64]$min = 0; [uint64]$pat = 0
+        if ([uint64]::TryParse($Matches[1], [ref]$maj) -and
+            [uint64]::TryParse($Matches[2], [ref]$min) -and
+            [uint64]::TryParse($Matches[3], [ref]$pat)) {
+            $norm = if ($trimmed.StartsWith("v")) { $trimmed.Substring(1) } else { $trimmed }
+            return @{
+                Major      = $maj
+                Minor      = $min
+                Patch      = $pat
+                Pre        = if ($Matches[4]) { $Matches[4] } else { "" }
+                Normalized = $norm
+            }
         }
     }
     return $null
 }
 
+function Parse-SemVer {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$VerText)
+    $strict = Parse-StrictSemVer -VerText $VerText
+    if ($null -ne $strict) { return $strict }
+    if ($VerText -match 'v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?') {
+        [uint64]$maj = 0; [uint64]$min = 0; [uint64]$pat = 0
+        if ([uint64]::TryParse($Matches[1], [ref]$maj) -and
+            [uint64]::TryParse($Matches[2], [ref]$min) -and
+            [uint64]::TryParse($Matches[3], [ref]$pat)) {
+            $preStr = if ($Matches[4]) { $Matches[4] } else { "" }
+            return @{
+                Major      = $maj
+                Minor      = $min
+                Patch      = $pat
+                Pre        = $preStr
+                Normalized = if ($preStr) { "$maj.$min.$pat-$preStr" } else { "$maj.$min.$pat" }
+            }
+        }
+    }
+    return $null
+}
+
+function Compare-SemVerPrerelease {
+    param([string]$A, [string]$B)
+    $partsA = $A.Split('.')
+    $partsB = $B.Split('.')
+    $maxLen = [Math]::Max($partsA.Length, $partsB.Length)
+    for ($i = 0; $i -lt $maxLen; $i++) {
+        if ($i -ge $partsA.Length) { return -1 }
+        if ($i -ge $partsB.Length) { return 1 }
+        $sa = $partsA[$i]
+        $sb = $partsB[$i]
+        $aNum = $sa -match '^[0-9]+$'
+        $bNum = $sb -match '^[0-9]+$'
+        if ($aNum -and $bNum) {
+            $na = $sa.TrimStart('0')
+            $nb = $sb.TrimStart('0')
+            if ($na.Length -ne $nb.Length) {
+                return $(if ($na.Length -lt $nb.Length) { -1 } else { 1 })
+            }
+            $c = [string]::Compare($na, $nb, [System.StringComparison]::Ordinal)
+            if ($c -ne 0) { return $(if ($c -lt 0) { -1 } else { 1 }) }
+        } elseif ($aNum -and -not $bNum) {
+            return -1
+        } elseif (-not $aNum -and $bNum) {
+            return 1
+        } else {
+            $c = [string]::Compare($sa, $sb, [System.StringComparison]::Ordinal)
+            if ($c -ne 0) { return $(if ($c -lt 0) { -1 } else { 1 }) }
+        }
+    }
+    return 0
+}
+
 function Compare-SemVer {
     param($A, $B)
+    if ($null -eq $A -or $null -eq $B) {
+        throw "Refusing SemVer comparison on malformed version."
+    }
     foreach ($k in @("Major", "Minor", "Patch")) {
         if ($A[$k] -lt $B[$k]) { return -1 }
         if ($A[$k] -gt $B[$k]) { return 1 }
     }
+    if ([string]::IsNullOrEmpty($A.Pre) -and [string]::IsNullOrEmpty($B.Pre)) { return 0 }
     if ([string]::IsNullOrEmpty($A.Pre) -and -not [string]::IsNullOrEmpty($B.Pre)) { return 1 }
     if (-not [string]::IsNullOrEmpty($A.Pre) -and [string]::IsNullOrEmpty($B.Pre)) { return -1 }
-    return [string]::Compare($A.Pre, $B.Pre, [System.StringComparison]::Ordinal)
+    return (Compare-SemVerPrerelease -A $A.Pre -B $B.Pre)
+}
+
+function Get-SignedReleaseHeaderVersion {
+    param([Parameter(Mandatory = $true)][string]$SumsText)
+    $found = $null
+    foreach ($line in ($SumsText -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '(?i)^#\s*Singularity-Release\s*:\s*(.*)$') {
+            if ($null -ne $found) {
+                throw "Duplicate '# Singularity-Release:' header in SHA256SUMS.txt. Update aborted."
+            }
+            $verVal = $Matches[1].Trim()
+            $parsed = Parse-StrictSemVer -VerText $verVal
+            if ($null -eq $parsed) {
+                throw "Malformed '# Singularity-Release:' SemVer header '$verVal' in SHA256SUMS.txt. Update aborted."
+            }
+            $found = @{ Raw = $verVal; SemVer = $parsed }
+        }
+    }
+    return $found
 }
 
 function New-PrivateUpdateWorkDir {
@@ -419,32 +626,40 @@ if ($Token -and $Token.Trim().Length -gt 0) {
 
 Write-Host "[1/5] Checking latest public release at https://github.com/$Repo ..." -ForegroundColor Gray
 try {
-    $release = Invoke-RestMethod -Uri $ApiUrl -Headers $apiHeaders -UseBasicParsing -TimeoutSec 15
+    $releaseJson = Invoke-AllowedHttpsRequest -Url $ApiUrl -Label "GitHub Releases API" -Headers $apiHeaders -TimeoutSec 15
+    $release = $releaseJson | ConvertFrom-Json
 } catch {
     if ($apiHeaders.ContainsKey("Authorization")) {
         $apiHeaders.Remove("Authorization")
-        $release = Invoke-RestMethod -Uri $ApiUrl -Headers $apiHeaders -UseBasicParsing -TimeoutSec 15
+        $releaseJson = Invoke-AllowedHttpsRequest -Url $ApiUrl -Label "GitHub Releases API" -Headers $apiHeaders -TimeoutSec 15
+        $release = $releaseJson | ConvertFrom-Json
     } else {
         throw
     }
 }
 
-$tag = [string]$release.tag_name
-if (-not ($tag -match '^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$')) {
+$tag = ([string]$release.tag_name).Trim()
+$tagSem = Parse-StrictSemVer -VerText $tag
+if ($null -eq $tagSem) {
     throw "Invalid GitHub release SemVer tag: $tag"
 }
 Write-Host "      Release found: $tag" -ForegroundColor Green
 
 # Anti-downgrade check against currently installed singularity.exe (when present)
+$installedSemVer = $null
+$installedVerStr = $null
 $existingExe = Join-Path $SafeInstallDir "singularity.exe"
 if ((Test-Path -LiteralPath $existingExe) -and -not (Test-ReparsePoint -PathToCheck $existingExe)) {
     try {
         $fvi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($existingExe)
         $curStr = if ($fvi.ProductVersion) { $fvi.ProductVersion } else { $fvi.FileVersion }
         $curSem = Parse-SemVer -VerText ([string]$curStr)
-        $newSem = Parse-SemVer -VerText $tag
-        if ($null -ne $curSem -and $null -ne $newSem -and (Compare-SemVer $newSem $curSem) -lt 0) {
-            throw "Refusing downgrade from installed version $curStr to older release $tag."
+        if ($null -ne $curSem) {
+            $installedSemVer = $curSem
+            $installedVerStr = [string]$curStr
+            if ((Compare-SemVer $tagSem $curSem) -lt 0) {
+                throw "Refusing downgrade from installed version $curStr to older release $tag."
+            }
         }
     } catch {
         if ($_.Exception.Message -like "Refusing downgrade*") { throw }
@@ -475,10 +690,10 @@ $SigFile = Join-Path $WorkDir "SHA256SUMS.txt.sig"
 
 try {
     Write-Host "[2/5] Downloading release artifacts into private per-user staging folder..." -ForegroundColor Gray
-    Invoke-WebRequest -Uri $setupAsset.browser_download_url -Headers $pubHeaders -OutFile $SetupExe -UseBasicParsing -TimeoutSec 180
-    Invoke-WebRequest -Uri $sumAsset.browser_download_url -Headers $pubHeaders -OutFile $SumsFile -UseBasicParsing -TimeoutSec 30
+    Invoke-AllowedHttpsRequest -Url $setupAsset.browser_download_url -Label "Singularity-setup.exe" -Headers $pubHeaders -OutFile $SetupExe -TimeoutSec 180 | Out-Null
+    Invoke-AllowedHttpsRequest -Url $sumAsset.browser_download_url -Label "SHA256SUMS.txt" -Headers $pubHeaders -OutFile $SumsFile -TimeoutSec 30 | Out-Null
     if (-not [string]::IsNullOrWhiteSpace($EffectivePubKeyHex)) {
-        Invoke-WebRequest -Uri $sigAsset.browser_download_url -Headers $pubHeaders -OutFile $SigFile -UseBasicParsing -TimeoutSec 30
+        Invoke-AllowedHttpsRequest -Url $sigAsset.browser_download_url -Label "SHA256SUMS.txt.sig" -Headers $pubHeaders -OutFile $SigFile -TimeoutSec 30 | Out-Null
     }
 
     $sumsBytes = [System.IO.File]::ReadAllBytes($SumsFile)
@@ -491,9 +706,23 @@ try {
         Write-Host "[3/5] Skipping Ed25519 check (-AllowUnsigned explicitly enabled)." -ForegroundColor Yellow
     }
 
+    $sumsText = [System.Text.Encoding]::UTF8.GetString($sumsBytes)
+    $signedHeader = Get-SignedReleaseHeaderVersion -SumsText $sumsText
+    $signedHeaderCutoff = Parse-StrictSemVer -VerText "3.0.3"
+    if ($null -ne $signedHeader) {
+        if ((Compare-SemVer $signedHeader.SemVer $tagSem) -ne 0 -or $signedHeader.SemVer.Normalized -ne $tagSem.Normalized) {
+            throw "Signed SHA256SUMS.txt release version '$($signedHeader.Raw)' does not match advertised GitHub release tag '$tag' (possible rollback attack). Update aborted."
+        }
+        if ($null -ne $installedSemVer -and (Compare-SemVer $signedHeader.SemVer $installedSemVer) -lt 0) {
+            throw "Refusing downgrade from installed version $installedVerStr to signed release $($signedHeader.Raw)."
+        }
+        Write-Host "      Signed release version verified: $($signedHeader.Raw)" -ForegroundColor Green
+    } elseif (-not [string]::IsNullOrWhiteSpace($EffectivePubKeyHex) -and (Compare-SemVer $tagSem $signedHeaderCutoff) -gt 0) {
+        throw "Signed SHA256SUMS.txt is missing mandatory '# Singularity-Release:' version header for release $tag (possible rollback attack). Update aborted."
+    }
+
     Write-Host "[4/5] Verifying SHA-256 cryptographic integrity..." -ForegroundColor Gray
     $expectedHash = $null
-    $sumsText = [System.Text.Encoding]::UTF8.GetString($sumsBytes)
     foreach ($line in ($sumsText -split "`r?`n")) {
         if ($line -match '^\s*([A-Fa-f0-9]{64})\s+\*?Singularity-setup\.exe\s*$') {
             $expectedHash = $Matches[1].ToLowerInvariant()

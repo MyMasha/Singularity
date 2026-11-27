@@ -647,7 +647,10 @@ impl RuleOptions {
 }
 
 fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix_lower: &str) -> Option<&'a str> {
-    if s.len() >= prefix_lower.len() && s[..prefix_lower.len()].eq_ignore_ascii_case(prefix_lower) {
+    if s.len() >= prefix_lower.len()
+        && s.is_char_boundary(prefix_lower.len())
+        && s[..prefix_lower.len()].eq_ignore_ascii_case(prefix_lower)
+    {
         Some(&s[prefix_lower.len()..])
     } else {
         None
@@ -3168,5 +3171,17 @@ mod tests {
         assert_eq!(engine.recent_log_events().len(), MAX_SHIELD_LOG_EVENTS);
         engine.clear_log();
         assert!(engine.recent_log_events().is_empty());
+    }
+
+    #[test]
+    fn test_strip_ascii_prefix_ci_non_ascii_boundary_safe() {
+        assert_eq!(
+            strip_ascii_prefix_ci("DOMAIN=example.com", "domain="),
+            Some("example.com")
+        );
+        // Multi-byte UTF-8 input where prefix_lower.len() lands mid-character must return None, not panic
+        assert_eq!(strip_ascii_prefix_ci("\u{00E9}\u{00E9}\u{00E9}\u{00E9}", "domain="), None);
+        let mut engine = UBlockNetworkEngine::new();
+        let _ = engine.load_filter_list_text("example.com$\u{00E9}\u{00E9}\u{00E9}\u{00E9}");
     }
 }

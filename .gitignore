@@ -1,4 +1,5 @@
 /target/
+/.cef-sdk/
 **/*.rs.bk
 *.singularity-vault
 .singularity/

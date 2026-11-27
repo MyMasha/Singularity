@@ -21,16 +21,17 @@ pub struct ParsedHttpUrl {
 pub struct WinHttpResponse {
     pub status_code: u16,
     pub location: Option<String>,
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
 /// Parses an `http://` or `https://` URL (case-insensitive scheme) into host, port, and
-/// path+query components. Rejects embedded userinfo (`@`), control characters, non-HTTP schemes,
-/// and empty hosts.
+/// path+query components. Rejects embedded userinfo (`@`), whitespace/control characters,
+/// non-HTTP schemes, and empty hosts.
 pub fn parse_http_url_parts(raw_url: &str) -> Result<ParsedHttpUrl, String> {
     let trimmed = raw_url.trim();
-    if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f) {
-        return Err("URL contains invalid control characters".into());
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err("URL contains invalid control characters or whitespace".into());
     }
     let (scheme, rest) = trimmed
         .split_once("://")
@@ -219,7 +220,32 @@ pub fn is_remote_ip_allowed(
 }
 
 /// Official Win32 `WINHTTP_OPTION_CONNECTION_INFO` option ID (`winhttp.h` = 93).
+#[allow(dead_code)]
 pub(crate) const WINHTTP_OPTION_CONNECTION_INFO: u32 = 93;
+
+/// Official Win32 `WINHTTP_QUERY_CONTENT_TYPE` info level (`winhttp.h` = 1).
+#[allow(dead_code)]
+pub(crate) const WINHTTP_QUERY_CONTENT_TYPE: u32 = 1;
+
+/// Parses a WinHTTP status callback IP string (`LPWSTR` from `CONNECTING_TO_SERVER` /
+/// `CONNECTED_TO_SERVER` / `NAME_RESOLVED`), stripping optional IPv6 brackets `[...]`,
+/// ports, and IPv6 zone indices (`%scope`), and normalizing IPv4-mapped IPv6 addresses.
+#[allow(dead_code)]
+pub(crate) fn parse_winhttp_callback_ip_str(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(sa) = trimmed.parse::<std::net::SocketAddr>() {
+        return Some(normalize_ip_addr(sa.ip()));
+    }
+    let unbracketed = trimmed.trim_start_matches('[').trim_end_matches(']');
+    let ip_part = unbracketed.split('%').next().unwrap_or(unbracketed).trim();
+    if ip_part.is_empty() {
+        return None;
+    }
+    ip_part.parse::<IpAddr>().ok().map(normalize_ip_addr)
+}
 
 /// Exact Win32 `SOCKADDR_STORAGE` layout (128 bytes, 8-byte aligned) used by
 /// `WINHTTP_CONNECTION_INFO` (`WINHTTP_OPTION_CONNECTION_INFO = 93`).
@@ -324,20 +350,32 @@ pub fn resolve_http_redirect(base_url: &str, location: &str) -> Option<String> {
 mod win32_impl {
     use super::{
         is_public_routable_ip, is_remote_ip_allowed, is_same_origin, normalize_ip_addr,
-        parse_http_url_parts, parse_win32_sockaddr_storage_ip, resolve_http_redirect,
-        Win32SockAddrStorage, Win32WinHttpConnectionInfo, WinHttpResponse,
-        WINHTTP_OPTION_CONNECTION_INFO,
+        parse_http_url_parts, parse_win32_sockaddr_storage_ip, parse_winhttp_callback_ip_str,
+        resolve_http_redirect, Win32SockAddrStorage, Win32WinHttpConnectionInfo, WinHttpResponse,
+        WINHTTP_OPTION_CONNECTION_INFO, WINHTTP_QUERY_CONTENT_TYPE,
     };
     use rand_core::{OsRng, RngCore};
     use std::ffi::c_void;
     use std::io::Write;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, ToSocketAddrs};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     type HInternet = *mut c_void;
+    type WinHttpStatusCallback = Option<
+        unsafe extern "system" fn(
+            h_internet: HInternet,
+            dw_context: usize,
+            dw_internet_status: u32,
+            lpv_status_information: *const c_void,
+            dw_status_information_length: u32,
+        ),
+    >;
 
     const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
     const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+    const WINHTTP_OPTION_CONTEXT_VALUE: u32 = 45;
     const WINHTTP_OPTION_SECURE_PROTOCOLS: u32 = 84;
     const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
     const WINHTTP_OPTION_REDIRECT_POLICY_NEVER: u32 = 0;
@@ -351,6 +389,11 @@ mod win32_impl {
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x2000_0000;
     const WINHTTP_ADDREQ_FLAG_REPLACE: u32 = 0x8000_0000;
+    const WINHTTP_CALLBACK_STATUS_NAME_RESOLVED: u32 = 0x0000_0002;
+    const WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER: u32 = 0x0000_0004;
+    const WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER: u32 = 0x0000_0008;
+    const WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING: u32 = 0x0000_0800;
+    const WINHTTP_INVALID_STATUS_CALLBACK: usize = usize::MAX;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -394,6 +437,12 @@ mod win32_impl {
             lp_buffer: *const c_void,
             dw_buffer_length: u32,
         ) -> i32;
+        fn WinHttpSetStatusCallback(
+            h_internet: HInternet,
+            lpfn_internet_callback: WinHttpStatusCallback,
+            dw_notification_flags: u32,
+            dw_reserved: usize,
+        ) -> usize;
         fn WinHttpQueryOption(
             h_internet: HInternet,
             dw_option: u32,
@@ -443,6 +492,213 @@ mod win32_impl {
                 }
             }
         }
+    }
+
+    /// Shared anti-SSRF / anti-DNS-rebinding context attached to each WinHTTP request handle
+    /// via `WINHTTP_OPTION_CONTEXT_VALUE` and `WinHttpSetStatusCallback`.
+    /// Lifetime is reference-counted with `Arc` so WinHTTP's reference is released strictly on
+    /// `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING` (if aborted in-callback) or in
+    /// `RequestHandleGuard::drop` (after uninstalling the callback on normal synchronous exit).
+    struct WinHttpIpGuardContext {
+        is_https: bool,
+        pinned_ip: Option<IpAddr>,
+        allowed_ip_check: Option<fn(IpAddr) -> bool>,
+        blocked: AtomicBool,
+        handle_closed: AtomicBool,
+        raw_ctx_released: AtomicBool,
+        blocked_reason: Mutex<Option<String>>,
+    }
+
+    struct RequestHandleGuard {
+        handle: HInternet,
+        ctx: Arc<WinHttpIpGuardContext>,
+        raw_ctx: usize,
+    }
+
+    impl Drop for RequestHandleGuard {
+        fn drop(&mut self) {
+            if !self.handle.is_null() && !self.ctx.handle_closed.swap(true, Ordering::AcqRel) {
+                unsafe {
+                    let _ = WinHttpSetStatusCallback(self.handle, None, 0, 0);
+                    let _ = WinHttpCloseHandle(self.handle);
+                }
+                if !self.ctx.raw_ctx_released.swap(true, Ordering::AcqRel) {
+                    unsafe {
+                        drop(Arc::from_raw(self.raw_ctx as *const WinHttpIpGuardContext));
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe fn parse_winhttp_status_ip_wstr(ptr: *const c_void, info_len: u32) -> Option<IpAddr> {
+        if ptr.is_null() || info_len == 0 {
+            return None;
+        }
+        let wptr = ptr as *const u16;
+        let max_units = (info_len as usize).min(256);
+        let mut buf = [0u16; 256];
+        let mut len = 0usize;
+        while len < max_units {
+            let ch = core::ptr::read_unaligned(wptr.add(len));
+            if ch == 0 {
+                break;
+            }
+            buf[len] = ch;
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        let text = String::from_utf16_lossy(&buf[..len]);
+        parse_winhttp_callback_ip_str(&text)
+    }
+
+    unsafe extern "system" fn winhttp_ip_guard_callback(
+        h_internet: HInternet,
+        dw_context: usize,
+        dw_internet_status: u32,
+        lpv_status_information: *const c_void,
+        dw_status_information_length: u32,
+    ) {
+        if dw_context == 0 {
+            return;
+        }
+        let ctx_ptr = dw_context as *const WinHttpIpGuardContext;
+
+        if dw_internet_status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING {
+            let should_release = {
+                let ctx = &*ctx_ptr;
+                !ctx.raw_ctx_released.swap(true, Ordering::AcqRel)
+            };
+            if should_release {
+                drop(Arc::from_raw(ctx_ptr));
+            }
+            return;
+        }
+
+        let ctx = &*ctx_ptr;
+        if ctx.blocked.load(Ordering::Acquire) {
+            return;
+        }
+
+        let reject_reason: Option<String> = match dw_internet_status {
+            WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER
+            | WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER => {
+                match parse_winhttp_status_ip_wstr(
+                    lpv_status_information,
+                    dw_status_information_length,
+                ) {
+                    Some(ip) => {
+                        if !is_remote_ip_allowed(
+                            ip,
+                            ctx.is_https,
+                            ctx.pinned_ip,
+                            ctx.allowed_ip_check,
+                        ) {
+                            Some(format!(
+                                "DNS rebinding / SSRF blocked before send: peer IP {} is not permitted",
+                                ip
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    None => Some(
+                        "DNS rebinding / SSRF blocked before send: unparseable peer IP in WinHTTP status callback"
+                            .to_string(),
+                    ),
+                }
+            }
+            WINHTTP_CALLBACK_STATUS_NAME_RESOLVED => {
+                // `NAME_RESOLVED` may carry an IP string or a hostname depending on OS version;
+                // only reject when it parses as a disallowed IP address (CONNECTING_TO_SERVER
+                // strictly enforces fail-closed IP validation before TLS/HTTP bytes are sent).
+                if let Some(ip) = parse_winhttp_status_ip_wstr(
+                    lpv_status_information,
+                    dw_status_information_length,
+                ) {
+                    if !is_remote_ip_allowed(
+                        ip,
+                        ctx.is_https,
+                        ctx.pinned_ip,
+                        ctx.allowed_ip_check,
+                    ) {
+                        Some(format!(
+                            "DNS rebinding / SSRF blocked on resolution: resolved IP {} is not permitted",
+                            ip
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(reason) = reject_reason {
+            ctx.blocked.store(true, Ordering::Release);
+            if let Ok(mut slot) = ctx.blocked_reason.try_lock() {
+                if slot.is_none() {
+                    *slot = Some(reason);
+                }
+            }
+            if !h_internet.is_null() && !ctx.handle_closed.swap(true, Ordering::AcqRel) {
+                let _ = WinHttpCloseHandle(h_internet);
+            }
+        }
+    }
+
+    /// Pre-resolves `host:port` and verifies that EVERY resolved IP address is permitted by
+    /// `allowed_ip_check` (defaulting to `is_public_routable_ip`) BEFORE initiating any socket
+    /// connection via `WinHttpConnect`.
+    fn pre_resolve_and_validate_host(
+        host: &str,
+        port: u16,
+        allowed_ip_check: Option<fn(IpAddr) -> bool>,
+    ) -> Result<IpAddr, String> {
+        let is_allowed = |ip: IpAddr| -> bool {
+            let norm = normalize_ip_addr(ip);
+            match allowed_ip_check {
+                Some(check) => check(norm),
+                None => is_public_routable_ip(norm),
+            }
+        };
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(literal_ip) = bare.parse::<IpAddr>() {
+            let norm = normalize_ip_addr(literal_ip);
+            if !is_allowed(norm) {
+                return Err(format!(
+                    "SSRF protection: refused connection to disallowed IP literal {}",
+                    norm
+                ));
+            }
+            return Ok(norm);
+        }
+        let addrs: Vec<std::net::SocketAddr> = (bare, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS resolution failed for {}: {}", bare, e))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("DNS resolution returned no addresses for {}", bare));
+        }
+        let mut first_allowed = None;
+        for sa in addrs {
+            let norm = normalize_ip_addr(sa.ip());
+            if !is_allowed(norm) {
+                return Err(format!(
+                    "SSRF / DNS protection: host {} resolved to disallowed IP {}",
+                    bare, norm
+                ));
+            }
+            if first_allowed.is_none() {
+                first_allowed = Some(norm);
+            }
+        }
+        first_allowed
+            .ok_or_else(|| format!("DNS resolution returned no permitted addresses for {}", bare))
     }
 
     struct TempFileGuard {
@@ -498,23 +754,24 @@ mod win32_impl {
                 err_code
             ));
         }
-        parse_win32_sockaddr_storage_ip(&info.remote_address)
+        let remote_addr = info.remote_address;
+        parse_win32_sockaddr_storage_ip(&remote_addr)
             .ok_or_else(|| "DNS rebinding protection: unsupported remote SOCKADDR family".to_string())
     }
 
-    fn query_location_header(h_req: HInternet) -> Option<String> {
+    fn query_string_header(h_req: HInternet, info_level: u32, max_bytes: u32) -> Option<String> {
         let mut byte_len: u32 = 0;
         let mut idx: u32 = 0;
         unsafe {
             let _ = WinHttpQueryHeaders(
                 h_req,
-                WINHTTP_QUERY_LOCATION,
+                info_level,
                 core::ptr::null(),
                 core::ptr::null_mut(),
                 &mut byte_len,
                 &mut idx,
             );
-            if byte_len < 2 || byte_len > 16_384 {
+            if byte_len < 2 || byte_len > max_bytes {
                 return None;
             }
             let mut buf = vec![0u16; (byte_len as usize / 2) + 2];
@@ -522,7 +779,7 @@ mod win32_impl {
             idx = 0;
             if WinHttpQueryHeaders(
                 h_req,
-                WINHTTP_QUERY_LOCATION,
+                info_level,
                 core::ptr::null(),
                 buf.as_mut_ptr() as *mut c_void,
                 &mut actual_bytes,
@@ -534,12 +791,20 @@ mod win32_impl {
             let u16_len = (actual_bytes as usize / 2).min(buf.len());
             let s = String::from_utf16_lossy(&buf[..u16_len]);
             let trimmed = s.trim_end_matches('\0').trim().to_string();
-            if trimmed.is_empty() {
+            if trimmed.is_empty() || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f) {
                 None
             } else {
                 Some(trimmed)
             }
         }
+    }
+
+    fn query_location_header(h_req: HInternet) -> Option<String> {
+        query_string_header(h_req, WINHTTP_QUERY_LOCATION, 16_384)
+    }
+
+    fn query_content_type_header(h_req: HInternet) -> Option<String> {
+        query_string_header(h_req, WINHTTP_QUERY_CONTENT_TYPE, 2_048)
     }
 
     fn query_content_length_header(h_req: HInternet) -> Option<u64> {
@@ -565,9 +830,12 @@ mod win32_impl {
     }
 
     /// Executes a single HTTP/HTTPS GET without following redirects, writing body chunks into `sink`.
-    /// Disables WPAD (`WINHTTP_ACCESS_TYPE_NO_PROXY`), pins plaintext HTTP connections directly to
-    /// `pinned_ip` with an explicit `Host:` header, and validates the real connected peer IP via
-    /// `WINHTTP_OPTION_CONNECTION_INFO` BEFORE reading any response body bytes.
+    /// Disables WPAD (`WINHTTP_ACCESS_TYPE_NO_PROXY`), pre-resolves and validates all target IPs
+    /// before `WinHttpConnect`, installs a `WinHttpSetStatusCallback` IP guard on
+    /// `WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER` / `CONNECTED_TO_SERVER` / `NAME_RESOLVED`
+    /// to abort any rebinding to non-global IPs BEFORE TLS/HTTP send, pins plaintext HTTP
+    /// connections directly to a validated IP with an explicit `Host:` header, and keeps
+    /// `WINHTTP_OPTION_CONNECTION_INFO` verification in defense in depth.
     #[allow(clippy::too_many_arguments)]
     fn single_hop_get<F>(
         url: &str,
@@ -579,14 +847,15 @@ mod win32_impl {
         pinned_ip: Option<IpAddr>,
         allowed_ip_check: Option<fn(IpAddr) -> bool>,
         mut on_chunk: F,
-    ) -> Result<(u16, Option<String>), String>
+    ) -> Result<(u16, Option<String>, Option<String>), String>
     where
         F: FnMut(&[u8], u64, u64) -> Result<(), String>,
     {
         let parsed = parse_http_url_parts(url)?;
 
-        // Pre-validate pinned_ip before initiating any outbound socket connection.
-        if let Some(pin) = pinned_ip {
+        // Layer 1 (Pre-connect): validate pinned_ip or pre-resolve & validate every DNS IP before
+        // WinHTTP opens any socket. For unpinned plaintext HTTP, auto-pin to the validated IP.
+        let effective_pinned_ip: Option<IpAddr> = if let Some(pin) = pinned_ip {
             let norm_pin = normalize_ip_addr(pin);
             let pin_ok = match allowed_ip_check {
                 Some(check) => check(norm_pin),
@@ -598,7 +867,27 @@ mod win32_impl {
                     norm_pin
                 ));
             }
-        }
+            // If URL host is itself an IP literal, validate it directly as well.
+            let bare = parsed.host.trim_start_matches('[').trim_end_matches(']');
+            if let Ok(lit_ip) = bare.parse::<IpAddr>() {
+                if !is_remote_ip_allowed(lit_ip, parsed.is_https, Some(norm_pin), allowed_ip_check)
+                {
+                    return Err(format!(
+                        "SSRF protection: refused connection to disallowed host IP {}",
+                        normalize_ip_addr(lit_ip)
+                    ));
+                }
+            }
+            Some(norm_pin)
+        } else {
+            let resolved_ip =
+                pre_resolve_and_validate_host(&parsed.host, parsed.port, allowed_ip_check)?;
+            if !parsed.is_https {
+                Some(resolved_ip)
+            } else {
+                None
+            }
+        };
 
         let ua_w = to_wide(user_agent);
 
@@ -651,11 +940,11 @@ mod win32_impl {
             );
         }
 
-        // For plaintext HTTP with a pinned IP, connect directly to the pinned IP and pass the
-        // original host in the `Host:` header (for HTTPS, pass the hostname for TLS SNI + cert check
-        // and verify the actual connected peer IP via `WINHTTP_OPTION_CONNECTION_INFO` below).
+        // For plaintext HTTP, connect directly to the validated pinned IP and pass the original
+        // host in the `Host:` header (for HTTPS, pass the hostname for TLS SNI + cert check and
+        // enforce pre-send IP validation in `winhttp_ip_guard_callback` + `WINHTTP_OPTION_CONNECTION_INFO`).
         let (connect_target, explicit_host_header) = if !parsed.is_https {
-            if let Some(pin) = pinned_ip {
+            if let Some(pin) = effective_pinned_ip {
                 let target = match normalize_ip_addr(pin) {
                     IpAddr::V4(v4) => v4.to_string(),
                     IpAddr::V6(v6) => format!("[{}]", v6),
@@ -716,7 +1005,54 @@ mod win32_impl {
         if h_request.is_null() {
             return Err("WinHttpOpenRequest failed".into());
         }
-        let _req_guard = HandleGuard(h_request);
+
+        // Layer 2 (Pre-TLS / Pre-HTTP-send): install WinHTTP status callback to reject any
+        // non-global or rebinding IP on `CONNECTING_TO_SERVER` / `CONNECTED_TO_SERVER` / `NAME_RESOLVED`
+        // BEFORE TLS ClientHello or HTTP request bytes are transmitted.
+        let guard_ctx = Arc::new(WinHttpIpGuardContext {
+            is_https: parsed.is_https,
+            pinned_ip: effective_pinned_ip,
+            allowed_ip_check,
+            blocked: AtomicBool::new(false),
+            handle_closed: AtomicBool::new(false),
+            raw_ctx_released: AtomicBool::new(false),
+            blocked_reason: Mutex::new(None),
+        });
+        let raw_ctx = Arc::into_raw(Arc::clone(&guard_ctx)) as usize;
+        let ctx_set_ok = unsafe {
+            WinHttpSetOption(
+                h_request,
+                WINHTTP_OPTION_CONTEXT_VALUE,
+                &raw_ctx as *const usize as *const c_void,
+                core::mem::size_of::<usize>() as u32,
+            ) != 0
+        };
+        if !ctx_set_ok {
+            unsafe {
+                let _ = WinHttpCloseHandle(h_request);
+                drop(Arc::from_raw(raw_ctx as *const WinHttpIpGuardContext));
+            }
+            return Err("WinHttpSetOption(CONTEXT_VALUE) failed".into());
+        }
+        let cb_flags = WINHTTP_CALLBACK_STATUS_NAME_RESOLVED
+            | WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER
+            | WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER
+            | WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING;
+        let prev_cb = unsafe {
+            WinHttpSetStatusCallback(h_request, Some(winhttp_ip_guard_callback), cb_flags, 0)
+        };
+        if prev_cb == WINHTTP_INVALID_STATUS_CALLBACK {
+            unsafe {
+                let _ = WinHttpCloseHandle(h_request);
+                drop(Arc::from_raw(raw_ctx as *const WinHttpIpGuardContext));
+            }
+            return Err("WinHttpSetStatusCallback failed".into());
+        }
+        let _req_guard = RequestHandleGuard {
+            handle: h_request,
+            ctx: Arc::clone(&guard_ctx),
+            raw_ctx,
+        };
 
         unsafe {
             let no_redir = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
@@ -770,22 +1106,50 @@ mod win32_impl {
                 core::ptr::null(),
                 0,
                 0,
-                0,
+                raw_ctx,
             )
         };
+        if guard_ctx.blocked.load(Ordering::Acquire) {
+            let reason = guard_ctx
+                .blocked_reason
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| {
+                    "DNS rebinding / SSRF blocked before send: disallowed remote IP".to_string()
+                });
+            return Err(reason);
+        }
         if sent == 0 {
             let err_code = unsafe { GetLastError() };
             return Err(format!("WinHttpSendRequest failed (win32={})", err_code));
         }
-        if unsafe { WinHttpReceiveResponse(h_request, core::ptr::null_mut()) } == 0 {
+        let recv_ok = unsafe { WinHttpReceiveResponse(h_request, core::ptr::null_mut()) };
+        if guard_ctx.blocked.load(Ordering::Acquire) {
+            let reason = guard_ctx
+                .blocked_reason
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| {
+                    "DNS rebinding / SSRF blocked before receive: disallowed remote IP".to_string()
+                });
+            return Err(reason);
+        }
+        if recv_ok == 0 {
             let err_code = unsafe { GetLastError() };
             return Err(format!("WinHttpReceiveResponse failed (win32={})", err_code));
         }
 
-        // Anti-DNS-rebinding TOCTOU verification: inspect the ACTUAL connected remote IP from
+        // Layer 3 (Defense in depth): inspect the ACTUAL connected remote IP from
         // `WINHTTP_OPTION_CONNECTION_INFO` BEFORE reading any headers/body bytes.
         let remote_ip = query_remote_connection_ip(h_request)?;
-        if !is_remote_ip_allowed(remote_ip, parsed.is_https, pinned_ip, allowed_ip_check) {
+        if !is_remote_ip_allowed(
+            remote_ip,
+            parsed.is_https,
+            effective_pinned_ip,
+            allowed_ip_check,
+        ) {
             return Err(format!(
                 "DNS rebinding detected: connected remote IP {} is not permitted",
                 remote_ip
@@ -816,9 +1180,10 @@ mod win32_impl {
         };
 
         if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
-            return Ok((status_code, location));
+            return Ok((status_code, location, None));
         }
 
+        let content_type = query_content_type_header(h_request);
         let content_length = query_content_length_header(h_request).unwrap_or(0);
         let mut total_read: usize = 0;
         let mut buf = vec![0u8; 32 * 1024];
@@ -854,7 +1219,7 @@ mod win32_impl {
             on_chunk(&buf[..n], total_read as u64, content_length)?;
         }
 
-        Ok((status_code, location))
+        Ok((status_code, location, content_type))
     }
 
     /// Single-hop GET (never follows redirects — caller validates every redirect hop for SSRF).
@@ -867,7 +1232,7 @@ mod win32_impl {
         max_bytes: usize,
     ) -> Result<WinHttpResponse, String> {
         let mut body = Vec::new();
-        let (status_code, location) = single_hop_get(
+        let (status_code, location, content_type) = single_hop_get(
             url,
             user_agent,
             extra_headers,
@@ -884,12 +1249,14 @@ mod win32_impl {
         Ok(WinHttpResponse {
             status_code,
             location,
+            content_type,
             body,
         })
     }
 
     /// Single-hop GET with explicit anti-DNS-rebinding IP pinning (`pinned_ip`) and/or peer IP
-    /// policy validation (`allowed_ip_check`) checked via `WINHTTP_OPTION_CONNECTION_INFO`.
+    /// policy validation (`allowed_ip_check`) checked pre-connect, pre-send via WinHTTP status
+    /// callback, and post-connect via `WINHTTP_OPTION_CONNECTION_INFO`.
     pub fn winhttp_get_no_redirect_pinned(
         url: &str,
         max_bytes: usize,
@@ -900,7 +1267,7 @@ mod win32_impl {
     ) -> Result<WinHttpResponse, String> {
         let t_ms = timeout_ms.min(i32::MAX as u32) as i32;
         let mut body = Vec::new();
-        let (status_code, location) = single_hop_get(
+        let (status_code, location, content_type) = single_hop_get(
             url,
             user_agent,
             &[],
@@ -917,6 +1284,7 @@ mod win32_impl {
         Ok(WinHttpResponse {
             status_code,
             location,
+            content_type,
             body,
         })
     }
@@ -1017,7 +1385,7 @@ mod win32_impl {
             let mut tmp_guard = TempFileGuard::new(tmp_path.clone());
             let mut file_opt: Option<std::fs::File> = None;
 
-            let (status_code, location) = single_hop_get(
+            let (status_code, location, _content_type) = single_hop_get(
                 &current,
                 user_agent,
                 &filtered_headers,
@@ -1165,9 +1533,50 @@ mod tests {
     #[test]
     fn test_public_ip_and_win32_connection_info_dns_rebinding_guard() {
         assert_eq!(WINHTTP_OPTION_CONNECTION_INFO, 93);
+        assert_eq!(WINHTTP_QUERY_CONTENT_TYPE, 1);
         assert_eq!(core::mem::size_of::<Win32SockAddrStorage>(), 128);
         assert_eq!(core::mem::align_of::<Win32SockAddrStorage>(), 8);
+        #[cfg(target_arch = "x86")]
+        assert_eq!(core::mem::size_of::<Win32WinHttpConnectionInfo>(), 260);
+        #[cfg(not(target_arch = "x86"))]
         assert_eq!(core::mem::size_of::<Win32WinHttpConnectionInfo>(), 264);
+
+        // Reject embedded whitespace in URL parser
+        assert!(parse_http_url_parts("https://example.com/hello world").is_err());
+
+        // Callback IP string parser normalizes IPv4, IPv6, brackets, ports, zone IDs, and IPv4-mapped IPv6
+        assert_eq!(
+            parse_winhttp_callback_ip_str("93.184.216.34"),
+            Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+        );
+        assert_eq!(
+            parse_winhttp_callback_ip_str("127.0.0.1:443"),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(
+            parse_winhttp_callback_ip_str("[::1]:8443"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_winhttp_callback_ip_str("::ffff:169.254.169.254"),
+            Some(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))
+        );
+        let link_local = parse_winhttp_callback_ip_str("fe80::1%12").unwrap();
+        assert!(!is_public_routable_ip(link_local));
+        assert!(parse_winhttp_callback_ip_str("example.com").is_none());
+        assert!(parse_winhttp_callback_ip_str("").is_none());
+
+        // Verify WinHttpResponse carries upstream Content-Type
+        let sample_resp = WinHttpResponse {
+            status_code: 200,
+            location: None,
+            content_type: Some("text/plain; charset=utf-8".to_string()),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            sample_resp.content_type.as_deref(),
+            Some("text/plain; charset=utf-8")
+        );
 
         // Public routable IPs allowed
         assert!(is_public_routable_ip("1.1.1.1".parse().unwrap()));

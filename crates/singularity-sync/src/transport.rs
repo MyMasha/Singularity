@@ -19,7 +19,7 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// File suffix used by the Encrypted Folder synchronization backend.
 pub const ENCRYPTED_DELTA_EXTENSION: &str = ".singularity-delta.enc";
@@ -142,6 +143,8 @@ pub struct SyncDeviceInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRegistry {
     devices: BTreeMap<String, SyncDeviceInfo>,
+    #[serde(default)]
+    revoked_pubkeys: BTreeSet<String>,
 }
 
 impl DeviceRegistry {
@@ -149,22 +152,66 @@ impl DeviceRegistry {
         Self::default()
     }
 
-    /// Registers or updates a device entry. If the device was previously revoked, revocation is preserved.
+    /// Returns `true` if `pubkey_hex` (case-insensitive) belongs to any revoked device,
+    /// evaluated in constant time across all known revoked public keys.
+    pub fn is_pubkey_revoked(&self, pubkey_hex: &str) -> bool {
+        let normalized = pubkey_hex.to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        let mut found = subtle::Choice::from(0u8);
+        for revoked_pk in &self.revoked_pubkeys {
+            let r_norm = revoked_pk.to_ascii_lowercase();
+            if r_norm.len() == normalized.len() {
+                found |= r_norm.as_bytes().ct_eq(normalized.as_bytes());
+            }
+        }
+        for dev in self.devices.values().filter(|d| d.revoked) {
+            let d_norm = dev.ed25519_pubkey_hex.to_ascii_lowercase();
+            if d_norm.len() == normalized.len() {
+                found |= d_norm.as_bytes().ct_eq(normalized.as_bytes());
+            }
+        }
+        bool::from(found)
+    }
+
+    /// Returns `true` if at least one device or public key has been revoked on this registry.
+    pub fn has_revoked_devices(&self) -> bool {
+        !self.revoked_pubkeys.is_empty() || self.devices.values().any(|d| d.revoked)
+    }
+
+    /// Registers or updates a device entry. If the device or its public key was previously revoked,
+    /// revocation is strictly preserved.
     pub fn register_device(&mut self, mut info: SyncDeviceInfo) {
+        let normalized_pk = info.ed25519_pubkey_hex.to_ascii_lowercase();
         if let Some(existing) = self.devices.get(&info.device_id) {
             if existing.revoked {
                 info.revoked = true;
                 info.revoked_at_ms = existing.revoked_at_ms;
             }
         }
+        if self.is_pubkey_revoked(&normalized_pk) {
+            info.revoked = true;
+            if info.revoked_at_ms.is_none() {
+                info.revoked_at_ms = Some(info.enrolled_at_ms);
+            }
+        }
+        if info.revoked && !normalized_pk.is_empty() {
+            self.revoked_pubkeys.insert(normalized_pk);
+        }
         self.devices.insert(info.device_id.clone(), info);
     }
 
-    /// Permanently marks `device_id` as revoked so future envelopes from it are rejected immediately.
+    /// Permanently marks `device_id` (and its Ed25519 public key) as revoked so future envelopes
+    /// from it are rejected immediately even if the sender changes `device_id`.
     pub fn revoke_device(&mut self, device_id: &str, revoked_at_ms: u64) -> bool {
         if let Some(dev) = self.devices.get_mut(device_id) {
             dev.revoked = true;
             dev.revoked_at_ms = Some(revoked_at_ms);
+            if !dev.ed25519_pubkey_hex.is_empty() {
+                self.revoked_pubkeys
+                    .insert(dev.ed25519_pubkey_hex.to_ascii_lowercase());
+            }
             true
         } else {
             false
@@ -190,12 +237,17 @@ impl DeviceRegistry {
         self.devices.values().collect()
     }
 
-    /// Validates that `device_id` is not revoked and, if already enrolled, matches its pinned Ed25519 public key.
+    /// Validates that neither `device_id` nor `sender_pubkey_hex` is revoked, enforces pinned
+    /// Ed25519 public key identity for enrolled devices, and blocks silent TOFU enrollment of
+    /// unknown devices once a revocation has occurred on the chain.
     pub fn verify_authorized_sender(
         &self,
         device_id: &str,
         sender_pubkey_hex: &str,
     ) -> Result<(), TransportError> {
+        if self.is_pubkey_revoked(sender_pubkey_hex) {
+            return Err(TransportError::DeviceRevoked(device_id.to_string()));
+        }
         if let Some(existing) = self.devices.get(device_id) {
             if existing.revoked {
                 return Err(TransportError::DeviceRevoked(device_id.to_string()));
@@ -208,6 +260,10 @@ impl DeviceRegistry {
             ) {
                 return Err(TransportError::DeviceKeyMismatch(device_id.to_string()));
             }
+        } else if self.has_revoked_devices() {
+            // Once a device has been revoked without rotating chain master keys, unknown devices
+            // cannot silently self-enroll via TOFU and must be explicitly pre-registered.
+            return Err(TransportError::DeviceRevoked(device_id.to_string()));
         }
         Ok(())
     }
@@ -373,8 +429,10 @@ impl SealedSyncEnvelope {
         validate_identifier(chain_id)?;
 
         let payload_kind = payload.kind();
-        let plaintext =
-            serde_json::to_vec(payload).map_err(|e| TransportError::Serialization(e.to_string()))?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(payload)
+                .map_err(|e| TransportError::Serialization(e.to_string()))?,
+        );
 
         let mut nonce_bytes = [0u8; 24];
         OsRng.fill_bytes(&mut nonce_bytes);
@@ -385,7 +443,7 @@ impl SealedSyncEnvelope {
             .encrypt(
                 XNonce::from_slice(&nonce_bytes),
                 Payload {
-                    msg: &plaintext,
+                    msg: plaintext.as_slice(),
                     aad: &aad,
                 },
             )
@@ -506,21 +564,40 @@ impl SealedSyncEnvelope {
 
         // 5. Authenticate & decrypt XChaCha20-Poly1305 ciphertext with canonical AAD
         let cipher = XChaCha20Poly1305::new(Key::from_slice(aead_key.as_bytes()));
-        let plaintext = cipher
-            .decrypt(
-                XNonce::from_slice(&nonce_arr),
-                Payload {
-                    msg: &ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| TransportError::DecryptionFailed)?;
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&nonce_arr),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| TransportError::DecryptionFailed)?,
+        );
 
-        let payload: SyncEnvelopePayload = serde_json::from_slice(&plaintext)
+        let payload: SyncEnvelopePayload = serde_json::from_slice(plaintext.as_slice())
             .map_err(|e| TransportError::Serialization(e.to_string()))?;
 
         if payload.kind() != self.payload_kind {
             return Err(TransportError::DecryptionFailed);
+        }
+
+        // Enforce strict binding between authenticated envelope headers (collection + device_id,
+        // which select the HKDF key domain such as `vault_subkey` and AAD) and inner payload fields.
+        match &payload {
+            SyncEnvelopePayload::CrdtDelta(delta) => {
+                if delta.collection != self.collection || delta.origin_device_id != self.device_id {
+                    return Err(TransportError::DecryptionFailed);
+                }
+            }
+            SyncEnvelopePayload::SendTab(tab) => {
+                if self.collection != SyncCollectionKind::OpenTabs
+                    || tab.sender_device_id != self.device_id
+                {
+                    return Err(TransportError::DecryptionFailed);
+                }
+            }
         }
 
         // 6. Advance monotonic replay watermark only after full cryptographic verification
@@ -643,15 +720,23 @@ impl EncryptedFolderBackend {
     }
 
     /// Scans the directory and reads all `*.singularity-delta.enc` envelopes in deterministic order.
+    ///
+    /// Symlinks, non-regular files, oversized files, and individually corrupted JSON files are
+    /// skipped rather than aborting synchronization of the remaining valid envelopes.
     pub fn read_all_envelopes(&self) -> Result<Vec<SealedSyncEnvelope>, TransportError> {
         if !self.root_dir.exists() {
             return Ok(Vec::new());
         }
         let mut paths: Vec<PathBuf> = Vec::new();
         for entry in fs::read_dir(&self.root_dir)? {
-            let entry = entry?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
-            if !path.is_file() {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -664,17 +749,29 @@ impl EncryptedFolderBackend {
 
         let mut envelopes = Vec::with_capacity(paths.len());
         for path in paths {
-            let meta = fs::metadata(&path)?;
-            if meta.len() as usize > MAX_ENVELOPE_WIRE_BYTES {
-                return Err(TransportError::MalformedFrame(format!(
-                    "Delta file {:?} exceeds {} byte safety cap",
-                    path.file_name(),
-                    MAX_ENVELOPE_WIRE_BYTES
-                )));
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                continue;
             }
-            let bytes = fs::read(&path)?;
-            let env: SealedSyncEnvelope = serde_json::from_slice(&bytes)
-                .map_err(|e| TransportError::Serialization(e.to_string()))?;
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if file
+                .take(MAX_ENVELOPE_WIRE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                continue;
+            }
+            if bytes.len() > MAX_ENVELOPE_WIRE_BYTES {
+                continue;
+            }
+            let Ok(env) = serde_json::from_slice::<SealedSyncEnvelope>(&bytes) else {
+                continue;
+            };
             envelopes.push(env);
         }
         Ok(envelopes)

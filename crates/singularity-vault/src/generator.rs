@@ -227,7 +227,10 @@ pub fn generate_password(cfg: &PasswordGeneratorConfig) -> Result<GeneratedSecre
         cfg.min_symbols
     };
 
-    let total_required = req_upper + req_lower + req_digits + req_symbols;
+    let total_required = req_upper
+        .saturating_add(req_lower)
+        .saturating_add(req_digits)
+        .saturating_add(req_symbols);
     if total_required > effective_length {
         return Err(GeneratorError::MinimumsExceedLength {
             required: total_required,
@@ -673,5 +676,28 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn test_password_generator_minimums_saturating_add_no_overflow() {
+        let cfg = PasswordGeneratorConfig {
+            length: 16,
+            uppercase: true,
+            lowercase: true,
+            digits: true,
+            symbols: true,
+            min_uppercase: usize::MAX,
+            min_lowercase: 1,
+            min_digits: 1,
+            min_symbols: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            generate_password(&cfg),
+            Err(GeneratorError::MinimumsExceedLength {
+                required: usize::MAX,
+                effective_length: 16
+            })
+        ));
     }
 }

@@ -25,6 +25,7 @@ use crate::roaming_store::{
 use crate::shell::SingularityBrowserShell;
 use cef::*;
 use singularity_core::{FilterDecision, NetworkResourceType};
+use singularity_net_mullvad::AtomicSocketKillSwitch;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -165,6 +166,7 @@ pub enum CefCallbackEvent {
     OpenNewTab {
         url: String,
         background: bool,
+        from_ui: bool,
     },
     DownloadStarted {
         download_id: u32,
@@ -184,7 +186,7 @@ pub enum CefCallbackEvent {
     },
     NativeShortcut {
         tab_id: u64,
-        action: &'static str,
+        action: String,
     },
     StatusMessage {
         tab_id: u64,
@@ -220,11 +222,14 @@ fn cef_str_userfree(s: CefStringUserfree) -> String {
 }
 
 fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
-    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+    haystack
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
-    if starts_with_ignore_ascii_case(haystack, prefix) {
+    if starts_with_ignore_ascii_case(haystack, prefix) && haystack.is_char_boundary(prefix.len()) {
         Some(&haystack[prefix.len()..])
     } else {
         None
@@ -232,7 +237,7 @@ fn strip_prefix_ignore_ascii_case<'a>(haystack: &'a str, prefix: &str) -> Option
 }
 
 /// Strictly validates that `url` is on the exact local UI shell origin `http://127.0.0.1:<ui_port>`.
-fn is_exact_local_ui_origin(url: &str, ui_port: u16) -> bool {
+pub(crate) fn is_exact_local_ui_origin(url: &str, ui_port: u16) -> bool {
     if ui_port == 0 {
         return false;
     }
@@ -251,6 +256,32 @@ fn is_exact_local_ui_origin(url: &str, ui_port: u16) -> bool {
         || after_auth.starts_with('/')
         || after_auth.starts_with('?')
         || after_auth.starts_with('#')
+}
+
+/// Decision for a main-frame navigation attempt inside `ui_browser` (the 80px chrome shell).
+///
+/// `ui_browser` MUST NEVER navigate away from `http://127.0.0.1:<bind_port>` (e.g. when the user
+/// drags & drops a link or local file onto the tab bar / omnibar / window controls). Valid
+/// external HTTP(S) links are redirected to a new focused web tab instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UiBrowserNavigationAction {
+    AllowInUi,
+    OpenInNewTab(String),
+    BlockSilent,
+}
+
+/// Classifies a main-frame navigation target on `ui_browser`.
+pub(crate) fn classify_ui_browser_navigation(url: &str, bind_port: u16) -> UiBrowserNavigationAction {
+    let trimmed = url.trim();
+    if is_exact_local_ui_origin(trimmed, bind_port) || trimmed.eq_ignore_ascii_case("about:blank") {
+        return UiBrowserNavigationAction::AllowInUi;
+    }
+    if let Some((host, _)) = parse_http_host_port(trimmed) {
+        if !is_blocked_local_ipc_url(trimmed, bind_port) && !is_local_or_ambiguous_host(&host) {
+            return UiBrowserNavigationAction::OpenInNewTab(trimmed.to_string());
+        }
+    }
+    UiBrowserNavigationAction::BlockSilent
 }
 
 fn parse_http_or_ws_host_port(url: &str, allow_ws: bool) -> Option<(String, u16)> {
@@ -318,7 +349,7 @@ fn parse_http_or_ws_host_port(url: &str, allow_ws: bool) -> Option<(String, u16)
         return Some((host.to_ascii_lowercase(), port));
     }
 
-    if hostport.contains('[') || hostport.contains(']') {
+    if hostport.contains('[') || hostport.contains(']') || hostport.contains('\u{FF1A}') {
         return None;
     }
 
@@ -426,9 +457,18 @@ fn is_local_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_local_or_ambiguous_host(host: &str) -> bool {
-    // Normalize IDNA fullwidth dot separators to ASCII `.` so `localhost。` cannot slip past.
-    let normalized = host
-        .replace(['\u{3002}', '\u{FF0E}', '\u{FF61}'], ".")
+    // Normalize IDNA fullwidth dot separators and fullwidth ASCII characters (`U+FF01..=U+FF5E`
+    // -> ASCII `0x21..=0x7E`) so `localhost。`, `ｌｏｃａｌｈｏｓｔ`, and `１２７．０．０．１`
+    // cannot slip past local-host detection via IDNA/NFKC normalization.
+    let mapped: String = host
+        .chars()
+        .map(|c| match c {
+            '\u{3002}' | '\u{FF0E}' | '\u{FF61}' => '.',
+            '\u{FF01}'..='\u{FF5E}' => ((c as u32 - 0xFEE0) as u8) as char,
+            _ => c,
+        })
+        .collect();
+    let normalized = mapped
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim_end_matches('.')
@@ -539,7 +579,9 @@ pub(crate) fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
     if current.starts_with("//") {
         let synthetic = format!("http:{current}");
         return match parse_http_or_ws_host_port(&synthetic, false) {
-            Some((host, port)) => port == bind_port && is_local_or_ambiguous_host(&host),
+            Some((host, port)) => {
+                port == bind_port && (!host.is_ascii() || is_local_or_ambiguous_host(&host))
+            }
             None => true,
         };
     }
@@ -565,7 +607,9 @@ pub(crate) fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
                 return true;
             }
             match parse_http_or_ws_host_port(current, true) {
-                Some((host, port)) => port == bind_port && is_local_or_ambiguous_host(&host),
+                Some((host, port)) => {
+                    port == bind_port && (!host.is_ascii() || is_local_or_ambiguous_host(&host))
+                }
                 None => true, // Fail closed on any malformed/ambiguous HTTP(S)/WS(S) URL.
             }
         }
@@ -577,7 +621,10 @@ pub(crate) fn is_blocked_local_ipc_url(nav_url: &str, bind_port: u16) -> bool {
             if let Some(after_slashes) = after_colon.strip_prefix("//") {
                 let synthetic = format!("http://{after_slashes}");
                 return match parse_http_or_ws_host_port(&synthetic, false) {
-                    Some((host, port)) => port == bind_port && is_local_or_ambiguous_host(&host),
+                    Some((host, port)) => {
+                        port == bind_port
+                            && (!host.is_ascii() || is_local_or_ambiguous_host(&host))
+                    }
                     None => true,
                 };
             }
@@ -1278,6 +1325,38 @@ pub fn create_isolated_request_context(cache_path: &Path) -> Option<RequestConte
     request_context_create_context(Some(&settings), None)
 }
 
+/// Returns `true` for internal/in-memory browser schemes that never emit outbound network traffic
+/// (must only be called AFTER `is_blocked_local_ipc_url` has rejected `file://` and local-IPC blobs).
+fn is_internal_or_non_network_cef_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    starts_with_ignore_ascii_case(trimmed, "chrome-extension://")
+        || trimmed.eq_ignore_ascii_case("about:blank")
+        || trimmed.eq_ignore_ascii_case("about:srcdoc")
+        || starts_with_ignore_ascii_case(trimmed, "data:")
+        || starts_with_ignore_ascii_case(trimmed, "blob:")
+        || starts_with_ignore_ascii_case(trimmed, "javascript:")
+        || starts_with_ignore_ascii_case(trimmed, "devtools://")
+        || starts_with_ignore_ascii_case(trimmed, "chrome-devtools://")
+}
+
+/// Fail-closed Mullvad Kill-Switch / Emergency Lockdown evaluation for CEF web requests.
+/// Permits UI shell (`is_ui`) and non-network internal schemes while enforcing
+/// `AtomicSocketKillSwitch::authorize_outbound_packet` (including LAN/RFC1918 & Cast policy).
+fn is_url_blocked_by_kill_switch(
+    is_ui: bool,
+    url: &str,
+    kill_switch: &AtomicSocketKillSwitch,
+) -> bool {
+    if is_ui || is_internal_or_non_network_cef_url(url) {
+        return false;
+    }
+    if let Some((host, _)) = parse_http_or_ws_host_port(url, true) {
+        return kill_switch.authorize_outbound_packet(&host).is_err();
+    }
+    kill_switch.is_emergency_lockdown()
+        || (kill_switch.is_strict_enabled() && !kill_switch.is_tunnel_established())
+}
+
 #[derive(Clone)]
 struct ClientConfig {
     is_ui: bool,
@@ -1287,6 +1366,7 @@ struct ClientConfig {
     bind_port: u16,
     sink: CefEventSink,
     shared_shell: Arc<Mutex<SingularityBrowserShell>>,
+    kill_switch: Arc<AtomicSocketKillSwitch>,
     download_resolver: CefDownloadResolver,
     downloads: Arc<Mutex<HashMap<u32, (String, String)>>>,
     last_user_gesture_ms: Arc<AtomicU64>,
@@ -1294,6 +1374,39 @@ struct ClientConfig {
 }
 
 impl ClientConfig {
+    fn is_blocked_by_kill_switch(&self, url: &str) -> bool {
+        is_url_blocked_by_kill_switch(self.is_ui, url, &self.kill_switch)
+    }
+
+    fn is_blocked_main_frame_by_adblocker(&self, url: &str) -> bool {
+        if self.is_ui || self.is_ext_popup || is_internal_or_non_network_cef_url(url) {
+            return false;
+        }
+        let Some((host, _)) = parse_http_host_port(url) else {
+            return false;
+        };
+        if is_local_or_ambiguous_host(&host) {
+            return false;
+        }
+        if let Ok(shell) = self.shared_shell.lock() {
+            let ext_domains =
+                crate::extensions::collect_installed_extension_host_domains(shell.roaming.root_dir());
+            if crate::extensions::host_matches_extension_domains(&host, &ext_domains) {
+                return false;
+            }
+            return matches!(
+                shell.core.adblocker.evaluate_request(
+                    url,
+                    &host,
+                    &host,
+                    NetworkResourceType::MainFrameDocument,
+                ),
+                FilterDecision::BlockedByDomainRule(_) | FilterDecision::BlockedByPatternRule(_)
+            );
+        }
+        false
+    }
+
     fn record_user_gesture(&self) {
         self.last_user_gesture_ms
             .store(monotonic_millis(), Ordering::Release);
@@ -1460,6 +1573,7 @@ wrap_life_span_handler! {
                             bind_port: self.cfg.bind_port,
                             sink: Arc::clone(&self.cfg.sink),
                             shared_shell: Arc::clone(&self.cfg.shared_shell),
+                            kill_switch: Arc::clone(&self.cfg.kill_switch),
                             download_resolver: Arc::clone(&self.cfg.download_resolver),
                             downloads: Arc::new(Mutex::new(HashMap::new())),
                             last_user_gesture_ms: Arc::new(AtomicU64::new(monotonic_millis())),
@@ -1489,6 +1603,7 @@ wrap_life_span_handler! {
                             bind_port: self.cfg.bind_port,
                             sink: Arc::clone(&self.cfg.sink),
                             shared_shell: Arc::clone(&self.cfg.shared_shell),
+                            kill_switch: Arc::clone(&self.cfg.kill_switch),
                             download_resolver: Arc::clone(&self.cfg.download_resolver),
                             downloads: Arc::new(Mutex::new(HashMap::new())),
                             last_user_gesture_ms: Arc::new(AtomicU64::new(if user_gesture != 0 {
@@ -1519,6 +1634,7 @@ wrap_life_span_handler! {
                         bind_port: self.cfg.bind_port,
                         sink: Arc::clone(&self.cfg.sink),
                         shared_shell: Arc::clone(&self.cfg.shared_shell),
+                        kill_switch: Arc::clone(&self.cfg.kill_switch),
                         download_resolver: Arc::clone(&self.cfg.download_resolver),
                         downloads: Arc::new(Mutex::new(HashMap::new())),
                         last_user_gesture_ms: Arc::new(AtomicU64::new(monotonic_millis())),
@@ -1534,7 +1650,11 @@ wrap_life_span_handler! {
                 let background = !is_explicit_popup
                     && (target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB
                         || is_ctrl_or_mbutton_down_cef());
-                (self.cfg.sink)(CefCallbackEvent::OpenNewTab { url, background });
+                (self.cfg.sink)(CefCallbackEvent::OpenNewTab {
+                    url,
+                    background,
+                    from_ui: false,
+                });
             }
             1 // Always suppress unmanaged external popup windows
         }
@@ -1721,7 +1841,16 @@ wrap_load_handler! {
                 return;
             }
             let u = cef_str_userfree(frame.url());
-            if u.starts_with("https://") || u.starts_with("http://") {
+            if self.cfg.is_ui {
+                if !u.is_empty() {
+                    (self.cfg.sink)(CefCallbackEvent::PageStarted {
+                        tab_id: self.cfg.tab_id,
+                        url: u,
+                    });
+                }
+            } else if starts_with_ignore_ascii_case(&u, "https://")
+                || starts_with_ignore_ascii_case(&u, "http://")
+            {
                 (self.cfg.sink)(CefCallbackEvent::PageStarted {
                     tab_id: self.cfg.tab_id,
                     url: u,
@@ -1899,17 +2028,31 @@ wrap_resource_request_handler! {
             request: Option<&mut Request>,
             _callback: Option<&mut Callback>,
         ) -> ReturnValue {
-            if self.cfg.is_ui || self.cfg.is_ext_popup {
+            if self.cfg.is_ext_popup {
                 return ReturnValue::CONTINUE;
             }
             let Some(req) = request else {
                 return ReturnValue::CONTINUE;
             };
             let url = cef_str_userfree(req.url());
+            if self.cfg.is_ui {
+                // Hard navigation lock for `ui_browser`: allow all UI sub-resources (favicons,
+                // images, API calls, stylesheets, scripts), but strictly cancel any main-frame
+                // request outside the exact local UI origin.
+                if req.resource_type() == ResourceType::MAIN_FRAME
+                    && !is_exact_local_ui_origin(&url, self.cfg.bind_port)
+                {
+                    return ReturnValue::CANCEL;
+                }
+                return ReturnValue::CONTINUE;
+            }
             if starts_with_ignore_ascii_case(&url, "chrome-extension://") {
                 return ReturnValue::CONTINUE;
             }
             if is_blocked_local_ipc_url(&url, self.cfg.bind_port) {
+                return ReturnValue::CANCEL;
+            }
+            if self.cfg.is_blocked_by_kill_switch(&url) {
                 return ReturnValue::CANCEL;
             }
             let (gpc_enabled, https_only_enabled) = self
@@ -1937,15 +2080,20 @@ wrap_resource_request_handler! {
             }
             let rtype = req.resource_type();
             if rtype == ResourceType::MAIN_FRAME {
+                let mut effective_url = url;
                 if https_only_enabled {
-                    if let Some(rest) = strip_prefix_ignore_ascii_case(&url, "http://") {
-                        let is_local = parse_http_host_port(&url)
+                    if let Some(rest) = strip_prefix_ignore_ascii_case(&effective_url, "http://") {
+                        let is_local = parse_http_host_port(&effective_url)
                             .is_some_and(|(h, _)| is_local_or_ambiguous_host(&h));
                         if !is_local {
                             let upgraded = format!("https://{}", rest);
                             req.set_url(Some(&CefString::from(upgraded.as_str())));
+                            effective_url = upgraded;
                         }
                     }
+                }
+                if self.cfg.is_blocked_main_frame_by_adblocker(&effective_url) {
+                    return ReturnValue::CANCEL;
                 }
                 return ReturnValue::CONTINUE;
             }
@@ -2028,18 +2176,44 @@ wrap_request_handler! {
         fn on_before_browse(
             &self,
             _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             user_gesture: ::std::os::raw::c_int,
             is_redirect: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             if self.cfg.is_ui {
-                return 0;
+                let is_main = frame.map(|f| f.is_main() != 0).unwrap_or(true);
+                if !is_main {
+                    return 0;
+                }
+                let Some(req) = request else {
+                    return 0;
+                };
+                let url = cef_str_userfree(req.url());
+                return match classify_ui_browser_navigation(&url, self.cfg.bind_port) {
+                    UiBrowserNavigationAction::AllowInUi => 0,
+                    UiBrowserNavigationAction::OpenInNewTab(target_url) => {
+                        (self.cfg.sink)(CefCallbackEvent::OpenNewTab {
+                            url: target_url,
+                            background: false,
+                            from_ui: true,
+                        });
+                        1
+                    }
+                    UiBrowserNavigationAction::BlockSilent => 1,
+                };
             }
             if let Some(req) = request {
                 let url = cef_str_userfree(req.url());
                 if is_blocked_local_ipc_url(&url, self.cfg.bind_port) {
                     return 1; // Cancel navigation to local IPC port or file://
+                }
+                if self.cfg.is_blocked_by_kill_switch(&url) {
+                    return 1; // Enforce Mullvad Kill-Switch / Emergency Lockdown on navigations & redirects
+                }
+                let is_main = frame.map(|f| f.is_main() != 0).unwrap_or(true);
+                if is_main && self.cfg.is_blocked_main_frame_by_adblocker(&url) {
+                    return 1; // Enforce Singularity Shield MainFrameDocument blocking on in-page navigations
                 }
                 if user_gesture != 0 {
                     self.cfg.record_user_gesture();
@@ -2058,10 +2232,25 @@ wrap_request_handler! {
             target_disposition: WindowOpenDisposition,
             user_gesture: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
-            if user_gesture != 0 && !self.cfg.is_ui {
+            if self.cfg.is_ui {
+                let url = target_url.map(CefString::to_string).unwrap_or_default();
+                return match classify_ui_browser_navigation(&url, self.cfg.bind_port) {
+                    UiBrowserNavigationAction::AllowInUi => 0,
+                    UiBrowserNavigationAction::OpenInNewTab(target_url) => {
+                        (self.cfg.sink)(CefCallbackEvent::OpenNewTab {
+                            url: target_url,
+                            background: false,
+                            from_ui: true,
+                        });
+                        1
+                    }
+                    UiBrowserNavigationAction::BlockSilent => 1,
+                };
+            }
+            if user_gesture != 0 {
                 self.cfg.record_user_gesture();
             }
-            if self.cfg.is_ui || target_disposition == WindowOpenDisposition::CURRENT_TAB {
+            if target_disposition == WindowOpenDisposition::CURRENT_TAB {
                 return 0;
             }
             let url = target_url.map(CefString::to_string).unwrap_or_default();
@@ -2070,7 +2259,11 @@ wrap_request_handler! {
             {
                 let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB
                     || is_ctrl_or_mbutton_down_cef();
-                (self.cfg.sink)(CefCallbackEvent::OpenNewTab { url, background });
+                (self.cfg.sink)(CefCallbackEvent::OpenNewTab {
+                    url,
+                    background,
+                    from_ui: false,
+                });
                 return 1;
             }
             0
@@ -2086,7 +2279,7 @@ wrap_request_handler! {
             _request_initiator: Option<&CefString>,
             _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
         ) -> Option<ResourceRequestHandler> {
-            if self.cfg.is_ui || self.cfg.is_ext_popup {
+            if self.cfg.is_ext_popup {
                 None
             } else {
                 Some(SingularityResourceRequestHandler::new(self.cfg.clone()))
@@ -2131,7 +2324,7 @@ fn percent_decode_ascii_lossy(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn is_dangerous_download_name(name: &str) -> bool {
+pub(crate) fn is_dangerous_download_name(name: &str) -> bool {
     const DANGEROUS_EXTS: &[&str] = &[
         ".exe", ".msi", ".msp", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
         ".hta", ".scr", ".com", ".pif", ".lnk", ".dll", ".cpl", ".reg", ".jar", ".sh", ".appimage",
@@ -2146,7 +2339,7 @@ fn is_dangerous_download_name(name: &str) -> bool {
     DANGEROUS_EXTS.iter().any(|ext| cleaned.ends_with(ext))
 }
 
-fn is_dangerous_download_url(url: &str) -> bool {
+pub(crate) fn is_dangerous_download_url(url: &str) -> bool {
     let without_frag = url.split(['?', '#']).next().unwrap_or("");
     let segment = without_frag
         .rsplit(['/', '\\'])
@@ -2201,7 +2394,10 @@ wrap_download_handler! {
             _request_method: Option<&CefString>,
         ) -> ::std::os::raw::c_int {
             if let Some(u) = url.map(CefString::to_string) {
-                if !u.is_empty() && is_blocked_local_ipc_url(&u, self.cfg.bind_port) {
+                if !u.is_empty()
+                    && (is_blocked_local_ipc_url(&u, self.cfg.bind_port)
+                        || self.cfg.is_blocked_by_kill_switch(&u))
+                {
                     return 0;
                 }
             }
@@ -2439,7 +2635,7 @@ wrap_keyboard_handler! {
             if let Some(act) = native_action {
                 (self.cfg.sink)(CefCallbackEvent::NativeShortcut {
                     tab_id: self.cfg.tab_id,
-                    action: act,
+                    action: act.to_string(),
                 });
                 return 1;
             }
@@ -2523,15 +2719,42 @@ wrap_keyboard_handler! {
                 };
 
                 if let Some((act, idx)) = web_shortcut {
-                    let body = match idx {
+                    let payload = match idx {
                         Some(n) => format!(r#"{{"k":"shortcut","a":"{}","n":{}}}"#, act, n),
                         None => format!(r#"{{"k":"shortcut","a":"{}"}}"#, act),
                     };
-                    (self.cfg.sink)(CefCallbackEvent::ContentIpc {
+                    (self.cfg.sink)(CefCallbackEvent::NativeShortcut {
                         tab_id: self.cfg.tab_id,
-                        body,
+                        action: format!("ui_shortcut:{payload}"),
                     });
                     return 1;
+                }
+            }
+            0
+        }
+    }
+}
+
+wrap_drag_handler! {
+    struct SingularityDragHandler {
+        cfg: ClientConfig,
+    }
+
+    impl DragHandler {
+        fn on_drag_enter(
+            &self,
+            _browser: Option<&mut Browser>,
+            drag_data: Option<&mut DragData>,
+            _mask: DragOperationsMask,
+        ) -> ::std::os::raw::c_int {
+            if self.cfg.is_ui {
+                if let Some(data) = drag_data {
+                    // Reject pure local-file drags on `ui_browser` so OS file drops can never
+                    // trigger Chromium file:// navigation on the chrome shell, while still
+                    // letting links/text reach `ui_app.rs`'s capture-phase JS drop handler.
+                    if data.is_file() != 0 && data.is_link() == 0 {
+                        return 1;
+                    }
                 }
             }
             0
@@ -2551,6 +2774,14 @@ wrap_client! {
 
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(SingularityDisplayHandler::new(self.cfg.clone()))
+        }
+
+        fn drag_handler(&self) -> Option<DragHandler> {
+            if self.cfg.is_ui {
+                Some(SingularityDragHandler::new(self.cfg.clone()))
+            } else {
+                None
+            }
         }
 
         fn download_handler(&self) -> Option<DownloadHandler> {
@@ -2965,6 +3196,11 @@ pub fn spawn_cef_child_browser(
         ..Default::default()
     };
 
+    let kill_switch = shared_shell
+        .lock()
+        .map(|shell| Arc::clone(shell.core.mullvad_vpn.kill_switch()))
+        .unwrap_or_else(|e| Arc::clone(e.into_inner().core.mullvad_vpn.kill_switch()));
+
     let cfg = ClientConfig {
         is_ui,
         is_ext_popup,
@@ -2973,6 +3209,7 @@ pub fn spawn_cef_child_browser(
         bind_port,
         sink,
         shared_shell,
+        kill_switch,
         download_resolver,
         downloads: Arc::new(Mutex::new(HashMap::new())),
         last_user_gesture_ms: Arc::new(AtomicU64::new(0)),
@@ -4186,4 +4423,160 @@ pub fn dynamic_reload_extension_cef(
 ) -> Result<String, String> {
     let _ = dynamic_unload_extension_cef(roaming_root, dir_id, install_path, pump_ui);
     dynamic_load_extension_cef(roaming_root, dir_id, install_path, pump_ui)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cef_kill_switch_and_lockdown_url_gate() {
+        let ks = AtomicSocketKillSwitch::new(false, false);
+
+        // Normal browsing (kill-switch & lockdown off): public web + LAN allowed
+        assert!(!is_url_blocked_by_kill_switch(false, "https://example.com/", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "wss://example.com/ws", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "http://192.168.1.50:8008/cast", &ks));
+
+        // Strict Kill-Switch active without tunnel: blocks external HTTP(S)/WS(S) & other network schemes
+        ks.set_strict_enabled(true);
+        ks.set_block_lan_rfc1918(true);
+        assert!(is_url_blocked_by_kill_switch(false, "https://example.com/", &ks));
+        assert!(is_url_blocked_by_kill_switch(false, "wss://example.com/ws", &ks));
+        assert!(is_url_blocked_by_kill_switch(false, "http://192.168.1.50:8008/cast", &ks));
+        assert!(is_url_blocked_by_kill_switch(false, "ftp://files.example.com/a", &ks));
+
+        // UI shell and internal/non-network schemes MUST remain allowed
+        assert!(!is_url_blocked_by_kill_switch(true, "http://127.0.0.1:54321/", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "chrome-extension://abcdefghijklmnop/popup.html", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "about:blank", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "about:srcdoc", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "data:text/html,<h1>ok</h1>", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "blob:https://example.com/uuid", &ks));
+
+        // Tunnel established: external allowed, LAN still gated by block_lan_rfc1918
+        ks.set_tunnel_established(true);
+        assert!(!is_url_blocked_by_kill_switch(false, "https://example.com/", &ks));
+        assert!(is_url_blocked_by_kill_switch(false, "http://192.168.1.50:8008/cast", &ks));
+
+        // Emergency Lockdown overrides established tunnel on web tabs, still keeps UI shell alive
+        ks.set_emergency_lockdown(true);
+        assert!(is_url_blocked_by_kill_switch(false, "https://example.com/", &ks));
+        assert!(is_url_blocked_by_kill_switch(false, "wss://example.com/ws", &ks));
+        assert!(!is_url_blocked_by_kill_switch(true, "http://127.0.0.1:54321/", &ks));
+        assert!(!is_url_blocked_by_kill_switch(false, "about:blank", &ks));
+    }
+
+    #[test]
+    fn test_is_blocked_local_ipc_url_fullwidth_and_non_ascii_host() {
+        let port: u16 = 54321;
+
+        // Fullwidth ASCII localhost / IPv4 / hex / IPv6 must be normalized and blocked
+        assert!(is_local_or_ambiguous_host("ｌｏｃａｌｈｏｓｔ"));
+        assert!(is_local_or_ambiguous_host("ＬＯＣＡＬＨＯＳＴ"));
+        assert!(is_local_or_ambiguous_host("sub.ｌｏｃａｌｈｏｓｔ"));
+        assert!(is_local_or_ambiguous_host("１２７．０．０．１"));
+        assert!(is_local_or_ambiguous_host("０ｘ７ｆ０００００１"));
+        assert!(is_local_or_ambiguous_host("［：：１］"));
+
+        assert!(is_blocked_local_ipc_url(
+            "http://ｌｏｃａｌｈｏｓｔ:54321/api/state",
+            port
+        ));
+        assert!(is_blocked_local_ipc_url(
+            "http://１２７．０．０．１:54321/api/state",
+            port
+        ));
+        assert!(is_blocked_local_ipc_url(
+            "ws://１２７．０．０．１:54321/ws",
+            port
+        ));
+        assert!(is_blocked_local_ipc_url(
+            "//ｌｏｃａｌｈｏｓｔ:54321/api/state",
+            port
+        ));
+        assert!(is_blocked_local_ipc_url(
+            "http://127.0.0.1：54321/api/state",
+            port
+        ));
+
+        // Residual non-ASCII hosts targeting bind_port must be rejected fail-closed
+        assert!(is_blocked_local_ipc_url(
+            "http://①②⑦.0.0.1:54321/api/state",
+            port
+        ));
+        assert!(is_blocked_local_ipc_url(
+            "http://café.example.com:54321/api/state",
+            port
+        ));
+
+        // Legitimate IDN & public hosts on non-IPC ports remain allowed
+        assert!(!is_local_or_ambiguous_host("café.example.com"));
+        assert!(!is_blocked_local_ipc_url("https://café.example.com/", port));
+        assert!(!is_blocked_local_ipc_url(
+            "https://example.com:54321/",
+            port
+        ));
+    }
+
+    #[test]
+    fn test_ui_browser_navigation_lock_and_external_link_redirect() {
+        let port: u16 = 54321;
+
+        // 1. Exact local UI shell origin & initial `about:blank` are allowed in `ui_browser`
+        assert_eq!(
+            classify_ui_browser_navigation("http://127.0.0.1:54321/?boot=abc&win=w1", port),
+            UiBrowserNavigationAction::AllowInUi
+        );
+        assert_eq!(
+            classify_ui_browser_navigation("http://127.0.0.1:54321/", port),
+            UiBrowserNavigationAction::AllowInUi
+        );
+        assert_eq!(
+            classify_ui_browser_navigation("about:blank", port),
+            UiBrowserNavigationAction::AllowInUi
+        );
+        assert_eq!(
+            classify_ui_browser_navigation("  ABOUT:BLANK  ", port),
+            UiBrowserNavigationAction::AllowInUi
+        );
+
+        // 2. External HTTP(S) links dropped/navigated onto `ui_browser` are blocked in UI and
+        //    redirected to a new focused web tab
+        assert_eq!(
+            classify_ui_browser_navigation("https://github.com/MyMasha/Singularity", port),
+            UiBrowserNavigationAction::OpenInNewTab(
+                "https://github.com/MyMasha/Singularity".to_string()
+            )
+        );
+        assert_eq!(
+            classify_ui_browser_navigation("http://example.org/docs?q=1", port),
+            UiBrowserNavigationAction::OpenInNewTab("http://example.org/docs?q=1".to_string())
+        );
+
+        // 3. Dangerous / non-HTTP / local-loopback URLs are blocked silently without opening a tab
+        for blocked in [
+            "file:///C:/Windows/win.ini",
+            "FILE:///C:/Users/test/Desktop/index.html",
+            "javascript:alert(1)",
+            "data:text/html,<h1>spoof</h1>",
+            "blob:https://example.com/uuid",
+            "http://127.0.0.1:8080/admin",
+            "http://localhost:3000/",
+            "http://localhost:54321/?boot=abc",
+            "https://127.0.0.1:54321/",
+            "http://[::1]:9000/",
+            "http://0x7f000001:8080/",
+            "chrome-extension://abcdefghijklmnop/popup.html",
+            "ws://example.com/socket",
+            "",
+        ] {
+            assert_eq!(
+                classify_ui_browser_navigation(blocked, port),
+                UiBrowserNavigationAction::BlockSilent,
+                "Expected BlockSilent for ui_browser navigation to '{}'",
+                blocked
+            );
+        }
+    }
 }

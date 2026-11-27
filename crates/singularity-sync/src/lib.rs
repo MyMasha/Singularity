@@ -383,8 +383,18 @@ impl SingularitySyncEngine {
             &mut self.replay_guard,
         )?;
 
-        // Auto-enroll valid peer devices that proved knowledge of the chain AEAD key + signed validly
+        // Auto-enroll valid peer devices that proved knowledge of the chain AEAD key + signed validly,
+        // strictly refusing any revoked public key or silent TOFU enrollment after a revocation event.
         if self.device_registry.get(&envelope.device_id).is_none() {
+            if self
+                .device_registry
+                .is_pubkey_revoked(&envelope.sender_pubkey_hex)
+                || self.device_registry.has_revoked_devices()
+            {
+                return Err(SyncError::Transport(TransportError::DeviceRevoked(
+                    envelope.device_id.clone(),
+                )));
+            }
             self.device_registry.register_device(SyncDeviceInfo {
                 device_id: envelope.device_id.clone(),
                 device_name: envelope.device_id.clone(),
@@ -402,6 +412,11 @@ impl SingularitySyncEngine {
 
         match payload {
             SyncEnvelopePayload::CrdtDelta(delta) => {
+                if delta.collection != envelope.collection
+                    || delta.origin_device_id != envelope.device_id
+                {
+                    return Err(SyncError::Transport(TransportError::DecryptionFailed));
+                }
                 if !self.collection_prefs.is_enabled(delta.collection) {
                     return Ok(IngestOutcome::SkippedDisabledCollection(delta.collection));
                 }
@@ -416,6 +431,11 @@ impl SingularitySyncEngine {
                 })
             }
             SyncEnvelopePayload::SendTab(tab) => {
+                if envelope.collection != SyncCollectionKind::OpenTabs
+                    || tab.sender_device_id != envelope.device_id
+                {
+                    return Err(SyncError::Transport(TransportError::DecryptionFailed));
+                }
                 if tab.target_device_id == "*" || tab.target_device_id == self.local_device_id {
                     self.received_tabs.push(tab.clone());
                     Ok(IngestOutcome::TabReceived(tab))
@@ -480,6 +500,23 @@ impl SingularitySyncEngine {
                 }
                 Err(SyncError::Transport(TransportError::ReplayDetected { .. })) => {
                     // Already ingested from folder in an earlier poll pass
+                    report.envelopes_skipped_duplicate_or_self += 1;
+                }
+                Err(
+                    SyncError::Transport(TransportError::DeviceRevoked(_))
+                    | SyncError::Transport(TransportError::DeviceKeyMismatch(_))
+                    | SyncError::Transport(TransportError::InvalidSignature(_))
+                    | SyncError::Transport(TransportError::DecryptionFailed)
+                    | SyncError::Transport(TransportError::ChainIdMismatch)
+                    | SyncError::Transport(TransportError::UnsupportedVersion(_))
+                    | SyncError::Transport(TransportError::ZeroSequenceNumber)
+                    | SyncError::Transport(TransportError::MalformedFrame(_))
+                    | SyncError::Transport(TransportError::Serialization(_))
+                    | SyncError::Transport(TransportError::InvalidIdentifier(_))
+                    | SyncError::Crdt(_),
+                ) => {
+                    // Skip corrupted, tampered, foreign-chain, or revoked-device envelopes
+                    // individually so one bad file cannot block valid peers in the folder.
                     report.envelopes_skipped_duplicate_or_self += 1;
                 }
                 Err(other) => return Err(other),
@@ -813,5 +850,223 @@ mod tests {
             LanSyncTransport::receive_udp_beacon(&udp_rx, Duration::from_secs(2), true, false)
                 .unwrap();
         assert_eq!(decoded, beacon);
+    }
+
+    #[test]
+    fn revoked_device_cannot_bypass_via_new_device_id_or_auto_enroll() {
+        let now_sec = 1_795_651_200u64;
+        let (mut dev_a, phrase_24, _) =
+            SingularitySyncEngine::create_new_chain("Desktop", "linux", now_sec);
+        let mut dev_b =
+            SingularitySyncEngine::join_from_24_words(&phrase_24, now_sec, "Laptop", "linux")
+                .unwrap();
+
+        dev_a.upsert_item(
+            SyncCollectionKind::Settings,
+            "k1",
+            json!("v1"),
+            20_000,
+        );
+        let env1 = dev_a
+            .seal_collection_delta(SyncCollectionKind::Settings)
+            .unwrap();
+        dev_b.ingest_envelope(&env1, 20_010).unwrap();
+        assert!(dev_b.revoke_device(dev_a.local_device_id(), 20_030));
+
+        // 1. Same revoked Ed25519 pubkey attempting to re-enroll under a brand-new device_id
+        let mut forged_doc = CrdtDocument::new(SyncCollectionKind::Settings);
+        forged_doc.upsert("dev-a-reborn", "evil", json!(true), 20_040);
+        let forged_delta = forged_doc.export_delta_since("dev-a-reborn", &VectorClock::new());
+        let env_same_key_new_id = SealedSyncEnvelope::seal(
+            dev_a.master_keys(),
+            &dev_a.local_signing_key,
+            "dev-a-reborn",
+            SyncCollectionKind::Settings,
+            1,
+            &SyncEnvelopePayload::CrdtDelta(forged_delta),
+        )
+        .unwrap();
+        assert!(matches!(
+            dev_b.ingest_envelope(&env_same_key_new_id, 20_050),
+            Err(SyncError::Transport(TransportError::DeviceRevoked(_)))
+        ));
+        assert!(dev_b.device_registry().get("dev-a-reborn").is_none());
+
+        // 2. Uppercase hex variant of the revoked pubkey is also rejected
+        let upper_pk = dev_a.local_device_pubkey_hex().to_ascii_uppercase();
+        assert!(matches!(
+            dev_b
+                .device_registry()
+                .verify_authorized_sender("dev-a-upper", &upper_pk),
+            Err(TransportError::DeviceRevoked(_))
+        ));
+
+        // 3. Unknown device with a fresh Ed25519 key cannot silently TOFU auto-enroll after revocation
+        let mut fresh_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut fresh_seed);
+        let fresh_sk = SigningKey::from_bytes(&fresh_seed);
+        fresh_seed.zeroize();
+        let mut fresh_doc = CrdtDocument::new(SyncCollectionKind::Settings);
+        fresh_doc.upsert("dev-a-fresh", "evil2", json!(true), 20_060);
+        let fresh_delta = fresh_doc.export_delta_since("dev-a-fresh", &VectorClock::new());
+        let env_fresh_key = SealedSyncEnvelope::seal(
+            dev_a.master_keys(),
+            &fresh_sk,
+            "dev-a-fresh",
+            SyncCollectionKind::Settings,
+            1,
+            &SyncEnvelopePayload::CrdtDelta(fresh_delta),
+        )
+        .unwrap();
+        assert!(matches!(
+            dev_b.ingest_envelope(&env_fresh_key, 20_070),
+            Err(SyncError::Transport(TransportError::DeviceRevoked(_)))
+        ));
+        assert!(dev_b.device_registry().get("dev-a-fresh").is_none());
+    }
+
+    #[test]
+    fn vault_subkey_isolation_rejects_collection_and_origin_mismatch() {
+        let now_sec = 1_795_651_200u64;
+        let (_dev_a, phrase_24, _) =
+            SingularitySyncEngine::create_new_chain("Desktop", "linux", now_sec);
+        let mut dev_b =
+            SingularitySyncEngine::join_from_24_words(&phrase_24, now_sec, "Laptop", "linux")
+                .unwrap();
+
+        let mut rogue_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut rogue_seed);
+        let rogue_sk = SigningKey::from_bytes(&rogue_seed);
+        rogue_seed.zeroize();
+
+        // Attacker holds only content_encryption_key (NOT vault_subkey) and seals a VaultCredentials
+        // CRDT delta inside a Bookmarks envelope header.
+        let mut vault_doc = CrdtDocument::new(SyncCollectionKind::VaultCredentials);
+        vault_doc.upsert("dev-rogue", "cred-injected", json!({"pw": "evil"}), 50_000);
+        let vault_delta = vault_doc.export_delta_since("dev-rogue", &VectorClock::new());
+
+        let forged_env = SealedSyncEnvelope::seal_with_key(
+            dev_b.chain_id(),
+            dev_b.master_keys().content_encryption_key(),
+            &rogue_sk,
+            "dev-rogue",
+            SyncCollectionKind::Bookmarks,
+            1,
+            &SyncEnvelopePayload::CrdtDelta(vault_delta),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            dev_b.ingest_envelope(&forged_env, 50_010),
+            Err(SyncError::Transport(TransportError::DecryptionFailed))
+        ));
+        assert!(dev_b
+            .document(SyncCollectionKind::VaultCredentials)
+            .active_items()
+            .is_empty());
+
+        // Spoofed origin_device_id inside a matching collection is also rejected.
+        let mut bm_doc = CrdtDocument::new(SyncCollectionKind::Bookmarks);
+        bm_doc.upsert("dev-victim", "bm-spoof", json!({"url": "https://evil.example"}), 50_020);
+        let spoofed_delta = bm_doc.export_delta_since("dev-victim", &VectorClock::new());
+        let spoofed_env = SealedSyncEnvelope::seal_with_key(
+            dev_b.chain_id(),
+            dev_b.master_keys().content_encryption_key(),
+            &rogue_sk,
+            "dev-rogue",
+            SyncCollectionKind::Bookmarks,
+            2,
+            &SyncEnvelopePayload::CrdtDelta(spoofed_delta),
+        )
+        .unwrap();
+        assert!(matches!(
+            dev_b.ingest_envelope(&spoofed_env, 50_030),
+            Err(SyncError::Transport(TransportError::DecryptionFailed))
+        ));
+    }
+
+    #[test]
+    fn encrypted_folder_skips_corrupted_and_revoked_envelopes_without_blocking_valid_peers() {
+        let dir = unique_temp_dir("folder_resilience");
+        let now_sec = 1_795_651_200u64;
+
+        let (mut dev_revoked, phrase_24, _) =
+            SingularitySyncEngine::create_new_chain("RevokedLaptop", "linux", now_sec);
+        let mut dev_good =
+            SingularitySyncEngine::join_from_24_words(&phrase_24, now_sec, "GoodDesktop", "linux")
+                .unwrap();
+        let mut dev_receiver =
+            SingularitySyncEngine::join_from_24_words(&phrase_24, now_sec, "Receiver", "linux")
+                .unwrap();
+
+        // First enroll both dev_revoked and dev_good on receiver before any revocation event
+        // (post-revocation silent TOFU enrollment is strictly forbidden by security policy),
+        // then revoke dev_revoked.
+        dev_revoked.upsert_item(
+            SyncCollectionKind::Bookmarks,
+            "bm-before-revoke",
+            json!({"title": "Initial"}),
+            10_000,
+        );
+        let initial_env = dev_revoked
+            .seal_collection_delta(SyncCollectionKind::Bookmarks)
+            .unwrap();
+        dev_receiver.ingest_envelope(&initial_env, 10_010).unwrap();
+
+        dev_good.upsert_item(
+            SyncCollectionKind::Bookmarks,
+            "bm-good-init",
+            json!({"title": "Good Peer Enrolled"}),
+            10_012,
+        );
+        let good_init_env = dev_good
+            .seal_collection_delta(SyncCollectionKind::Bookmarks)
+            .unwrap();
+        dev_receiver.ingest_envelope(&good_init_env, 10_015).unwrap();
+
+        assert!(dev_receiver.revoke_device(dev_revoked.local_device_id(), 10_020));
+
+        // 1. Write a corrupted JSON file with an early sorting name
+        std::fs::write(
+            dir.join("000_corrupt.singularity-delta.enc"),
+            b"{not valid json!!!",
+        )
+        .unwrap();
+
+        // 2. Write a subsequent envelope from the revoked device
+        dev_revoked.upsert_item(
+            SyncCollectionKind::Bookmarks,
+            "bm-evil",
+            json!({"title": "Revoked"}),
+            10_050,
+        );
+        dev_revoked.push_to_encrypted_folder(&dir).unwrap();
+
+        // 3. Write a valid envelope from dev_good
+        dev_good.upsert_item(
+            SyncCollectionKind::Bookmarks,
+            "bm-good",
+            json!({"title": "Valid Peer Bookmark"}),
+            10_060,
+        );
+        dev_good.push_to_encrypted_folder(&dir).unwrap();
+
+        // Pull must skip the corrupted JSON and revoked device envelope and still merge dev_good
+        let report = dev_receiver
+            .pull_from_encrypted_folder(&dir, 10_100)
+            .expect("pull must not abort on corrupted or revoked files");
+        assert_eq!(report.envelopes_applied, 1);
+        assert_eq!(
+            dev_receiver
+                .document(SyncCollectionKind::Bookmarks)
+                .get("bm-good"),
+            Some(&json!({"title": "Valid Peer Bookmark"}))
+        );
+        assert!(dev_receiver
+            .document(SyncCollectionKind::Bookmarks)
+            .get("bm-evil")
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

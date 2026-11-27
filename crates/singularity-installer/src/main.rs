@@ -15,9 +15,16 @@ use std::sync::{Arc, Mutex};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Fallback 64-hex-character Ed25519 release signing public key pinned to match
+/// `crates/singularity-ui/src/updater.rs::RELEASE_SIGNING_PUBKEY_HEX` when
+/// `SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX` is not injected at compile time via `option_env!`.
+const PINNED_RELEASE_SIGNING_PUBKEY_HEX: &str =
+    "3af87c325effee5f8f23e1ba7d9b8c5e7cebda70388718e87cf308237e70c155";
+
 /// Compile-time optional 64-hex-character Ed25519 release signing public key injected by CI
 /// (`.github/workflows/release.yml`) from `SINGULARITY_RELEASE_SIGNING_KEY`.
-/// When present, every `SGX1` SFX ZIP overlay MUST carry a valid Ed25519 signature.
+/// When absent or empty, falls back to `PINNED_RELEASE_SIGNING_PUBKEY_HEX`.
+/// Every `SGX1` SFX ZIP overlay in release builds MUST carry a valid Ed25519 signature.
 const EMBEDDED_RELEASE_SIGNING_PUBKEY_HEX: Option<&str> =
     option_env!("SINGULARITY_RELEASE_SIGNING_PUBKEY_HEX");
 
@@ -1025,9 +1032,15 @@ fn roaming_singularity_dir() -> Result<PathBuf, String> {
 }
 
 fn embedded_release_pubkey_hex() -> Option<&'static str> {
-    EMBEDDED_RELEASE_SIGNING_PUBKEY_HEX
+    let candidate = EMBEDDED_RELEASE_SIGNING_PUBKEY_HEX
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| PINNED_RELEASE_SIGNING_PUBKEY_HEX.trim());
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate)
+    }
 }
 
 /// Validates an appended `SGX1` SFX ZIP overlay on `reader`:
@@ -1105,6 +1118,14 @@ fn open_verified_sfx_zip<R: Read + Seek>(
         let pk_bytes = crypto_verify::decode_hex_32(pk_hex)?;
         crypto_verify::ed25519_verify(&pk_bytes, &trailer[0..SFX_SIGNED_HEADER_LEN], &sig_bytes)
             .map_err(|e| format!("SFX overlay Ed25519 signature verification failed: {e}"))?;
+    } else {
+        #[cfg(not(debug_assertions))]
+        {
+            return Err(
+                "Refusing unsigned SGX1 SFX overlay in release build: Ed25519 signing public key is required."
+                    .to_string(),
+            );
+        }
     }
 
     // Stream exact ZIP slice `[zip_start .. zip_start + zip_len]` through SHA-256 on the same handle
@@ -1620,6 +1641,319 @@ fn set_step<F: Fn()>(
     notify();
 }
 
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn normalize_win_path_str(raw: &str) -> String {
+    let stripped = raw.trim().strip_prefix(r"\\?\").unwrap_or(raw.trim());
+    let mut s = stripped.replace('/', "\\").to_ascii_lowercase();
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    if s.len() == 2 && s.as_bytes()[1] == b':' {
+        s.push('\\');
+    }
+    s
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn lexically_normalize_win_str(raw: &str) -> String {
+    let s = normalize_win_path_str(raw);
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = &s[..2];
+        let rest = s[2..].trim_start_matches('\\');
+        let mut segs: Vec<&str> = Vec::new();
+        for seg in rest.split('\\') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    segs.pop();
+                }
+                other => segs.push(other),
+            }
+        }
+        if segs.is_empty() {
+            format!("{drive}\\")
+        } else {
+            format!("{drive}\\{}", segs.join("\\"))
+        }
+    } else {
+        s
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn validate_windows_install_dir_str(raw: &str, env_vars: &[(&str, &str)]) -> Result<(), String> {
+    let norm = lexically_normalize_win_str(raw);
+    if norm.is_empty() {
+        return Err("Installation path is empty.".into());
+    }
+    if let Some(unc_rest) = norm.strip_prefix(r"\\") {
+        let seg_count = unc_rest.split('\\').filter(|s| !s.is_empty()).count();
+        if seg_count <= 2 {
+            return Err(format!(
+                "Refusing unsafe root/share installation directory '{}'. Choose a dedicated Singularity subfolder.",
+                raw
+            ));
+        }
+    }
+    let bytes = norm.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let after_drive = norm.get(3..).unwrap_or("");
+        if after_drive.is_empty() {
+            return Err(format!(
+                "Refusing drive root installation directory '{}'. Choose a dedicated Singularity subfolder.",
+                raw
+            ));
+        }
+        if after_drive == "windows"
+            || after_drive.starts_with("windows\\")
+            || after_drive == "$recycle.bin"
+            || after_drive.starts_with("$recycle.bin\\")
+            || after_drive == "system volume information"
+            || after_drive.starts_with("system volume information\\")
+        {
+            return Err(format!(
+                "Refusing protected Windows system directory '{}'. Choose a dedicated Singularity subfolder.",
+                raw
+            ));
+        }
+        if matches!(
+            after_drive,
+            "program files" | "program files (x86)" | "programdata" | "users"
+        ) {
+            return Err(format!(
+                "Refusing shared system directory '{}'. Choose a dedicated subfolder such as '{}\\Singularity'.",
+                raw,
+                raw.trim_end_matches(['\\', '/'])
+            ));
+        }
+    } else if norm == "\\" || norm == "/" {
+        return Err("Refusing root installation directory.".into());
+    }
+
+    for &(var_name, var_val) in env_vars {
+        let trimmed = var_val.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let env_norm = lexically_normalize_win_str(trimmed);
+        if env_norm.is_empty() {
+            continue;
+        }
+        if matches!(var_name, "SystemRoot" | "WINDIR") {
+            let prefix = if env_norm.ends_with('\\') {
+                env_norm.clone()
+            } else {
+                format!("{env_norm}\\")
+            };
+            if norm == env_norm || norm.starts_with(&prefix) {
+                return Err(format!(
+                    "Refusing protected system directory '{}' (%{}%).",
+                    raw, var_name
+                ));
+            }
+            continue;
+        }
+        if norm == env_norm {
+            return Err(format!(
+                "Refusing shared directory '{}' (%{}%). Choose a dedicated Singularity subfolder.",
+                raw, var_name
+            ));
+        }
+        if var_name.eq_ignore_ascii_case("LOCALAPPDATA") {
+            for sub in ["programs", "temp"] {
+                if norm == format!("{env_norm}\\{sub}") {
+                    return Err(format!(
+                        "Refusing shared directory '{}'. Choose a dedicated Singularity subfolder.",
+                        raw
+                    ));
+                }
+            }
+        } else if var_name.eq_ignore_ascii_case("USERPROFILE") {
+            for sub in [
+                "desktop",
+                "documents",
+                "downloads",
+                "appdata",
+                "appdata\\local",
+                "appdata\\local\\programs",
+                "appdata\\roaming",
+            ] {
+                if norm == format!("{env_norm}\\{sub}") {
+                    return Err(format!(
+                        "Refusing shared user profile directory '{}'. Choose a dedicated Singularity subfolder.",
+                        raw
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates that `target_dir` is a safe, dedicated, absolute installation directory and NOT a
+/// drive/filesystem root, OS system directory, or shared user/program parent folder.
+fn validate_install_dir(target_dir: &Path) -> Result<(), String> {
+    if target_dir.as_os_str().is_empty() {
+        return Err("Installation path is empty.".into());
+    }
+    if !target_dir.is_absolute() {
+        return Err(format!(
+            "Installation path '{}' must be an absolute path.",
+            target_dir.display()
+        ));
+    }
+    let lexical = normalize_path_lexically(target_dir);
+    let has_normal_component = lexical
+        .components()
+        .any(|c| matches!(c, Component::Normal(_)));
+    if !has_normal_component {
+        return Err(format!(
+            "Refusing root installation directory '{}'. Choose a dedicated Singularity subfolder.",
+            target_dir.display()
+        ));
+    }
+
+    let mut candidates = vec![lexical];
+    if let Ok(canon) = std::fs::canonicalize(target_dir) {
+        candidates.push(canon);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        const WIN_ENV_NAMES: &[&str] = &[
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "ProgramData",
+            "PUBLIC",
+            "TEMP",
+            "TMP",
+            "SystemRoot",
+            "WINDIR",
+        ];
+        let env_owned: Vec<(&str, String)> = WIN_ENV_NAMES
+            .iter()
+            .filter_map(|&name| std::env::var(name).ok().map(|val| (name, val)))
+            .collect();
+        let env_refs: Vec<(&str, &str)> = env_owned
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+        for cand in &candidates {
+            let s = cand.to_string_lossy();
+            validate_windows_install_dir_str(&s, &env_refs)?;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home_opt = std::env::var("HOME")
+            .ok()
+            .map(|h| normalize_path_lexically(Path::new(h.trim())));
+        for cand in &candidates {
+            let norm = normalize_path_lexically(cand);
+            let s = norm.to_string_lossy();
+            let trimmed = s.trim_end_matches('/');
+            if trimmed.is_empty()
+                || matches!(
+                    trimmed,
+                    "/bin"
+                        | "/sbin"
+                        | "/usr"
+                        | "/usr/bin"
+                        | "/usr/local"
+                        | "/usr/local/bin"
+                        | "/etc"
+                        | "/var"
+                        | "/lib"
+                        | "/lib64"
+                        | "/boot"
+                        | "/dev"
+                        | "/proc"
+                        | "/sys"
+                        | "/root"
+                        | "/tmp"
+                        | "/opt"
+                        | "/home"
+                )
+                || trimmed.starts_with("/etc/")
+                || trimmed.starts_with("/proc/")
+                || trimmed.starts_with("/sys/")
+                || trimmed.starts_with("/dev/")
+                || trimmed.starts_with("/boot/")
+            {
+                return Err(format!(
+                    "Refusing protected system installation directory '{}'. Choose a dedicated Singularity subfolder.",
+                    target_dir.display()
+                ));
+            }
+            if let Some(ref home) = home_opt {
+                if norm == *home
+                    || norm == home.join(".local")
+                    || norm == home.join(".local").join("share")
+                    || norm == home.join(".local").join("bin")
+                    || norm == home.join(".config")
+                {
+                    return Err(format!(
+                        "Refusing shared home directory '{}'. Choose a dedicated Singularity subfolder.",
+                        target_dir.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `true` ONLY when `actual_norm_path` refers strictly to an executable named
+/// `singularity.exe` (case-insensitive) located under `target_dir`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_matching_singularity_process_path(
+    actual_norm_path: &str,
+    expected_dir_prefix: &str,
+    expected_exe: &str,
+) -> bool {
+    let file_name = actual_norm_path.rsplit(['\\', '/']).next().unwrap_or("");
+    if !file_name.eq_ignore_ascii_case("singularity.exe") {
+        return false;
+    }
+    if !expected_exe.is_empty() && actual_norm_path == expected_exe {
+        return true;
+    }
+    if !expected_dir_prefix.is_empty() {
+        if expected_dir_prefix.ends_with('\\') || expected_dir_prefix.ends_with('/') {
+            return actual_norm_path.starts_with(expected_dir_prefix);
+        }
+        if let Some(rest) = actual_norm_path.strip_prefix(expected_dir_prefix) {
+            return rest.starts_with('\\') || rest.starts_with('/');
+        }
+    }
+    false
+}
+
 fn perform_installation<F: Fn()>(
     opts: &InstallOptions,
     progress: &Arc<Mutex<SharedProgress>>,
@@ -1638,9 +1972,7 @@ fn perform_installation<F: Fn()>(
         }
     }
     let target_dir = PathBuf::from(opts.install_dir.trim());
-    if target_dir.as_os_str().is_empty() {
-        return Err("Installation path is empty.".into());
-    }
+    validate_install_dir(&target_dir)?;
 
     let exe_name = if cfg!(target_os = "windows") {
         "singularity.exe"
@@ -1902,10 +2234,11 @@ mod win32_ops {
                                 let actual =
                                     String::from_utf16_lossy(&path_buf[..len as usize]);
                                 let norm = normalize_win_path(Path::new(&actual));
-                                if norm == expected_exe
-                                    || (!expected_dir_prefix.is_empty()
-                                        && norm.starts_with(expected_dir_prefix))
-                                {
+                                if super::is_matching_singularity_process_path(
+                                    &norm,
+                                    expected_dir_prefix,
+                                    expected_exe,
+                                ) {
                                     pids.push(entry.th32ProcessID);
                                 }
                             }
@@ -4275,5 +4608,120 @@ mod tests {
             "roaming_singularity_dir must never fall back to /tmp: {}",
             roam.display()
         );
+    }
+
+    #[test]
+    fn test_pinned_release_signing_pubkey_fallback_is_valid_ed25519_hex() {
+        let pk_hex = embedded_release_pubkey_hex()
+            .expect("pinned fallback Ed25519 pubkey must be resolved when env var is absent");
+        assert_eq!(pk_hex.len(), 64);
+        assert!(
+            crypto_verify::decode_hex_32(pk_hex).is_ok(),
+            "pinned pubkey hex must decode to 32 bytes"
+        );
+    }
+
+    #[test]
+    fn test_validate_install_dir_rejects_roots_and_protected_dirs() {
+        let env_vars = [
+            ("USERPROFILE", r"C:\Users\Alice"),
+            ("LOCALAPPDATA", r"C:\Users\Alice\AppData\Local"),
+            ("APPDATA", r"C:\Users\Alice\AppData\Roaming"),
+            ("ProgramFiles", r"C:\Program Files"),
+            ("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            ("ProgramData", r"C:\ProgramData"),
+            ("SystemRoot", r"C:\Windows"),
+            ("WINDIR", r"C:\Windows"),
+            ("TEMP", r"C:\Users\Alice\AppData\Local\Temp"),
+        ];
+
+        for bad in [
+            r"C:\",
+            r"D:\",
+            r"C:\Windows",
+            r"C:\Windows\System32",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+            r"C:\Users",
+            r"C:\Users\Alice",
+            r"C:\Users\Alice\Desktop",
+            r"C:\Users\Alice\AppData\Local",
+            r"C:\Users\Alice\AppData\Local\Programs",
+            r"C:\Users\Alice\AppData\Local\Programs\Singularity\..",
+            r"C:\Users\Alice\AppData\Roaming",
+            r"C:\Users\Alice\AppData\Local\Temp",
+            r"\\server\share",
+        ] {
+            assert!(
+                validate_windows_install_dir_str(bad, &env_vars).is_err(),
+                "dangerous install dir '{}' MUST be rejected",
+                bad
+            );
+        }
+
+        for good in [
+            r"C:\Users\Alice\AppData\Local\Programs\Singularity",
+            r"C:\Program Files\Singularity",
+            r"D:\Apps\Singularity",
+        ] {
+            assert!(
+                validate_windows_install_dir_str(good, &env_vars).is_ok(),
+                "legitimate install dir '{}' MUST be accepted",
+                good
+            );
+        }
+    }
+
+    #[test]
+    fn test_matching_singularity_process_path_restricts_to_singularity_exe_under_target_dir() {
+        let dir_prefix = r"c:\users\alice\appdata\local\programs\singularity\";
+        let expected_exe = r"c:\users\alice\appdata\local\programs\singularity\singularity.exe";
+
+        // Matches singularity.exe (case-insensitive) directly or under target_dir
+        assert!(is_matching_singularity_process_path(
+            expected_exe,
+            dir_prefix,
+            expected_exe
+        ));
+        assert!(is_matching_singularity_process_path(
+            r"c:\users\alice\appdata\local\programs\singularity\SINGULARITY.EXE",
+            dir_prefix,
+            expected_exe
+        ));
+        assert!(is_matching_singularity_process_path(
+            r"c:\users\alice\appdata\local\programs\singularity\sub\singularity.exe",
+            dir_prefix,
+            expected_exe
+        ));
+
+        // Never matches unrelated executables even inside target_dir
+        assert!(!is_matching_singularity_process_path(
+            r"c:\users\alice\appdata\local\programs\singularity\explorer.exe",
+            dir_prefix,
+            expected_exe
+        ));
+        assert!(!is_matching_singularity_process_path(
+            r"c:\users\alice\appdata\local\programs\singularity\singularity-setup.exe",
+            dir_prefix,
+            expected_exe
+        ));
+        assert!(!is_matching_singularity_process_path(
+            r"c:\windows\system32\svchost.exe",
+            dir_prefix,
+            expected_exe
+        ));
+
+        // Never matches singularity.exe outside target_dir or sibling prefix
+        assert!(!is_matching_singularity_process_path(
+            r"c:\users\alice\appdata\local\programs\singularity-dev\singularity.exe",
+            dir_prefix,
+            expected_exe
+        ));
+        assert!(!is_matching_singularity_process_path(
+            r"d:\other\singularity.exe",
+            dir_prefix,
+            expected_exe
+        ));
     }
 }

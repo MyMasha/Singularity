@@ -20,6 +20,12 @@ pub const DNS_TYPE_AAAA: u16 = 28;
 pub const DNS_TYPE_SVCB: u16 = 64;
 pub const DNS_TYPE_HTTPS: u16 = 65;
 
+/// Maximum RFC 8484 DNS-over-HTTPS response payload size (64 KiB).
+const MAX_DOH_RESPONSE_BYTES: usize = 65_536;
+
+/// Maximum number of cached DNS records retained in memory by [`EncryptedDnsResolver`].
+const MAX_DNS_CACHE_ENTRIES: usize = 4_096;
+
 /// Encrypted DNS transport protocol supported by Singularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EncryptedDnsProtocol {
@@ -295,6 +301,7 @@ pub enum DnsResolutionOutcome {
 struct CachedDnsEntry {
     record: EncryptedDnsRecord,
     expires_at_unix: u64,
+    inserted_seq: u64,
 }
 
 fn now_unix_sec() -> u64 {
@@ -313,6 +320,7 @@ pub struct EncryptedDnsResolver {
     fallback_policy: DnsFallbackPolicy,
     captive_portal_state: CaptivePortalState,
     cache: HashMap<String, CachedDnsEntry>,
+    cache_insert_seq: u64,
     custom_transport: Option<DohTransportFn>,
     allow_explicit_loopback: bool,
 }
@@ -337,6 +345,7 @@ impl EncryptedDnsResolver {
             fallback_policy: DnsFallbackPolicy::StrictFailClosed,
             captive_portal_state: CaptivePortalState::None,
             cache: HashMap::new(),
+            cache_insert_seq: 0,
             custom_transport: None,
             allow_explicit_loopback: false,
         }
@@ -351,6 +360,7 @@ impl EncryptedDnsResolver {
             fallback_policy: DnsFallbackPolicy::StrictFailClosed,
             captive_portal_state: CaptivePortalState::None,
             cache: HashMap::new(),
+            cache_insert_seq: 0,
             custom_transport: None,
             allow_explicit_loopback: false,
         }
@@ -419,12 +429,38 @@ impl EncryptedDnsResolver {
     }
 
     pub fn insert_cached_record(&mut self, record: EncryptedDnsRecord) {
-        let expires_at_unix = now_unix_sec().saturating_add(u64::from(record.ttl_seconds.max(1)));
+        let now = now_unix_sec();
+        let key = record.query_hostname.to_ascii_lowercase();
+        let expires_at_unix = now.saturating_add(u64::from(record.ttl_seconds.max(1)));
+
+        if !self.cache.contains_key(&key) && self.cache.len() >= MAX_DNS_CACHE_ENTRIES {
+            // Purge expired entries first before evicting live entries.
+            self.cache.retain(|_, entry| entry.expires_at_unix > now);
+
+            // If still at capacity, evict the oldest inserted entries.
+            while self.cache.len() >= MAX_DNS_CACHE_ENTRIES {
+                let oldest_key = self
+                    .cache
+                    .iter()
+                    .min_by_key(|(_, entry)| (entry.inserted_seq, entry.expires_at_unix))
+                    .map(|(k, _)| k.clone());
+                match oldest_key {
+                    Some(k) => {
+                        self.cache.remove(&k);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        self.cache_insert_seq = self.cache_insert_seq.saturating_add(1);
+        let inserted_seq = self.cache_insert_seq;
         self.cache.insert(
-            record.query_hostname.to_ascii_lowercase(),
+            key,
             CachedDnsEntry {
                 record,
                 expires_at_unix,
+                inserted_seq,
             },
         );
     }
@@ -1381,6 +1417,8 @@ impl PartitionedHstsStore {
 
 #[cfg(not(target_os = "windows"))]
 fn execute_system_https_doh(doh_url: &str, wire_query: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
     let mut child = Command::new("curl")
         .args([
             "--silent",
@@ -1393,6 +1431,8 @@ fn execute_system_https_doh(doh_url: &str, wire_query: &[u8]) -> Result<Vec<u8>,
             "5",
             "--connect-timeout",
             "4",
+            "--max-filesize",
+            "65536",
             "-X",
             "POST",
             "-H",
@@ -1416,25 +1456,48 @@ fn execute_system_https_doh(doh_url: &str, wire_query: &[u8]) -> Result<Vec<u8>,
             .map_err(|e| format!("Failed writing DNS wire query to DoH transport: {}", e))?;
     }
 
-    let output = child
-        .wait_with_output()
+    let mut body = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take((MAX_DOH_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("HTTPS DoH transport I/O error: {}", e))?;
+    }
+    if body.len() > MAX_DOH_RESPONSE_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "HTTPS DoH response exceeds maximum allowed {} bytes",
+            MAX_DOH_RESPONSE_BYTES
+        ));
+    }
+
+    let mut err_buf = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        let _ = stderr.take(4096).read_to_end(&mut err_buf);
+    }
+
+    let status = child
+        .wait()
         .map_err(|e| format!("HTTPS DoH transport I/O error: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err_buf);
         return Err(format!(
             "HTTPS DoH request failed (status {}): {}",
-            output.status,
+            status,
             stderr.trim()
         ));
     }
-    if output.stdout.is_empty() {
+    if body.is_empty() {
         return Err("HTTPS DoH resolver returned an empty body".into());
     }
-    Ok(output.stdout)
+    Ok(body)
 }
 
 #[cfg(target_os = "windows")]
 fn execute_system_https_doh(doh_url: &str, wire_query: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
     let query_hex: String = wire_query.iter().map(|b| format!("{:02x}", b)).collect();
     let ps_script = r#"
 $ErrorActionPreference = 'Stop'
@@ -1447,6 +1510,8 @@ for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hex.S
 $req = [System.Net.HttpWebRequest]::Create($url)
 $req.Method = 'POST'
 $req.Timeout = 5000
+$req.ReadWriteTimeout = 5000
+$req.AllowAutoRedirect = $false
 $req.ContentType = 'application/dns-message'
 $req.Accept = 'application/dns-message'
 $req.ContentLength = $bytes.Length
@@ -1454,33 +1519,86 @@ $reqStream = $req.GetRequestStream()
 $reqStream.Write($bytes, 0, $bytes.Length)
 $reqStream.Close()
 $resp = $req.GetResponse()
+if ([int]$resp.StatusCode -ne 200) {
+  $code = [int]$resp.StatusCode
+  $resp.Close()
+  throw "Unexpected DoH HTTP status $code"
+}
+$maxBytes = 65536
+if ($resp.ContentLength -gt $maxBytes) {
+  $resp.Close()
+  throw "DoH response exceeds maximum allowed $maxBytes bytes"
+}
+$stream = $resp.GetResponseStream()
 $ms = New-Object System.IO.MemoryStream
-$resp.GetResponseStream().CopyTo($ms)
+$buf = New-Object byte[] 4096
+$total = 0
+while (($read = $stream.Read($buf, 0, $buf.Length)) -gt 0) {
+  $total += $read
+  if ($total -gt $maxBytes) {
+    $stream.Close()
+    $resp.Close()
+    throw "DoH response exceeds maximum allowed $maxBytes bytes"
+  }
+  $ms.Write($buf, 0, $read)
+}
+$stream.Close()
 $resp.Close()
 [BitConverter]::ToString($ms.ToArray()).Replace('-', '')
 "#;
-    let output = Command::new("powershell")
+    let mut child = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
         .env("SINGULARITY_DOH_URL", doh_url)
         .env("SINGULARITY_DOH_QUERY_HEX", &query_hex)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| format!("Failed to invoke Windows HTTPS DoH transport: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let max_stdout_bytes = MAX_DOH_RESPONSE_BYTES * 2 + 64;
+    let mut stdout_buf = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take((max_stdout_bytes + 1) as u64)
+            .read_to_end(&mut stdout_buf)
+            .map_err(|e| format!("Windows HTTPS DoH stdout I/O error: {}", e))?;
+    }
+    if stdout_buf.len() > max_stdout_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "Windows HTTPS DoH response exceeds maximum allowed {} bytes",
+            MAX_DOH_RESPONSE_BYTES
+        ));
+    }
+
+    let mut stderr_buf = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        let _ = stderr.take(4096).read_to_end(&mut stderr_buf);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Windows HTTPS DoH wait error: {}", e))?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_buf);
         return Err(format!("Windows HTTPS DoH request failed: {}", stderr.trim()));
     }
-    let hex_out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let hex_out = String::from_utf8_lossy(&stdout_buf).trim().to_string();
     decode_hex_bytes(&hex_out)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    if s.is_empty() || s.len() % 2 != 0 {
+    if !s.is_ascii() || s.is_empty() || s.len() % 2 != 0 {
         return Err("Invalid hex response from Windows DoH transport".into());
+    }
+    if s.len() > MAX_DOH_RESPONSE_BYTES * 2 {
+        return Err(format!(
+            "Windows DoH response exceeds maximum allowed {} bytes",
+            MAX_DOH_RESPONSE_BYTES
+        ));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     for i in (0..s.len()).step_by(2) {
@@ -1726,5 +1844,40 @@ mod tests {
         assert!(!hsts.should_upgrade_to_https("site-a.test", "img.cdn.shared.test", 5000));
         assert!(hsts.delete("site-a.test", "cdn.shared.test"));
         assert_eq!(hsts.purge_all(), 0);
+    }
+
+    #[test]
+    fn test_decode_hex_bytes_rejects_non_ascii_and_oversized() {
+        assert_eq!(decode_hex_bytes("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        // Non-ASCII UTF-8 string of even byte length must return Err without panicking
+        assert!(decode_hex_bytes("a\u{00E9}a").is_err());
+        // Oversized response (> 64 KiB) must be rejected
+        let too_large = "aa".repeat(MAX_DOH_RESPONSE_BYTES + 1);
+        assert!(decode_hex_bytes(&too_large).is_err());
+    }
+
+    #[test]
+    fn test_dns_cache_enforces_max_capacity_and_evicts_oldest() {
+        let mut resolver = EncryptedDnsResolver::from_preset(DnsProviderPreset::Cloudflare);
+        let overflow = 12usize;
+        for i in 0..(MAX_DNS_CACHE_ENTRIES + overflow) {
+            resolver.insert_cached_record(EncryptedDnsRecord {
+                query_hostname: format!("host-{i}.example.test"),
+                canonical_cname_chain: Vec::new(),
+                ipv4_addresses: vec!["93.184.216.34".into()],
+                ipv6_addresses: Vec::new(),
+                ech_config_base64: None,
+                ttl_seconds: 300,
+            });
+        }
+        assert_eq!(resolver.cache.len(), MAX_DNS_CACHE_ENTRIES);
+        // Oldest entries must have been evicted
+        for i in 0..overflow {
+            assert!(!resolver.cache.contains_key(&format!("host-{i}.example.test")));
+        }
+        // Newest entries must still be cached
+        assert!(resolver
+            .cache
+            .contains_key(&format!("host-{}.example.test", MAX_DNS_CACHE_ENTRIES + overflow - 1)));
     }
 }

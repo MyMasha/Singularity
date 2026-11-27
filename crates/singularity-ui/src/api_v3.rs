@@ -35,7 +35,7 @@ use crate::profiles::{
     SiteBoostRule, WebPanelConfig, WorkspaceRecord,
 };
 use crate::roaming_store::unix_now;
-use crate::server::{HttpResponse, ParsedHttpRequest};
+use crate::server::{HttpResponse, ParsedHttpRequest, ServerConfig};
 use crate::shell::SingularityBrowserShell;
 use singularity_cast::CastPlaybackCommand;
 use singularity_core::{
@@ -60,9 +60,47 @@ use singularity_vault::{
     PasswordGeneratorConfig, SendPayloadType, SingularitySendEnvelope, VaultFolder, VaultItem,
     WordCapitalization, WordlistLanguage,
 };
+use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
+
+const MAX_STAGE_REVIEW_CRX_BYTES: u64 = 32 * 1024 * 1024;
+
+fn is_unc_or_device_path(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.bytes().any(|b| b <= 0x1f || b == 0x7f)
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("\\\\?\\")
+        || trimmed.starts_with("\\\\.\\")
+        || trimmed.starts_with("//?/")
+        || trimmed.starts_with("//./")
+}
+
+fn has_parent_dir_component(raw: &str) -> bool {
+    raw.split(['/', '\\']).any(|seg| seg == "..")
+        || Path::new(raw)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+}
+
+fn is_symlink_or_reparse_meta(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
 
 fn parse_body(req: &ParsedHttpRequest) -> serde_json::Value {
     if req.body.is_empty() {
@@ -163,7 +201,8 @@ pub(crate) fn build_internal_page_context(
         })
         .collect();
 
-    let wv = inspect_widevine_status(shell.roaming.root_dir());
+    let cef_profile_dir = shell.roaming.chromium_profile_dir();
+    let wv = inspect_widevine_status(&cef_profile_dir);
     ctx.components.push(ComponentEntry {
         id: "widevine-cdm".to_string(),
         name: "Widevine Content Decryption Module".to_string(),
@@ -256,21 +295,54 @@ pub(crate) fn handle_browser_internal_page(
         normalized_slug.as_str()
     };
     match render_internal_page_html(target, &ctx) {
-        Some(html) => HttpResponse::new("200 OK", "text/html; charset=utf-8", html.into_bytes())
-            .with_header(
-                "Content-Security-Policy",
-                "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none';",
+        Some(html) => {
+            let mut csp_nonce_raw = [0u8; 16];
+            OsRng.fill_bytes(&mut csp_nonce_raw);
+            let csp_nonce = hex::encode(csp_nonce_raw);
+            let html_with_nonce = crate::server::inject_csp_nonce(&html, &csp_nonce);
+            let csp_header = format!(
+                "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-{}'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self';",
+                csp_nonce
+            );
+            HttpResponse::new(
+                "200 OK",
+                "text/html; charset=utf-8",
+                html_with_nonce.into_bytes(),
             )
-            .with_header("X-Frame-Options", "SAMEORIGIN"),
+            .with_header("Content-Security-Policy", csp_header)
+            .with_header("X-Frame-Options", "SAMEORIGIN")
+        }
         None => HttpResponse::text("404 Not Found", "Unknown browser:// internal page"),
     }
 }
 
-/// Dispatches all v3.0 API routes across all 10 domains. Returns `None` if path is not a v3 route.
+fn enforce_v3_vault_auto_lock(shell: &mut SingularityBrowserShell, cfg: Option<&ServerConfig>) {
+    if let Some(c) = cfg {
+        crate::server::enforce_vault_auto_lock_and_sync(shell, c);
+    } else {
+        shell.enforce_vault_auto_lock();
+    }
+}
+
+/// Dispatches all v3.0 API routes across all 10 domains (test-only 3-arg convenience wrapper).
+/// Production callers MUST use [`try_handle_v3_route_with_config`] with `Some(cfg)`.
+#[cfg(test)]
 pub(crate) fn try_handle_v3_route(
     req: &ParsedHttpRequest,
     params: &HashMap<String, String>,
     shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
+) -> Option<HttpResponse> {
+    try_handle_v3_route_with_config(req, params, shell_mutex, None)
+}
+
+/// Dispatches all v3.0 API routes with optional `ServerConfig` so every `/api/vault/*` route
+/// enforces auto-lock synchronization, activity touch, and `vault_op_lock` serialization
+/// matching `server.rs`'s strict lock hierarchy (`vault_op_lock -> shell_mutex -> vault_session_cache`).
+pub(crate) fn try_handle_v3_route_with_config(
+    req: &ParsedHttpRequest,
+    params: &HashMap<String, String>,
+    shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
+    cfg: Option<&ServerConfig>,
 ) -> Option<HttpResponse> {
     let path = req.path.as_str();
     let resp = match path {
@@ -433,7 +505,8 @@ pub(crate) fn try_handle_v3_route(
         }
         "/api/internal/components" => {
             let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            let wv = inspect_widevine_status(shell.roaming.root_dir());
+            let cef_profile_dir = shell.roaming.chromium_profile_dir();
+            let wv = inspect_widevine_status(&cef_profile_dir);
             ok_json(&serde_json::json!({
                 "widevine": wv,
                 "filter_lists": shell.core.adblocker.subscriptions(),
@@ -812,6 +885,7 @@ pub(crate) fn try_handle_v3_route(
             let input = NewBookmarkNode {
                 parent_id: body
                     .get("parent_id")
+                    .or_else(|| body.get("folder_id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or(ROOT_BOOKMARK_BAR)
                     .to_string(),
@@ -1471,11 +1545,14 @@ pub(crate) fn try_handle_v3_route(
         // DOMAIN 5: VAULT V2, GENERATOR, HEALTH, PASSKEYS, TOTP, IMPORT/EXPORT, CXF, SEND
         // ====================================================================
         "/api/vault/items" => {
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
             let q = params.get("q").map(String::as_str).unwrap_or("");
             if shell.vault.is_locked() {
                 return Some(err_json("423 Locked", "Vault is locked"));
             }
+            shell.touch_vault_activity();
             let items = if q.is_empty() {
                 match shell.vault.active_items() {
                     Ok(list) => list.into_iter().cloned().collect::<Vec<_>>(),
@@ -1498,9 +1575,15 @@ pub(crate) fn try_handle_v3_route(
             let Ok(item) = serde_json::from_value::<VaultItem>(body) else {
                 return Some(err_json("400 Bad Request", "Invalid VaultItem JSON"));
             };
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
             match shell.vault.upsert_item(item, unix_now()) {
                 Ok(()) => {
+                    shell.touch_vault_activity();
                     let _ = shell.persist_unlocked_vault_to_disk();
                     ok_json(&serde_json::json!({ "ok": true }))
                 }
@@ -1513,9 +1596,15 @@ pub(crate) fn try_handle_v3_route(
                 Err(r) => return Some(r),
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
             match shell.vault.trash_item(id, unix_now()) {
                 Ok(ok) => {
+                    shell.touch_vault_activity();
                     let _ = shell.persist_unlocked_vault_to_disk();
                     ok_json(&serde_json::json!({ "ok": ok }))
                 }
@@ -1528,9 +1617,15 @@ pub(crate) fn try_handle_v3_route(
                 Err(r) => return Some(r),
             };
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
             match shell.vault.restore_item(id, unix_now()) {
                 Ok(ok) => {
+                    shell.touch_vault_activity();
                     let _ = shell.persist_unlocked_vault_to_disk();
                     ok_json(&serde_json::json!({ "ok": ok }))
                 }
@@ -1538,7 +1633,13 @@ pub(crate) fn try_handle_v3_route(
             }
         }
         "/api/vault/folders" => {
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            shell.touch_vault_activity();
             match shell.vault.folders() {
                 Ok(f) => ok_json(&serde_json::json!({ "folders": f })),
                 Err(e) => err_json("423 Locked", e),
@@ -1552,9 +1653,15 @@ pub(crate) fn try_handle_v3_route(
             let Ok(folder) = serde_json::from_value::<VaultFolder>(body) else {
                 return Some(err_json("400 Bad Request", "Invalid VaultFolder JSON"));
             };
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
             match shell.vault.upsert_folder(folder, unix_now()) {
                 Ok(()) => {
+                    shell.touch_vault_activity();
                     let _ = shell.persist_unlocked_vault_to_disk();
                     ok_json(&serde_json::json!({ "ok": true }))
                 }
@@ -1574,9 +1681,11 @@ pub(crate) fn try_handle_v3_route(
                 .get("origin")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
             if mode == "passphrase" {
-                let cfg = PassphraseConfig {
+                let pp_cfg = PassphraseConfig {
                     word_count: body.get("words").and_then(|v| v.as_u64()).unwrap_or(5) as usize,
                     separator: body
                         .get("separator")
@@ -1603,11 +1712,12 @@ pub(crate) fn try_handle_v3_route(
                     },
                 };
                 let res = if !shell.vault.is_locked() {
+                    shell.touch_vault_activity();
                     shell
                         .vault
-                        .generate_and_record_passphrase(&cfg, origin, unix_now())
+                        .generate_and_record_passphrase(&pp_cfg, origin, unix_now())
                 } else {
-                    singularity_vault::generate_passphrase(&cfg).map_err(|e| e.to_string())
+                    singularity_vault::generate_passphrase(&pp_cfg).map_err(|e| e.to_string())
                 };
                 match res {
                     Ok(g) => ok_json(&serde_json::json!({
@@ -1617,22 +1727,23 @@ pub(crate) fn try_handle_v3_route(
                     Err(e) => err_json("400 Bad Request", e),
                 }
             } else {
-                let mut cfg = PasswordGeneratorConfig::default();
+                let mut pw_cfg = PasswordGeneratorConfig::default();
                 if let Some(len) = body.get("length").and_then(|v| v.as_u64()) {
-                    cfg.length = len.clamp(8, 128) as usize;
+                    pw_cfg.length = len.clamp(8, 128) as usize;
                 }
                 if let Some(v) = body.get("exclude_ambiguous").and_then(|v| v.as_bool()) {
-                    cfg.exclude_ambiguous = v;
+                    pw_cfg.exclude_ambiguous = v;
                 }
                 if let Some(v) = body.get("include_symbols").and_then(|v| v.as_bool()) {
-                    cfg.symbols = v;
+                    pw_cfg.symbols = v;
                 }
                 let res = if !shell.vault.is_locked() {
+                    shell.touch_vault_activity();
                     shell
                         .vault
-                        .generate_and_record_password(&cfg, origin, unix_now())
+                        .generate_and_record_password(&pw_cfg, origin, unix_now())
                 } else {
-                    singularity_vault::generate_password(&cfg).map_err(|e| e.to_string())
+                    singularity_vault::generate_password(&pw_cfg).map_err(|e| e.to_string())
                 };
                 match res {
                     Ok(g) => ok_json(&serde_json::json!({
@@ -1644,21 +1755,39 @@ pub(crate) fn try_handle_v3_route(
             }
         }
         "/api/vault/generator_history" => {
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            shell.touch_vault_activity();
             match shell.vault.generator_history() {
                 Ok(h) => ok_json(&serde_json::json!({ "history": h })),
                 Err(e) => err_json("423 Locked", e),
             }
         }
         "/api/vault/health" => {
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            shell.touch_vault_activity();
             match shell.vault.generate_health_report(unix_now()) {
                 Ok(report) => ok_json(&report),
                 Err(e) => err_json("423 Locked", e),
             }
         }
         "/api/vault/passkeys" => {
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            shell.touch_vault_activity();
             match shell.vault.passkeys() {
                 Ok(list) => ok_json(&serde_json::json!({ "passkeys": list })),
                 Err(e) => err_json("423 Locked", e),
@@ -1676,7 +1805,12 @@ pub(crate) fn try_handle_v3_route(
                 .get("display_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or(user_name);
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
             match shell.vault.enroll_passkey_v2(
                 rp_id,
                 rp_name,
@@ -1687,6 +1821,7 @@ pub(crate) fn try_handle_v3_route(
                 unix_now(),
             ) {
                 Ok(cred) => {
+                    shell.touch_vault_activity();
                     let _ = shell.persist_unlocked_vault_to_disk();
                     ok_json(&serde_json::json!({ "ok": true, "passkey": cred }))
                 }
@@ -1698,11 +1833,24 @@ pub(crate) fn try_handle_v3_route(
                 Ok(v) => v,
                 Err(r) => return Some(r),
             };
-            let secret = body.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_v3_vault_auto_lock(&mut shell, cfg);
+                if !shell.vault.is_locked() {
+                    shell.touch_vault_activity();
+                }
+            }
+            let secret = Zeroizing::new(
+                body.get("secret")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
             let digits = body.get("digits").and_then(|v| v.as_u64()).unwrap_or(6) as u32;
             let period = body.get("period").and_then(|v| v.as_u64()).unwrap_or(30);
             match singularity_vault::generate_totp_with_next(
-                secret,
+                secret.as_str(),
                 unix_now(),
                 period,
                 digits,
@@ -1720,9 +1868,28 @@ pub(crate) fn try_handle_v3_route(
             if let Err(r) = require_post(req) {
                 return Some(r);
             }
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
             match shell.vault.generate_and_bind_recovery_key(unix_now()) {
-                Ok(key_str) => ok_json(&serde_json::json!({ "ok": true, "recovery_key": key_str })),
+                Ok(key_str) => {
+                    shell.touch_vault_activity();
+                    let key_zero = Zeroizing::new(key_str);
+                    #[derive(serde::Serialize)]
+                    struct RecoveryKeyResp<'a> {
+                        ok: bool,
+                        recovery_key: &'a str,
+                    }
+                    let json_bytes = serde_json::to_vec(&RecoveryKeyResp {
+                        ok: true,
+                        recovery_key: key_zero.as_str(),
+                    })
+                    .unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
+                    HttpResponse::new("200 OK", "application/json; charset=utf-8", json_bytes)
+                }
                 Err(e) => err_json("400 Bad Request", e.to_string()),
             }
         }
@@ -1731,9 +1898,20 @@ pub(crate) fn try_handle_v3_route(
                 Ok(v) => v,
                 Err(r) => return Some(r),
             };
-            let raw = body.get("data").and_then(|v| v.as_str()).unwrap_or("");
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            match shell.vault.preview_import(raw, None, unix_now()) {
+            let raw = Zeroizing::new(
+                body.get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            shell.touch_vault_activity();
+            match shell.vault.preview_import(raw.as_str(), None, unix_now()) {
                 Ok(prev) => ok_json(&prev),
                 Err(e) => err_json("400 Bad Request", e),
             }
@@ -1743,7 +1921,12 @@ pub(crate) fn try_handle_v3_route(
                 Ok(v) => v,
                 Err(r) => return Some(r),
             };
-            let raw = body.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            let raw = Zeroizing::new(
+                body.get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
             let strategy = match body
                 .get("strategy")
                 .and_then(|v| v.as_str())
@@ -1754,13 +1937,19 @@ pub(crate) fn try_handle_v3_route(
                 _ => ConflictResolution::Skip,
             };
             let now = unix_now();
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            let preview = match shell.vault.preview_import(raw, None, now) {
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            let preview = match shell.vault.preview_import(raw.as_str(), None, now) {
                 Ok(p) => p,
                 Err(e) => return Some(err_json("400 Bad Request", e)),
             };
             match shell.vault.apply_import(preview, strategy, now) {
                 Ok(res) => {
+                    shell.touch_vault_activity();
                     let _ = shell.persist_unlocked_vault_to_disk();
                     ok_json(&res)
                 }
@@ -1768,18 +1957,50 @@ pub(crate) fn try_handle_v3_route(
             }
         }
         "/api/vault/export_format" => {
-            let fmt = params.get("format").map(String::as_str).unwrap_or("json");
-            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let fmt = body
+                .get("format")
+                .and_then(|v| v.as_str())
+                .or_else(|| params.get("format").map(String::as_str))
+                .unwrap_or("json");
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            enforce_v3_vault_auto_lock(&mut shell, cfg);
+            if shell.vault.is_locked() {
+                return Some(err_json("423 Locked", "Vault is locked"));
+            }
+            shell.touch_vault_activity();
             let res = match fmt {
-                "csv" => shell.vault.export_csv(),
+                "csv" => shell.vault.export_csv().map(Zeroizing::new),
                 "cxf" => shell
                     .vault
                     .export_cxf("local@singularity.browser", unix_now())
-                    .and_then(|doc| serialize_cxf_json(&doc).map_err(|e| e.to_string())),
-                _ => shell.vault.export_plain_json(),
+                    .and_then(|doc| serialize_cxf_json(&doc).map_err(|e| e.to_string()))
+                    .map(Zeroizing::new),
+                _ => shell.vault.export_plain_json().map(Zeroizing::new),
             };
             match res {
-                Ok(data) => ok_json(&serde_json::json!({ "ok": true, "format": fmt, "data": data })),
+                Ok(data) => {
+                    #[derive(serde::Serialize)]
+                    struct VaultExportFormatResp<'a> {
+                        ok: bool,
+                        format: &'a str,
+                        data: &'a str,
+                    }
+                    match serde_json::to_vec(&VaultExportFormatResp {
+                        ok: true,
+                        format: fmt,
+                        data: data.as_str(),
+                    }) {
+                        Ok(bytes) => {
+                            HttpResponse::new("200 OK", "application/json; charset=utf-8", bytes)
+                        }
+                        Err(e) => err_json("500 Internal Server Error", e.to_string()),
+                    }
+                }
                 Err(e) => err_json("400 Bad Request", e),
             }
         }
@@ -1788,8 +2009,26 @@ pub(crate) fn try_handle_v3_route(
                 Ok(v) => v,
                 Err(r) => return Some(r),
             };
-            let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let _vault_op = cfg.map(|c| c.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner()));
+            {
+                let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                enforce_v3_vault_auto_lock(&mut shell, cfg);
+                if !shell.vault.is_locked() {
+                    shell.touch_vault_activity();
+                }
+            }
+            let text = Zeroizing::new(
+                body.get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            let password = Zeroizing::new(
+                body.get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
             let ttl_secs = body
                 .get("ttl_secs")
                 .and_then(|v| v.as_u64())
@@ -1886,12 +2125,68 @@ pub(crate) fn try_handle_v3_route(
                 Ok(v) => v,
                 Err(r) => return Some(r),
             };
-            let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let expected = body
                 .get("expected_sha256")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            match verify_file_sha256(Path::new(path), expected) {
+            let trimmed = raw_path.trim();
+            if is_unc_or_device_path(trimmed) || has_parent_dir_component(trimmed) {
+                return Some(err_json(
+                    "400 Bad Request",
+                    "Invalid or disallowed download path",
+                ));
+            }
+            let target = Path::new(trimmed);
+            let meta = match std::fs::symlink_metadata(target) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Some(err_json(
+                        "400 Bad Request",
+                        format!("Cannot inspect download file: {}", e),
+                    ))
+                }
+            };
+            if is_symlink_or_reparse_meta(&meta) || !meta.file_type().is_file() {
+                return Some(err_json(
+                    "400 Bad Request",
+                    "Download verification target must be a regular file",
+                ));
+            }
+            let Ok(canon_target) = std::fs::canonicalize(target) else {
+                return Some(err_json("400 Bad Request", "Unable to resolve download path"));
+            };
+            if canon_target
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("\\\\?\\UNC\\")
+            {
+                return Some(err_json(
+                    "400 Bad Request",
+                    "UNC network paths are not permitted",
+                ));
+            }
+            let mut allowed_roots = Vec::new();
+            if let Ok(canon_dl) = std::fs::canonicalize(crate::server::resolve_downloads_dir()) {
+                allowed_roots.push(canon_dl);
+            }
+            {
+                let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                let profile_dl = shell.roaming.root_dir().join("downloads");
+                if let Ok(canon_pdl) = std::fs::canonicalize(profile_dl) {
+                    allowed_roots.push(canon_pdl);
+                }
+            }
+            if !allowed_roots
+                .iter()
+                .any(|root| canon_target.starts_with(root))
+            {
+                return Some(err_json(
+                    "403 Forbidden",
+                    "File path must reside inside the configured downloads directory",
+                ));
+            }
+            match verify_file_sha256(&canon_target, expected) {
                 Ok(matched) => ok_json(&serde_json::json!({ "ok": true, "matched": matched })),
                 Err(e) => err_json("400 Bad Request", e),
             }
@@ -2247,7 +2542,52 @@ pub(crate) fn try_handle_v3_route(
                 Err(r) => return Some(r),
             };
             if let Some(p) = body.get("path").and_then(|v| v.as_str()) {
-                match stage_extension_for_review(Path::new(p)) {
+                let trimmed = p.trim();
+                if is_unc_or_device_path(trimmed) || has_parent_dir_component(trimmed) {
+                    return Some(err_json(
+                        "400 Bad Request",
+                        "Invalid or disallowed extension package path",
+                    ));
+                }
+                let target = Path::new(trimmed);
+                let meta = match std::fs::symlink_metadata(target) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return Some(err_json(
+                            "400 Bad Request",
+                            format!("Cannot inspect extension package: {}", e),
+                        ))
+                    }
+                };
+                if is_symlink_or_reparse_meta(&meta) || !meta.file_type().is_file() {
+                    return Some(err_json(
+                        "400 Bad Request",
+                        "Extension review target must be a regular local file",
+                    ));
+                }
+                if meta.len() > MAX_STAGE_REVIEW_CRX_BYTES {
+                    return Some(err_json(
+                        "400 Bad Request",
+                        "Extension package exceeds 32 MiB limit",
+                    ));
+                }
+                let Ok(canon_target) = std::fs::canonicalize(target) else {
+                    return Some(err_json(
+                        "400 Bad Request",
+                        "Unable to resolve extension package path",
+                    ));
+                };
+                if canon_target
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("\\\\?\\UNC\\")
+                {
+                    return Some(err_json(
+                        "400 Bad Request",
+                        "UNC network paths are not permitted",
+                    ));
+                }
+                match stage_extension_for_review(&canon_target) {
                     Ok(rev) => ok_json(&rev),
                     Err(e) => err_json("400 Bad Request", e),
                 }
@@ -2355,6 +2695,122 @@ pub(crate) fn try_handle_v3_route(
                 Ok(removed) => ok_json(&serde_json::json!({ "ok": removed })),
                 Err(e) => err_json("400 Bad Request", e.to_string()),
             }
+        }
+        "/api/pwa/launch" => {
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let id = body
+                .get("id")
+                .or_else(|| body.get("app_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            match shell.pwas.get(id) {
+                Some(app) => ok_json(&serde_json::json!({
+                    "ok": true,
+                    "app": app,
+                    "start_url": app.manifest.start_url,
+                })),
+                None => err_json("404 Not Found", "Installed PWA not found"),
+            }
+        }
+        "/api/process/action" => {
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let pid = body.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let core = &mut shell.core;
+            let ok = match action {
+                "hibernate" => core.tab_manager.freeze_tab_soft(
+                    pid,
+                    unix_now(),
+                    48 * 1024 * 1024,
+                    &core.chromium_bridge,
+                ),
+                "terminate" => core.tab_manager.close_tab(pid).is_some(),
+                _ => return Some(err_json("400 Bad Request", "Unsupported process action")),
+            };
+            ok_json(&serde_json::json!({ "ok": ok, "pid": pid, "action": action }))
+        }
+        "/api/tabs/discard" => {
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let tab_id = body
+                .get("tab_id")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
+                .unwrap_or(0);
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let core = &mut shell.core;
+            let discarded = core.tab_manager.discard_tab_with_reclaimed_ram(
+                tab_id,
+                48 * 1024 * 1024,
+                &core.chromium_bridge,
+            );
+            ok_json(&serde_json::json!({ "ok": discarded, "tab_id": tab_id }))
+        }
+        "/api/tracing/toggle" => {
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let active = body
+                .get("active")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            ok_json(&serde_json::json!({ "ok": true, "active": active }))
+        }
+        "/api/devtools/inspect" => {
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let target_id = body
+                .get("target_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if target_id.is_empty() {
+                return Some(err_json("400 Bad Request", "Missing target_id"));
+            }
+            ok_json(&serde_json::json!({ "ok": true, "target_id": target_id }))
+        }
+        "/api/security/cert_bypass" | "/api/security/allow_http_once" => {
+            let body = match require_post(req) {
+                Ok(v) => v,
+                Err(r) => return Some(r),
+            };
+            let host = body
+                .get("host")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let url = body
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let indicator = if !url.is_empty() { url } else { host };
+            if indicator.is_empty() {
+                return Some(err_json("400 Bad Request", "Missing host or url"));
+            }
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            shell.core.threat_guard.add_session_exception(indicator);
+            ok_json(&serde_json::json!({
+                "ok": true,
+                "scope": "session",
+                "host": host,
+                "url": url,
+            }))
         }
 
         // ====================================================================
@@ -2894,17 +3350,41 @@ pub(crate) fn try_handle_v3_route(
         "/api/sync/status" => {
             let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref sync) = shell.sync_engine {
-                let now = unix_now();
+                // Never expose the secret 25-word daily sync phrase on GET (use POST /api/sync/daily_phrase).
                 ok_json(&serde_json::json!({
                     "linked": true,
                     "chain_id": sync.chain_id(),
                     "device_id": sync.local_device_id(),
-                    "daily_25_word_phrase": sync.current_25_word_phrase(now),
+                    "daily_25_word_phrase": serde_json::Value::Null,
                     "transport": sync.transport_config(),
                     "devices": sync.device_registry().all_devices(),
                 }))
             } else {
                 ok_json(&serde_json::json!({ "linked": false }))
+            }
+        }
+        "/api/sync/daily_phrase" => {
+            if let Err(r) = require_post(req) {
+                return Some(r);
+            }
+            let shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(ref sync) = shell.sync_engine else {
+                return Some(err_json("400 Bad Request", "Sync chain not initialized"));
+            };
+            let phrase = Zeroizing::new(sync.current_25_word_phrase(unix_now()));
+            #[derive(serde::Serialize)]
+            struct DailySyncPhraseResp<'a> {
+                ok: bool,
+                daily_25_word_phrase: &'a str,
+            }
+            match serde_json::to_vec(&DailySyncPhraseResp {
+                ok: true,
+                daily_25_word_phrase: phrase.as_str(),
+            }) {
+                Ok(bytes) => {
+                    HttpResponse::new("200 OK", "application/json; charset=utf-8", bytes)
+                }
+                Err(e) => err_json("500 Internal Server Error", e.to_string()),
             }
         }
         "/api/sync/create_chain" => {

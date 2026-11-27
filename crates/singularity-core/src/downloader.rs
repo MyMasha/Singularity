@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "windows"))]
+use std::path::PathBuf;
 
 /// Lifecycle state of a download item in [`DownloadManager`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,7 +235,63 @@ pub fn split_compound_filename(filename: &str) -> (&str, &str) {
     (filename, "")
 }
 
-/// Sanitizes a filename fragment to remove directory traversal, control chars, and bidi spoofers.
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn is_safe_routing_target_dir(dir: &str) -> bool {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    // Reject Windows UNC / extended device paths (`\\server\share`, `\\?\`, `\\.\`),
+    // leading backslash root-relative paths, and POSIX `//` network paths.
+    if trimmed.starts_with('\\') || trimmed.starts_with("//") {
+        return false;
+    }
+    if Path::new(trimmed)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if trimmed
+        .split(['/', '\\'])
+        .any(|seg| seg.trim() == "..")
+    {
+        return false;
+    }
+    true
+}
+
+/// Sanitizes a filename fragment to remove directory traversal, control chars, bidi spoofers,
+/// trailing Windows dot/space obfuscation, and reserved Windows device names.
 pub fn sanitize_filename_component(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -246,11 +304,16 @@ pub fn sanitize_filename_component(raw: &str) -> String {
             out.push(ch);
         }
     }
-    let trimmed = out.trim().trim_matches('.');
-    if trimmed.is_empty() {
+    let trimmed = out.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    let base = if trimmed.is_empty() {
         "download".to_string()
     } else {
         trimmed.to_string()
+    };
+    if is_windows_reserved_device_name(&base) {
+        format!("_{}", base)
+    } else {
+        base
     }
 }
 
@@ -427,10 +490,16 @@ pub fn classify_download_danger(
         }
     }
 
-    // 4. Double-extension masquerading check (e.g. `report.pdf.exe`, `photo.jpg.vbs`)
-    let trimmed_name = filename.trim().trim_end_matches('.');
+    // 4. Double-extension masquerading check (e.g. `report.pdf.exe`, `photo.jpg.vbs`, `evil.exe .`)
+    let trimmed_name = filename
+        .trim_end_matches(|c: char| c.is_whitespace() || c == '.')
+        .trim_start();
     let lower_name = trimmed_name.to_ascii_lowercase();
-    let parts: Vec<&str> = lower_name.split('.').filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = lower_name
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() >= 3 {
         let final_ext = parts[parts.len() - 1];
         let prev_ext = parts[parts.len() - 2];
@@ -538,6 +607,9 @@ fn sha256_file_bytes(path: &Path) -> Result<[u8; 32], String> {
 
 fn decode_sha256_hex(hex_str: &str) -> Result<[u8; 32], String> {
     let clean = hex_str.trim();
+    if !clean.is_ascii() {
+        return Err("Expected ASCII hexadecimal SHA-256 digest".into());
+    }
     if clean.len() != 64 {
         return Err(format!(
             "Expected 64-character SHA-256 hex digest, got {} characters",
@@ -739,6 +811,9 @@ impl DownloadManager {
     }
 
     pub fn add_routing_rule(&mut self, rule: DownloadRoutingRule) {
+        if !is_safe_routing_target_dir(&rule.target_dir) {
+            return;
+        }
         if let Some(pos) = self.routing_rules.iter().position(|r| r.id == rule.id) {
             self.routing_rules[pos] = rule;
         } else {
@@ -768,7 +843,7 @@ impl DownloadManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        let danger_level =
+        let mut danger_level =
             classify_download_danger(raw_filename, url, referring_page_url, threat_guard);
         let safe_raw_name = sanitize_filename_component(raw_filename);
         let category = classify_category(&safe_raw_name, mime_type);
@@ -782,6 +857,7 @@ impl DownloadManager {
             .find(|r| r.matches(category, ext, &source_host));
 
         let target_dir = matched_rule
+            .filter(|r| is_safe_routing_target_dir(&r.target_dir))
             .map(|r| r.target_dir.clone())
             .unwrap_or_else(|| self.default_download_dir.clone());
 
@@ -792,6 +868,14 @@ impl DownloadManager {
                 render_filename_template(tpl, &safe_raw_name, &source_host, &date_ymd, category)
             })
             .unwrap_or(safe_raw_name);
+
+        if danger_level.is_safe() {
+            let post_template_danger =
+                classify_download_danger(&templated_name, url, referring_page_url, None);
+            if !post_template_danger.is_safe() {
+                danger_level = post_template_danger;
+            }
+        }
 
         let existing_in_dir: Vec<String> = self
             .records
@@ -1184,5 +1268,50 @@ mod tests {
             let _ = std::fs::remove_file(sidecar);
         }
         let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_windows_trailing_dot_space_reserved_names_routing_and_non_ascii_sha256() {
+        // Trailing space + dot bypass must still trigger double-extension and executable detection
+        assert!(matches!(
+            classify_download_danger("facture.pdf.exe .", "https://example.org/a", None, None),
+            DownloadDangerLevel::DangerousDoubleExtension { .. }
+        ));
+        assert!(matches!(
+            classify_download_danger("evil.exe . .", "https://example.org/a", None, None),
+            DownloadDangerLevel::PotentiallyDangerousExecutable { extension } if extension == "exe"
+        ));
+
+        // Sanitizer strips trailing dots/spaces iteratively and neutralizes Windows reserved names
+        assert_eq!(sanitize_filename_component("facture.pdf.exe ."), "facture.pdf.exe");
+        assert_eq!(sanitize_filename_component("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename_component("nul"), "_nul");
+        assert_eq!(sanitize_filename_component("COM1.exe ."), "_COM1.exe");
+
+        // add_routing_rule rejects path traversal (`..`) and UNC/leading-backslash paths
+        let mut mgr = DownloadManager::new("/tmp/singularity-dl", 2);
+        for bad_dir in [
+            "../escape",
+            "/tmp/singularity-dl/../../etc",
+            r"\\attacker\share\drop",
+            "//attacker/share",
+            r"\Windows\System32",
+        ] {
+            mgr.add_routing_rule(DownloadRoutingRule {
+                id: format!("bad-{}", bad_dir),
+                category: None,
+                extension_glob: None,
+                source_domain_glob: None,
+                target_dir: bad_dir.to_string(),
+                filename_template: None,
+                enabled: true,
+            });
+        }
+        assert!(mgr.routing_rules().is_empty());
+
+        // Non-ASCII 64-byte string must return Err without UTF-8 char-boundary panic
+        let bad_sha = format!("a\u{00E9}{}", "a".repeat(61));
+        assert_eq!(bad_sha.len(), 64);
+        assert!(decode_sha256_hex(&bad_sha).is_err());
     }
 }

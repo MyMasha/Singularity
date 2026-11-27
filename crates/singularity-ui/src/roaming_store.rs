@@ -727,6 +727,7 @@ pub struct RoamingSingularityStore {
     master_key: [u8; 32],
     pub profile: UserProfile,
     pub tokens: RoamingTokensPlaintext,
+    deleted_token_ids: HashMap<String, u64>,
 }
 
 impl fmt::Debug for RoamingSingularityStore {
@@ -820,7 +821,7 @@ impl RoamingSingularityStore {
         }
 
         let master_key = load_or_create_master_key(&root_dir)?;
-        let mut profile = load_profile(&root_dir);
+        let mut profile = load_profile(&root_dir)?;
         let mut migrated_profile = false;
         if !profile.session_restore_v2_migrated {
             profile.restore_session = true;
@@ -1020,13 +1021,13 @@ impl RoamingSingularityStore {
             master_key,
             profile,
             tokens,
+            deleted_token_ids: HashMap::new(),
         };
 
         if !store.tokens_file_path().exists() {
-            if let Ok(_lock) = InterProcessFileLock::acquire(&store.root_dir.join(".tokens.lock")) {
-                if !store.tokens_file_path().exists() {
-                    let _ = store.write_tokens_unlocked();
-                }
+            let _lock = InterProcessFileLock::acquire(&store.root_dir.join(".tokens.lock"))?;
+            if !store.tokens_file_path().exists() {
+                store.write_tokens_unlocked()?;
             }
         }
         if !claimed_dead_paths.is_empty() {
@@ -1318,7 +1319,23 @@ impl RoamingSingularityStore {
         }
         let slots_root = self.root_dir.join("browser-ui-slots");
         let _ = std::fs::create_dir_all(&slots_root);
-        let _slot_guard = InterProcessFileLock::acquire(&slots_root.join(".slots.lock"));
+        let safe_id = if is_valid_window_id(&self.window_id) {
+            self.window_id.as_str()
+        } else {
+            "fallback"
+        };
+        let _slot_guard = match InterProcessFileLock::acquire(&slots_root.join(".slots.lock")) {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!(
+                    "[singularity] Failed to acquire .slots.lock ({}); using isolated ephemeral UI slot",
+                    err
+                );
+                let fallback = slots_root.join(format!("ephemeral-{}", safe_id));
+                let _ = std::fs::create_dir_all(&fallback);
+                return fallback;
+            }
+        };
         let current_pid = std::process::id();
         let owner_payload = format!("{}\n{}\n", current_pid, self.window_id);
 
@@ -1349,11 +1366,6 @@ impl RoamingSingularityStore {
             }
         }
 
-        let safe_id = if is_valid_window_id(&self.window_id) {
-            self.window_id.as_str()
-        } else {
-            "fallback"
-        };
         let fallback = slots_root.join(format!("ephemeral-{}", safe_id));
         let _ = std::fs::create_dir_all(&fallback);
         fallback
@@ -1362,8 +1374,23 @@ impl RoamingSingularityStore {
     pub fn release_ui_webview_slot(&mut self) {
         if let Some(lock_path) = self.ui_slot_lock_path.take() {
             let slots_root = self.root_dir.join("browser-ui-slots");
-            let _slot_guard = InterProcessFileLock::acquire(&slots_root.join(".slots.lock"));
-            let _ = std::fs::remove_file(lock_path);
+            match InterProcessFileLock::acquire(&slots_root.join(".slots.lock")) {
+                Ok(_slot_guard) => {
+                    let expected = format!("{}\n{}\n", std::process::id(), self.window_id);
+                    if std::fs::read_to_string(&lock_path).ok().as_deref()
+                        == Some(expected.as_str())
+                    {
+                        let _ = std::fs::remove_file(lock_path);
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[singularity] Failed to acquire .slots.lock while releasing {}: {}",
+                        lock_path.display(),
+                        err
+                    );
+                }
+            }
         }
     }
 
@@ -1630,17 +1657,25 @@ impl RoamingSingularityStore {
         self.write_tokens_unlocked()
     }
 
-    /// Inserts or updates a session/OAuth token and persists `tokens.enc` encrypted on disk
-    /// under an inter-process exclusive lock (merging concurrent disk updates cleanly).
-    pub fn upsert_token(&mut self, record: EncryptedAuthTokenRecord) -> Result<(), String> {
-        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+    fn merge_disk_tokens_unlocked(&mut self) {
         if let Ok(mut disk_tokens) =
             load_encrypted_tokens_unlocked(&self.root_dir, &self.master_key)
         {
             for disk_rec in std::mem::take(&mut disk_tokens.sessions) {
-                if disk_rec.id != record.id
-                    && !self.tokens.sessions.iter().any(|r| r.id == disk_rec.id)
+                if self
+                    .deleted_token_ids
+                    .get(&disk_rec.id)
+                    .map_or(false, |&deleted_at| disk_rec.updated_unix <= deleted_at)
                 {
+                    continue;
+                }
+                if let Some(existing) =
+                    self.tokens.sessions.iter_mut().find(|r| r.id == disk_rec.id)
+                {
+                    if disk_rec.updated_unix > existing.updated_unix {
+                        *existing = disk_rec;
+                    }
+                } else {
                     self.tokens.sessions.push(disk_rec);
                 }
             }
@@ -1648,9 +1683,33 @@ impl RoamingSingularityStore {
                 self.tokens.saved_mullvad_account = disk_tokens.saved_mullvad_account.clone();
             }
         }
+    }
+
+    fn record_deleted_token_id(&mut self, token_id: String, deleted_at: u64) {
+        self.deleted_token_ids
+            .entry(token_id)
+            .and_modify(|ts| *ts = (*ts).max(deleted_at))
+            .or_insert(deleted_at);
+    }
+
+    /// Inserts or updates a session/OAuth token and persists `tokens.enc` encrypted on disk
+    /// under an inter-process exclusive lock (merging concurrent disk updates by newest timestamp
+    /// and preventing resurrection of tokens deleted during this session).
+    pub fn upsert_token(&mut self, record: EncryptedAuthTokenRecord) -> Result<(), String> {
+        let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+        self.merge_disk_tokens_unlocked();
         if let Some(existing) = self.tokens.sessions.iter_mut().find(|r| r.id == record.id) {
-            *existing = record;
-        } else {
+            if record.updated_unix >= existing.updated_unix {
+                let id = record.id.clone();
+                *existing = record;
+                self.deleted_token_ids.remove(&id);
+            }
+        } else if !self
+            .deleted_token_ids
+            .get(&record.id)
+            .map_or(false, |&deleted_at| record.updated_unix < deleted_at)
+        {
+            self.deleted_token_ids.remove(&record.id);
             self.tokens.sessions.push(record);
         }
         self.write_tokens_unlocked()
@@ -1666,32 +1725,32 @@ impl RoamingSingularityStore {
             return Ok(0);
         }
         let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
-        if let Ok(mut disk_tokens) =
-            load_encrypted_tokens_unlocked(&self.root_dir, &self.master_key)
-        {
-            for disk_rec in std::mem::take(&mut disk_tokens.sessions) {
-                if !self.tokens.sessions.iter().any(|r| r.id == disk_rec.id) {
-                    self.tokens.sessions.push(disk_rec);
-                }
-            }
-            if self.tokens.saved_mullvad_account.is_none() {
-                self.tokens.saved_mullvad_account = disk_tokens.saved_mullvad_account.clone();
-            }
-        }
+        self.merge_disk_tokens_unlocked();
         let mut changed = 0usize;
         for rec in incoming {
             if let Some(existing) = self.tokens.sessions.iter_mut().find(|r| r.id == rec.id) {
+                if rec.updated_unix < existing.updated_unix {
+                    continue;
+                }
                 if existing.secret_value != rec.secret_value
                     || existing.expires_unix != rec.expires_unix
                     || existing.same_site != rec.same_site
                     || existing.host_only != rec.host_only
                     || existing.http_only != rec.http_only
                     || existing.secure != rec.secure
+                    || rec.updated_unix > existing.updated_unix
                 {
+                    let id = rec.id.clone();
                     *existing = rec;
+                    self.deleted_token_ids.remove(&id);
                     changed += 1;
                 }
-            } else {
+            } else if !self
+                .deleted_token_ids
+                .get(&rec.id)
+                .map_or(false, |&deleted_at| rec.updated_unix <= deleted_at)
+            {
+                self.deleted_token_ids.remove(&rec.id);
                 self.tokens.sessions.push(rec);
                 changed += 1;
             }
@@ -1706,22 +1765,28 @@ impl RoamingSingularityStore {
     /// token ID, or `"ALL"` wildcard under `.tokens.lock`.
     pub fn remove_tokens_by_provider_or_id(&mut self, target: &str) -> Result<usize, String> {
         let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
-        if let Ok(mut disk_tokens) =
-            load_encrypted_tokens_unlocked(&self.root_dir, &self.master_key)
-        {
-            for disk_rec in std::mem::take(&mut disk_tokens.sessions) {
-                if !self.tokens.sessions.iter().any(|r| r.id == disk_rec.id) {
-                    self.tokens.sessions.push(disk_rec);
-                }
-            }
-        }
+        self.merge_disk_tokens_unlocked();
         let before = self.tokens.sessions.len();
+        let mut removed_entries: Vec<(String, u64)> = Vec::new();
         if target.eq_ignore_ascii_case("ALL") {
+            for t in &self.tokens.sessions {
+                removed_entries.push((t.id.clone(), t.updated_unix));
+            }
             self.tokens.sessions.clear();
         } else {
             self.tokens.sessions.retain(|t| {
-                !t.provider.eq_ignore_ascii_case(target) && t.id != target
+                let keep = !t.provider.eq_ignore_ascii_case(target) && t.id != target;
+                if !keep {
+                    removed_entries.push((t.id.clone(), t.updated_unix));
+                }
+                keep
             });
+            if removed_entries.is_empty() {
+                self.record_deleted_token_id(target.to_string(), unix_now());
+            }
+        }
+        for (id, ts) in removed_entries {
+            self.record_deleted_token_id(id, ts);
         }
         let removed = before.saturating_sub(self.tokens.sessions.len());
         if removed > 0 {
@@ -1732,6 +1797,16 @@ impl RoamingSingularityStore {
 
     pub fn clear_all_tokens(&mut self) -> Result<(), String> {
         let _lock = InterProcessFileLock::acquire(&self.root_dir.join(".tokens.lock"))?;
+        self.merge_disk_tokens_unlocked();
+        let removed_entries: Vec<(String, u64)> = self
+            .tokens
+            .sessions
+            .iter()
+            .map(|t| (t.id.clone(), t.updated_unix))
+            .collect();
+        for (id, ts) in removed_entries {
+            self.record_deleted_token_id(id, ts);
+        }
         self.tokens.sessions.clear();
         self.write_tokens_unlocked()
     }
@@ -2488,41 +2563,153 @@ impl Drop for InterProcessFileLock {
 }
 
 #[cfg(not(unix))]
+fn parse_lock_file_metadata(raw: &str) -> (u32, u64, Option<&str>) {
+    let mut lines = raw.lines();
+    let owner_pid = lines
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let created_unix = lines
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let owner_token = lines.next().map(str::trim).filter(|s| !s.is_empty());
+    (owner_pid, created_unix, owner_token)
+}
+
+#[cfg(not(unix))]
+fn lock_file_matches_owner(lock_path: &Path, expected_owner_token: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(lock_path) else {
+        return false;
+    };
+    let (_pid, _ts, token) = parse_lock_file_metadata(&raw);
+    token == Some(expected_owner_token)
+}
+
+#[cfg(not(unix))]
+fn unique_lock_quarantine_path(lock_path: &Path, tag: &str) -> PathBuf {
+    let parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = lock_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("lock");
+    let mut rnd = [0u8; 8];
+    OsRng.fill_bytes(&mut rnd);
+    parent.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        name,
+        tag,
+        std::process::id(),
+        hex::encode(rnd)
+    ))
+}
+
+#[cfg(not(unix))]
+fn is_lock_content_stale(raw: &str) -> bool {
+    let (owner_pid, created_unix, _token) = parse_lock_file_metadata(raw);
+    (owner_pid != 0 && !is_process_alive(owner_pid))
+        || (created_unix != 0 && unix_now().saturating_sub(created_unix) > 30)
+}
+
+#[cfg(not(unix))]
 struct InterProcessFileLock {
     path: PathBuf,
+    owner_token: String,
+    #[cfg(target_os = "windows")]
+    handle: Option<std::fs::File>,
 }
 
 #[cfg(not(unix))]
 impl InterProcessFileLock {
     fn acquire(lock_path: &Path) -> Result<Self, String> {
         if let Some(parent) = lock_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("Failed creating lock directory {}: {}", parent.display(), e)
+            })?;
         }
+
+        let mut nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        let owner_token = format!("{}:{}", std::process::id(), hex::encode(nonce));
         let deadline = Instant::now() + Duration::from_secs(5);
+
         loop {
-            let payload = format!("{}\n{}\n", std::process::id(), unix_now());
-            if atomic_write_create_new(lock_path, payload.as_bytes())? {
-                return Ok(Self {
-                    path: lock_path.to_path_buf(),
-                });
+            let payload = format!("{}\n{}\n{}\n", std::process::id(), unix_now(), owner_token);
+
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Grant FILE_SHARE_READ only (no FILE_SHARE_WRITE, no FILE_SHARE_DELETE):
+                // other processes may inspect the `pid:nonce` owner identity, while the Windows
+                // kernel prevents any concurrent process from overwriting, renaming, or deleting
+                // an actively held lock file.
+                const FILE_SHARE_READ: u32 = 0x0000_0001;
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(lock_path)
+                {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(payload.as_bytes()).and_then(|_| file.flush())
+                        {
+                            drop(file);
+                            let _ = std::fs::remove_file(lock_path);
+                            return Err(format!(
+                                "Failed writing lock {}: {}",
+                                lock_path.display(),
+                                e
+                            ));
+                        }
+                        return Ok(Self {
+                            path: lock_path.to_path_buf(),
+                            owner_token,
+                            handle: Some(file),
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e)
+                        if matches!(e.raw_os_error(), Some(5) | Some(32))
+                            || e.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "Timed out acquiring exclusive lock {} ({})",
+                                lock_path.display(),
+                                e
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(4));
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "Failed creating exclusive lock {}: {}",
+                            lock_path.display(),
+                            e
+                        ));
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                if atomic_write_create_new(lock_path, payload.as_bytes())? {
+                    return Ok(Self {
+                        path: lock_path.to_path_buf(),
+                        owner_token,
+                    });
+                }
             }
 
             // Detect stale locks owned by dead PIDs or expired (>30s) crash leftovers.
+            let mut expected_stale_raw: Option<String> = None;
             let mut is_stale = false;
             if let Ok(raw) = std::fs::read_to_string(lock_path) {
-                let mut lines = raw.lines();
-                let owner_pid = lines
-                    .next()
-                    .and_then(|l| l.trim().parse::<u32>().ok())
-                    .unwrap_or(0);
-                let created_unix = lines
-                    .next()
-                    .and_then(|l| l.trim().parse::<u64>().ok())
-                    .unwrap_or(0);
-                if (owner_pid != 0 && !is_process_alive(owner_pid))
-                    || (created_unix != 0 && unix_now().saturating_sub(created_unix) > 30)
-                {
+                if is_lock_content_stale(&raw) {
                     is_stale = true;
+                    expected_stale_raw = Some(raw);
                 }
             } else if let Ok(meta) = std::fs::metadata(lock_path) {
                 if let Ok(modified) = meta.modified() {
@@ -2537,8 +2724,40 @@ impl InterProcessFileLock {
             }
 
             if is_stale {
-                let _ = std::fs::remove_file(lock_path);
-                continue;
+                // Re-verify expected stale owner identity right before attempting an atomic rename
+                // to a unique quarantine path so we never remove a freshly acquired live lock.
+                let identity_still_matches = match expected_stale_raw.as_deref() {
+                    Some(expected) => {
+                        std::fs::read_to_string(lock_path).ok().as_deref() == Some(expected)
+                    }
+                    None => std::fs::metadata(lock_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|d| d > Duration::from_secs(30)),
+                };
+                if identity_still_matches {
+                    let quarantine = unique_lock_quarantine_path(lock_path, "stale");
+                    if std::fs::rename(lock_path, &quarantine).is_ok() {
+                        let safe_to_delete = match expected_stale_raw.as_deref() {
+                            Some(expected) => {
+                                std::fs::read_to_string(&quarantine).ok().as_deref()
+                                    == Some(expected)
+                            }
+                            None => std::fs::read_to_string(&quarantine)
+                                .map(|raw| raw.is_empty() || is_lock_content_stale(&raw))
+                                .unwrap_or(true),
+                        };
+                        if safe_to_delete {
+                            let _ = std::fs::remove_file(&quarantine);
+                        } else {
+                            let _ = std::fs::hard_link(&quarantine, lock_path)
+                                .or_else(|_| std::fs::rename(&quarantine, lock_path));
+                            let _ = std::fs::remove_file(&quarantine);
+                        }
+                        continue;
+                    }
+                }
             }
 
             if Instant::now() >= deadline {
@@ -2555,7 +2774,32 @@ impl InterProcessFileLock {
 #[cfg(not(unix))]
 impl Drop for InterProcessFileLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        #[cfg(target_os = "windows")]
+        let _ = self.handle.take();
+
+        // Never delete a lock file that no longer belongs to this exact `pid:nonce` owner.
+        for _ in 0..25 {
+            if !lock_file_matches_owner(&self.path, &self.owner_token) {
+                return;
+            }
+            let release_tmp = unique_lock_quarantine_path(&self.path, "rel");
+            match std::fs::rename(&self.path, &release_tmp) {
+                Ok(()) => {
+                    if lock_file_matches_owner(&release_tmp, &self.owner_token) {
+                        let _ = std::fs::remove_file(&release_tmp);
+                    } else {
+                        let _ = std::fs::hard_link(&release_tmp, &self.path)
+                            .or_else(|_| std::fs::rename(&release_tmp, &self.path));
+                        let _ = std::fs::remove_file(&release_tmp);
+                    }
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
     }
 }
 
@@ -2571,9 +2815,9 @@ fn load_profile_unlocked(root_dir: &Path) -> UserProfile {
     UserProfile::default()
 }
 
-fn load_profile(root_dir: &Path) -> UserProfile {
-    let _lock = InterProcessFileLock::acquire(&root_dir.join(".profile.lock"));
-    load_profile_unlocked(root_dir)
+fn load_profile(root_dir: &Path) -> Result<UserProfile, String> {
+    let _lock = InterProcessFileLock::acquire(&root_dir.join(".profile.lock"))?;
+    Ok(load_profile_unlocked(root_dir))
 }
 
 fn load_encrypted_tokens_unlocked(
@@ -3329,6 +3573,21 @@ struct PersistQueueState {
     flushed_generation: u64,
 }
 
+fn sort_and_filter_persist_batch(
+    mut batch: Vec<(PathBuf, String, UserProfile, WindowGeometry, u64)>,
+    last_written_gen_by_key: &HashMap<(PathBuf, String), u64>,
+) -> Vec<(PathBuf, String, UserProfile, WindowGeometry, u64)> {
+    batch.sort_by_key(|entry| entry.4);
+    batch
+        .into_iter()
+        .filter(|(root_dir, window_id, _, _, gen_id)| {
+            last_written_gen_by_key
+                .get(&(root_dir.clone(), window_id.clone()))
+                .map_or(true, |&prev| *gen_id > prev)
+        })
+        .collect()
+}
+
 struct ProfilePersistWorker {
     state: Mutex<PersistQueueState>,
     wake_cond: Condvar,
@@ -3359,6 +3618,8 @@ impl ProfilePersistWorker {
                     let mut last_backup_at = Instant::now()
                         .checked_sub(Duration::from_secs(60))
                         .unwrap_or_else(Instant::now);
+                    let mut last_written_gen_by_key: HashMap<(PathBuf, String), u64> =
+                        HashMap::new();
                     loop {
                         let (batch, batch_max_gen, force_bak) = {
                             let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3381,13 +3642,14 @@ impl ProfilePersistWorker {
                                     .unwrap_or_else(|e| e.into_inner());
                                 st = guard;
                             }
-                            let batch: Vec<(PathBuf, String, UserProfile, WindowGeometry, u64)> = st
-                                .dirty
-                                .drain()
-                                .map(|((root_dir, window_id), (profile, geometry, gen_id))| {
-                                    (root_dir, window_id, profile, geometry, gen_id)
-                                })
-                                .collect();
+                            let mut batch: Vec<(PathBuf, String, UserProfile, WindowGeometry, u64)> =
+                                st.dirty
+                                    .drain()
+                                    .map(|((root_dir, window_id), (profile, geometry, gen_id))| {
+                                        (root_dir, window_id, profile, geometry, gen_id)
+                                    })
+                                    .collect();
+                            batch.sort_by_key(|entry| entry.4);
                             let batch_max_gen = batch
                                 .iter()
                                 .map(|entry| entry.4)
@@ -3399,19 +3661,32 @@ impl ProfilePersistWorker {
                         };
 
                         let batch_len = batch.len();
+                        let ordered_batch =
+                            sort_and_filter_persist_batch(batch, &last_written_gen_by_key);
                         let mut wrote_backup = false;
-                        for (root_dir, window_id, profile, geometry, _gen_id) in batch {
+                        for (root_dir, window_id, profile, geometry, gen_id) in ordered_batch {
+                            let key = (root_dir.clone(), window_id.clone());
+                            if last_written_gen_by_key
+                                .get(&key)
+                                .map_or(false, |&prev| gen_id <= prev)
+                            {
+                                continue;
+                            }
                             let write_backup =
                                 force_bak || last_backup_at.elapsed() >= Duration::from_secs(30);
-                            let _ = RoamingSingularityStore::write_profile_snapshot(
+                            if RoamingSingularityStore::write_profile_snapshot(
                                 &root_dir,
                                 &window_id,
                                 &profile,
                                 geometry,
                                 write_backup,
-                            );
-                            if write_backup {
-                                wrote_backup = true;
+                            )
+                            .is_ok()
+                            {
+                                last_written_gen_by_key.insert(key, gen_id);
+                                if write_backup {
+                                    wrote_backup = true;
+                                }
                             }
                         }
                         if wrote_backup {
@@ -3832,8 +4107,8 @@ mod tests {
         store_b.schedule_save_profile();
         store_b.flush_async_persistence();
 
-        let loaded_a = load_profile(&dir_a);
-        let loaded_b = load_profile(&dir_b);
+        let loaded_a = load_profile(&dir_a).unwrap();
+        let loaded_b = load_profile(&dir_b).unwrap();
         assert_eq!(loaded_a.default_search_engine, "brave");
         assert_eq!(loaded_b.default_search_engine, "startpage");
         assert!(loaded_a.saved_tabs.iter().any(|t| t.url == "https://alpha.example"));
@@ -3841,5 +4116,142 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_inter_process_file_lock_pid_nonce_and_drop_ownership_guard() {
+        let test_dir = unique_test_dir("singularity_lock_guard");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let lock_path = test_dir.join(".guard.lock");
+
+        // 1. Acquired lock writes `pid\nunix\npid:nonce\n` and cleans up on Drop
+        let active_token = {
+            let lock = InterProcessFileLock::acquire(&lock_path).expect("acquire fresh lock");
+            let raw = std::fs::read_to_string(&lock_path).expect("read live lock");
+            let (pid, ts, token) = parse_lock_file_metadata(&raw);
+            assert_eq!(pid, std::process::id());
+            assert!(ts > 0);
+            assert_eq!(token, Some(lock.owner_token.as_str()));
+            assert!(lock_file_matches_owner(&lock_path, &lock.owner_token));
+            assert!(!lock_file_matches_owner(&lock_path, "999999:deadbeef"));
+            lock.owner_token.clone()
+        };
+        assert!(!lock_path.exists(), "owned lock must be removed on Drop");
+
+        // 2. Stale lock from a dead PID is atomically reclaimed
+        std::fs::write(&lock_path, "4294967294\n1\n4294967294:stale0001\n").unwrap();
+        {
+            let lock = InterProcessFileLock::acquire(&lock_path).expect("reclaim stale lock");
+            assert_ne!(lock.owner_token, active_token);
+            assert!(lock_file_matches_owner(&lock_path, &lock.owner_token));
+
+            // 3. Dropping a stale/foreign lock guard with a different owner_token MUST NOT
+            //    delete the currently held lock file!
+            let foreign = InterProcessFileLock {
+                path: lock_path.clone(),
+                owner_token: "123456:foreign_nonce".to_string(),
+                #[cfg(target_os = "windows")]
+                handle: None,
+            };
+            drop(foreign);
+
+            assert!(
+                lock_path.exists(),
+                "dropping a non-owner lock guard must never delete another process's lock"
+            );
+            assert!(lock_file_matches_owner(&lock_path, &lock.owner_token));
+        }
+        assert!(!lock_path.exists());
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_persist_batch_sorts_by_gen_id_and_skips_stale_generations() {
+        let dir = PathBuf::from("test_root");
+        let mut last_written: HashMap<(PathBuf, String), u64> = HashMap::new();
+        last_written.insert((dir.clone(), "win-a".into()), 5);
+
+        let batch = vec![
+            (dir.clone(), "win-b".into(), UserProfile::default(), WindowGeometry::default(), 9),
+            (dir.clone(), "win-a".into(), UserProfile::default(), WindowGeometry::default(), 4),
+            (dir.clone(), "win-a".into(), UserProfile::default(), WindowGeometry::default(), 5),
+            (dir.clone(), "win-c".into(), UserProfile::default(), WindowGeometry::default(), 2),
+            (dir.clone(), "win-a".into(), UserProfile::default(), WindowGeometry::default(), 7),
+        ];
+
+        let ordered = sort_and_filter_persist_batch(batch, &last_written);
+        let gens: Vec<(&str, u64)> = ordered
+            .iter()
+            .map(|(_, wid, _, _, g)| (wid.as_str(), *g))
+            .collect();
+        assert_eq!(gens, vec![("win-c", 2), ("win-a", 7), ("win-b", 9)]);
+    }
+
+    #[test]
+    fn test_oauth_tokens_prevent_deleted_resurrection_and_stale_rotation_overwrite() {
+        let test_dir = unique_test_dir("singularity_token_merge_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        let mk_token = |id: &str, secret: &str, updated_unix: u64| EncryptedAuthTokenRecord {
+            id: id.into(),
+            provider: "Google".into(),
+            domain: ".google.com".into(),
+            path: "/".into(),
+            token_name: "SID".into(),
+            secret_value: secret.into(),
+            http_only: true,
+            secure: true,
+            same_site: Some("lax".into()),
+            host_only: false,
+            expires_unix: Some(2_000_000_000),
+            updated_unix,
+            kind: "cookie_session".into(),
+        };
+
+        let mut store_a = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        store_a
+            .upsert_token(mk_token("tok-1", "secret-v1", 1000))
+            .unwrap();
+        let mut store_b = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+
+        // 1. store_b rotates tok-1 to v2 (t=2000). A stale write from store_a must NOT clobber v2.
+        store_b
+            .upsert_token(mk_token("tok-1", "secret-v2", 2000))
+            .unwrap();
+        store_a
+            .upsert_token(mk_token("tok-1", "secret-v1-stale", 1500))
+            .unwrap();
+        let reopened1 = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        let tok1 = reopened1
+            .tokens
+            .sessions
+            .iter()
+            .find(|t| t.id == "tok-1")
+            .expect("tok-1 present");
+        assert_eq!(tok1.secret_value, "secret-v2");
+        assert_eq!(tok1.updated_unix, 2000);
+
+        // 2. store_a deletes tok-1; store_b writes unrelated tok-2 (re-persisting its stale tok-1@2000);
+        //    store_a then upserts tok-3 and must NOT resurrect tok-1@2000.
+        assert_eq!(store_a.remove_tokens_by_provider_or_id("tok-1").unwrap(), 1);
+        store_b
+            .upsert_token(mk_token("tok-2", "other-secret", 2100))
+            .unwrap();
+        store_a
+            .upsert_token(mk_token("tok-3", "third-secret", 2200))
+            .unwrap();
+
+        let reopened2 = RoamingSingularityStore::open_at(test_dir.clone()).unwrap();
+        assert!(
+            !reopened2.tokens.sessions.iter().any(|t| t.id == "tok-1"),
+            "Deleted token must not be resurrected by stale disk copy"
+        );
+        assert!(reopened2.tokens.sessions.iter().any(|t| t.id == "tok-2"));
+        assert!(reopened2.tokens.sessions.iter().any(|t| t.id == "tok-3"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

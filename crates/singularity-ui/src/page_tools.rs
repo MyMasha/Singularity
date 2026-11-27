@@ -581,12 +581,18 @@ impl NotesStore {
     }
 }
 
+const MAX_MARKDOWN_BLOCKQUOTE_DEPTH: usize = 32;
+
 /// Renders GFM Markdown into strictly XSS-safe HTML in 100% pure Rust.
 ///
 /// Supports ATX headings, bold/italic/strikethrough/inline code, fenced code blocks,
 /// ordered/unordered lists, GFM task lists (`[x]`/`[ ]`), blockquotes, GFM tables,
 /// horizontal rules, and safe `http(s)`/`mailto:`/`#` links. All raw HTML is escaped.
 pub fn render_safe_markdown_html(markdown: &str) -> String {
+    render_safe_markdown_html_depth(markdown, 0)
+}
+
+fn render_safe_markdown_html_depth(markdown: &str, depth: usize) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut out = String::with_capacity(markdown.len() + 128);
     let mut i = 0usize;
@@ -662,8 +668,16 @@ pub fn render_safe_markdown_html(markdown: &str) -> String {
                 q_lines.push(inner);
                 i += 1;
             }
-            let inner_html = render_safe_markdown_html(&q_lines.join("\n"));
-            out.push_str(&format!("<blockquote>{}</blockquote>\n", inner_html.trim()));
+            if depth >= MAX_MARKDOWN_BLOCKQUOTE_DEPTH {
+                let joined = q_lines.join(" ");
+                let escaped = html_escape(joined.trim());
+                if !escaped.is_empty() {
+                    out.push_str(&format!("<p>{}</p>\n", escaped));
+                }
+            } else {
+                let inner_html = render_safe_markdown_html_depth(&q_lines.join("\n"), depth + 1);
+                out.push_str(&format!("<blockquote>{}</blockquote>\n", inner_html.trim()));
+            }
             continue;
         }
 
@@ -1321,15 +1335,23 @@ impl ReaderModeExtractor {
                 break;
             };
             let body_start = start + open_end + 1;
-            let close_rel = find_close_tag_ci(&cleaned[body_start..], "p")
-                .unwrap_or_else(|| (cleaned.len() - body_start).min(4000));
-            let text = strip_all_html_tags(&cleaned[body_start..body_start + close_rel]);
+            let body_end = match find_close_tag_ci(&cleaned[body_start..], "p") {
+                Some(close_rel) => body_start + close_rel,
+                None => {
+                    let mut end = body_start.saturating_add(4000).min(cleaned.len());
+                    while end > body_start && !cleaned.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    end
+                }
+            };
+            let text = strip_all_html_tags(&cleaned[body_start..body_end]);
             let char_len = text.trim().chars().count();
             if char_len >= 60 {
                 substantial_p_chars += char_len;
                 p_count += 1;
             }
-            cursor = body_start + close_rel;
+            cursor = body_end;
             if cursor >= cleaned.len() {
                 break;
             }
@@ -1400,7 +1422,7 @@ impl ReaderModeExtractor {
         let font_stack = if opts.use_open_dyslexic {
             "'OpenDyslexic', 'OpenDyslexic3', 'Comic Sans MS', sans-serif".to_string()
         } else {
-            opts.font_family.clone()
+            sanitize_css_font_family(&opts.font_family)
         };
 
         let focus_lines = opts
@@ -1455,6 +1477,7 @@ impl ReaderModeExtractor {
 
         format!(
             "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">\
+             <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src https: data:;\">\
              <title>{title} — Singularity Reader</title>\
              <style>\
              :root{{--bg:{bg};--surface:{surface};--fg:{fg};--muted:{muted};--accent:{accent};--border:{border};}}\
@@ -1499,6 +1522,24 @@ impl ReaderModeExtractor {
             content = article.content_html,
         )
     }
+}
+
+fn sanitize_css_font_family(raw: &str) -> String {
+    const SAFE_FALLBACK: &str = "Georgia, 'Iowan Old Style', serif";
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 200 {
+        return SAFE_FALLBACK.to_string();
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | ',' | '-' | '\''))
+    {
+        return SAFE_FALLBACK.to_string();
+    }
+    if trimmed.bytes().filter(|&b| b == b'\'').count() % 2 != 0 {
+        return SAFE_FALLBACK.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn extract_best_container(html: &str) -> Option<String> {
@@ -2451,8 +2492,8 @@ fn parse_jsonpath(expr: &str) -> Option<Vec<JsonPathStep>> {
                 let inner = trimmed[i + 1..end].trim();
                 if inner == "*" {
                     steps.push(JsonPathStep::RecursiveWildcard);
-                } else if (inner.starts_with('\'') && inner.ends_with('\''))
-                    || (inner.starts_with('"') && inner.ends_with('"'))
+                } else if (inner.starts_with('\'') && inner.ends_with('\'') && inner.len() >= 2)
+                    || (inner.starts_with('"') && inner.ends_with('"') && inner.len() >= 2)
                 {
                     steps.push(JsonPathStep::RecursiveKey(
                         inner[1..inner.len() - 1].to_string(),
@@ -3041,6 +3082,10 @@ pub fn compute_line_diff(left: &str, right: &str) -> Vec<DiffLine> {
     let n = a_mid.len();
     let m = b_mid.len();
 
+    const MAX_MYERS_LINES_SUM: usize = 4_000;
+    const MAX_MYERS_TRACE_CELLS: usize = 4_000_000; // <= ~32 MiB peak trace budget
+
+    let mut fallback_needed = false;
     if n == 0 {
         for (j, &line) in b_mid.iter().enumerate() {
             out.push(DiffLine {
@@ -3059,14 +3104,20 @@ pub fn compute_line_diff(left: &str, right: &str) -> Vec<DiffLine> {
                 text: line.to_string(),
             });
         }
-    } else if n * m <= 4_000_000 {
-        // Exact Myers O(ND) shortest edit script
+    } else if n.saturating_add(m) <= MAX_MYERS_LINES_SUM && n.saturating_mul(m) <= 4_000_000 {
+        // Exact Myers O(ND) shortest edit script with strict memory budget
         let max_d = n + m;
         let offset = max_d as isize;
-        let mut v = vec![0isize; 2 * max_d + 1];
+        let v_len = 2 * max_d + 1;
+        let max_steps = (MAX_MYERS_TRACE_CELLS / v_len).max(1);
+        let mut v = vec![0isize; v_len];
         let mut trace: Vec<Vec<isize>> = Vec::new();
+        let mut reached = false;
 
         'outer: for d in 0..=max_d {
+            if d > max_steps {
+                break 'outer;
+            }
             trace.push(v.clone());
             let d_i = d as isize;
             let mut k = -d_i;
@@ -3086,64 +3137,73 @@ pub fn compute_line_diff(left: &str, right: &str) -> Vec<DiffLine> {
                 }
                 v[(k + offset) as usize] = x;
                 if (x as usize) >= n && (y as usize) >= m {
+                    reached = true;
                     break 'outer;
                 }
                 k += 2;
             }
         }
 
-        // Backtrack trace
-        let mut mid_ops: Vec<DiffLine> = Vec::new();
-        let mut x = n as isize;
-        let mut y = m as isize;
-        for (d, prev_v) in trace.iter().enumerate().rev() {
-            let d_i = d as isize;
-            let k = x - y;
-            let prev_k = if k == -d_i
-                || (k != d_i
-                    && prev_v[(k - 1 + offset) as usize] < prev_v[(k + 1 + offset) as usize])
-            {
-                k + 1
-            } else {
-                k - 1
-            };
-            let prev_x = prev_v[(prev_k + offset) as usize];
-            let prev_y = prev_x - prev_k;
+        if reached {
+            // Backtrack trace
+            let mut mid_ops: Vec<DiffLine> = Vec::new();
+            let mut x = n as isize;
+            let mut y = m as isize;
+            for (d, prev_v) in trace.iter().enumerate().rev() {
+                let d_i = d as isize;
+                let k = x - y;
+                let prev_k = if k == -d_i
+                    || (k != d_i
+                        && prev_v[(k - 1 + offset) as usize] < prev_v[(k + 1 + offset) as usize])
+                {
+                    k + 1
+                } else {
+                    k - 1
+                };
+                let prev_x = prev_v[(prev_k + offset) as usize];
+                let prev_y = prev_x - prev_k;
 
-            while x > prev_x && y > prev_y {
-                x -= 1;
-                y -= 1;
-                mid_ops.push(DiffLine {
-                    kind: DiffLineKind::Equal,
-                    left_line: Some(prefix + x as usize + 1),
-                    right_line: Some(prefix + y as usize + 1),
-                    text: a_mid[x as usize].to_string(),
-                });
-            }
-            if d > 0 {
-                if x == prev_x {
+                while x > prev_x && y > prev_y {
+                    x -= 1;
                     y -= 1;
                     mid_ops.push(DiffLine {
-                        kind: DiffLineKind::Added,
-                        left_line: None,
-                        right_line: Some(prefix + y as usize + 1),
-                        text: b_mid[y as usize].to_string(),
-                    });
-                } else {
-                    x -= 1;
-                    mid_ops.push(DiffLine {
-                        kind: DiffLineKind::Removed,
+                        kind: DiffLineKind::Equal,
                         left_line: Some(prefix + x as usize + 1),
-                        right_line: None,
+                        right_line: Some(prefix + y as usize + 1),
                         text: a_mid[x as usize].to_string(),
                     });
                 }
+                if d > 0 {
+                    if x == prev_x {
+                        y -= 1;
+                        mid_ops.push(DiffLine {
+                            kind: DiffLineKind::Added,
+                            left_line: None,
+                            right_line: Some(prefix + y as usize + 1),
+                            text: b_mid[y as usize].to_string(),
+                        });
+                    } else {
+                        x -= 1;
+                        mid_ops.push(DiffLine {
+                            kind: DiffLineKind::Removed,
+                            left_line: Some(prefix + x as usize + 1),
+                            right_line: None,
+                            text: a_mid[x as usize].to_string(),
+                        });
+                    }
+                }
             }
+            mid_ops.reverse();
+            out.extend(mid_ops);
+        } else {
+            fallback_needed = true;
         }
-        mid_ops.reverse();
-        out.extend(mid_ops);
     } else {
-        // Bounded fallback for gigantic inputs
+        fallback_needed = true;
+    }
+
+    if fallback_needed {
+        // Bounded fallback for gigantic or memory-capped inputs
         for (i, &line) in a_mid.iter().enumerate() {
             out.push(DiffLine {
                 kind: DiffLineKind::Removed,
@@ -3908,6 +3968,26 @@ mod tests {
         );
         assert!(reader_page.contains("OpenDyslexic"));
         assert!(reader_page.contains("data-line-focus=\"3\""));
+        assert!(reader_page.contains(
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src https: data:;\">"
+        ));
+
+        // Font family CSS injection is rejected and replaced with safe fallback
+        let injected_page = ReaderModeExtractor::render_reader_page_html(
+            &extracted,
+            &ReaderRenderOptions {
+                font_family: "Georgia; background:url(https://evil.test)</style><script>alert(1)</script>".into(),
+                use_open_dyslexic: false,
+                ..Default::default()
+            },
+        );
+        assert!(!injected_page.contains("evil.test"));
+        assert!(!injected_page.contains("<script>"));
+        assert!(injected_page.contains("font-family:Georgia, 'Iowan Old Style', serif;"));
+
+        // Unclosed <p> with >4000 bytes of multi-byte UTF-8 where body_start + 4000 is mid-char
+        let utf8_unclosed = format!("<article><p>a{}", "é".repeat(2500));
+        assert!(ReaderModeExtractor::is_probably_readerable(&utf8_unclosed));
 
         // Reading list auto-read at >= 90%
         let mut rl = ReadingListStore::new();
@@ -4080,5 +4160,31 @@ mod tests {
             tf,
             "https://example.org/doc#:~:text=zero%2Dknowledge%2C%20fast"
         );
+    }
+
+    #[test]
+    fn test_page_tools_security_bounds_jsonpath_diff_and_markdown_blockquotes() {
+        // F-04: malformed single-quote recursive bracket JSONPath must not panic
+        let doc = serde_json::json!({"a": {"price": 10}});
+        assert!(evaluate_jsonpath(&doc, "$..[']").is_empty());
+        assert!(evaluate_jsonpath(&doc, "$..[\"]").is_empty());
+        assert_eq!(
+            evaluate_jsonpath(&doc, "$..['price']"),
+            vec![serde_json::json!(10)]
+        );
+
+        // F-03: asymmetric huge diff falls back linearly without O((N+M)^2) OOM
+        let huge_left = "a\n".repeat(10_000);
+        let diff = compute_line_diff(&huge_left, "b\n");
+        assert_eq!(diff.len(), 10_001);
+        assert_eq!(diff[0].kind, DiffLineKind::Removed);
+        assert_eq!(diff.last().unwrap().kind, DiffLineKind::Added);
+
+        // F-06: deeply nested Markdown blockquotes cap recursion at 32 levels
+        let deep_quotes = format!("{}hello", ">".repeat(5_000));
+        let rendered = render_safe_markdown_html(&deep_quotes);
+        assert!(rendered.matches("<blockquote>").count() <= MAX_MARKDOWN_BLOCKQUOTE_DEPTH);
+        assert!(rendered.contains("hello"));
+        assert!(!rendered.contains("<script>"));
     }
 }

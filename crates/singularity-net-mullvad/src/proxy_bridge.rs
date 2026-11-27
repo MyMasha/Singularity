@@ -19,6 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
@@ -1039,8 +1040,8 @@ fn handle_socks5(stream: &mut TcpStream, state: &Arc<BridgeSharedState>) -> io::
             let mut domain_bytes = vec![0u8; len];
             stream.read_exact(&mut domain_bytes)?;
             match String::from_utf8(domain_bytes) {
-                Ok(d) => d,
-                Err(_) => {
+                Ok(d) if is_valid_dest_host(&d) => d,
+                _ => {
                     send_socks5_reply(stream, 0x01, None)?;
                     return Ok(());
                 }
@@ -1302,6 +1303,10 @@ fn handle_http_connect(
 
     let upstream = match dial_upstream(state, &decision, &dest_host, dest_port) {
         Ok(u) => u,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
+            return Ok(());
+        }
         Err(_) => {
             stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")?;
             return Ok(());
@@ -1435,7 +1440,7 @@ fn dial_upstream(
                 )),
             }
         }
-        RouteDecision::MullvadRelay { .. } => {
+        RouteDecision::MullvadRelay { relay_hostname, .. } => {
             let upstream_socks = *state
                 .upstream_vpn_socks5
                 .read()
@@ -1449,7 +1454,14 @@ fn dial_upstream(
                     dest_port,
                 )
             } else {
-                dial_direct_checked(&state.kill_switch, dest_host, dest_port)
+                state.blocked_requests.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Mullvad relay '{}' has no upstream VPN SOCKS5 transport configured (fail-closed; refusing clearnet fallback)",
+                        relay_hostname
+                    ),
+                ))
             }
         }
         RouteDecision::BypassDirect { .. } => {
@@ -1494,6 +1506,28 @@ fn dial_direct_checked(
     }
 }
 
+/// Validates that a destination hostname/IP contains no ASCII control characters
+/// (`< 0x20` or `0x7F`), NUL bytes, CR/LF, or whitespace.
+fn is_valid_dest_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && !host.bytes().any(|b| b <= 0x20 || b == 0x7F)
+        && !host.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+fn is_relay_permitted(state: &BridgeSharedState) -> bool {
+    if !state.running.load(Ordering::Acquire) {
+        return false;
+    }
+    if state.kill_switch.is_emergency_lockdown() {
+        return false;
+    }
+    if state.kill_switch.is_strict_enabled() && !state.kill_switch.is_tunnel_established() {
+        return false;
+    }
+    true
+}
+
 /// Outbound SOCKS5h client handshake (RFC 1928 + optional RFC 1929) always transmitting hostnames
 /// as `ATYP = 0x03` so `.onion` and proxied DNS names NEVER resolve locally.
 fn dial_via_upstream_socks5h(
@@ -1503,6 +1537,12 @@ fn dial_via_upstream_socks5h(
     dest_host: &str,
     dest_port: u16,
 ) -> io::Result<TcpStream> {
+    if !is_valid_dest_host(dest_host) || dest_port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid destination host or port for upstream SOCKS5h",
+        ));
+    }
     let addr = (proxy_host, proxy_port)
         .to_socket_addrs()?
         .next()
@@ -1624,6 +1664,12 @@ fn dial_via_upstream_http_connect(
     dest_host: &str,
     dest_port: u16,
 ) -> io::Result<TcpStream> {
+    if !is_valid_dest_host(dest_host) || dest_port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid destination host or port for upstream HTTP CONNECT",
+        ));
+    }
     let addr = (proxy_host, proxy_port)
         .to_socket_addrs()?
         .next()
@@ -1654,7 +1700,13 @@ fn dial_via_upstream_http_connect(
         .ok()
         .and_then(|s| s.lines().next())
         .unwrap_or("");
-    if !status_line.contains(" 200") {
+    let is_http_200 = {
+        let mut parts = status_line.split_whitespace();
+        let version = parts.next().unwrap_or("");
+        let code = parts.next();
+        version.starts_with("HTTP/1.") && code == Some("200")
+    };
+    if !is_http_200 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             format!("Upstream HTTP CONNECT failed: {}", status_line),
@@ -1671,6 +1723,18 @@ fn dial_via_upstream_socks4a(
     dest_host: &str,
     dest_port: u16,
 ) -> io::Result<TcpStream> {
+    if !is_valid_dest_host(dest_host) || dest_port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid destination host or port for upstream SOCKS4a",
+        ));
+    }
+    if user_id.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7F) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid control or NUL byte in upstream SOCKS4a user_id",
+        ));
+    }
     let addr = (proxy_host, proxy_port)
         .to_socket_addrs()?
         .next()
@@ -1715,10 +1779,10 @@ fn relay_bidirectional(
     upstream: TcpStream,
     state: &Arc<BridgeSharedState>,
 ) -> io::Result<()> {
-    let _ = client.set_read_timeout(None);
-    let _ = client.set_write_timeout(None);
-    let _ = upstream.set_read_timeout(None);
-    let _ = upstream.set_write_timeout(None);
+    let _ = client.set_read_timeout(Some(RELAY_POLL_TIMEOUT));
+    let _ = client.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+    let _ = upstream.set_read_timeout(Some(RELAY_POLL_TIMEOUT));
+    let _ = upstream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
     let mut client_write = client.try_clone()?;
     let mut upstream_read = upstream.try_clone()?;
@@ -1727,10 +1791,19 @@ fn relay_bidirectional(
     let rx_state = Arc::clone(state);
     let down_handle = thread::spawn(move || {
         let mut buf = [0u8; 16 * 1024];
+        let mut killed = false;
         loop {
+            if !is_relay_permitted(&rx_state) {
+                killed = true;
+                break;
+            }
             match upstream_read.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if !is_relay_permitted(&rx_state) {
+                        killed = true;
+                        break;
+                    }
                     if client_write.write_all(&buf[..n]).is_err() {
                         break;
                     }
@@ -1738,26 +1811,65 @@ fn relay_bidirectional(
                         .bytes_received
                         .fetch_add(n as u64, Ordering::Relaxed);
                 }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
                 Err(_) => break,
             }
         }
-        let _ = client_write.shutdown(Shutdown::Write);
+        if killed {
+            let _ = upstream_read.shutdown(Shutdown::Both);
+            let _ = client_write.shutdown(Shutdown::Both);
+        } else {
+            let _ = client_write.shutdown(Shutdown::Write);
+        }
     });
 
     let mut buf = [0u8; 16 * 1024];
+    let mut killed = false;
     loop {
+        if !is_relay_permitted(state) {
+            killed = true;
+            break;
+        }
         match client.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if !is_relay_permitted(state) {
+                    killed = true;
+                    break;
+                }
                 if upstream_write.write_all(&buf[..n]).is_err() {
                     break;
                 }
                 state.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
             }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
             Err(_) => break,
         }
     }
-    let _ = upstream_write.shutdown(Shutdown::Write);
+    if killed {
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = upstream_write.shutdown(Shutdown::Both);
+    } else {
+        let _ = upstream_write.shutdown(Shutdown::Write);
+    }
     let _ = down_handle.join();
     Ok(())
 }
@@ -1932,7 +2044,7 @@ fn split_host_and_port(input: &str) -> (&str, Option<u16>) {
 fn parse_connect_authority(authority: &str) -> Option<(&str, u16)> {
     let (host, port) = split_host_and_port(authority);
     let port = port?;
-    if host.is_empty() || port == 0 {
+    if !is_valid_dest_host(host) || port == 0 {
         return None;
     }
     Some((host, port))
@@ -2179,7 +2291,10 @@ mod tests {
 
         let ks = Arc::new(AtomicSocketKillSwitch::new(true, true));
         let policy = SplitTunnelPolicy {
-            domain_rules: vec![SplitTunnelRule::block("blocked.example")],
+            domain_rules: vec![
+                SplitTunnelRule::block("blocked.example"),
+                SplitTunnelRule::bypass_direct("127.0.0.1"),
+            ],
             default_relay_hostname: Some("ch-zrh-wg-001".into()),
             ..Default::default()
         };
@@ -2547,5 +2662,146 @@ mod tests {
 
         socks4_handle.join().expect("mock socks4a exited cleanly");
         bridge.stop();
+    }
+
+    #[test]
+    fn test_security_host_injection_mullvad_fail_closed_and_active_relay_lockdown() {
+        // 1. Upstream HTTP CONNECT & SOCKS4a must reject CR/LF/NUL/control chars
+        let err_http = dial_via_upstream_http_connect(
+            "127.0.0.1",
+            1,
+            "evil.example\r\nX-Injected: yes",
+            80,
+        )
+        .unwrap_err();
+        assert_eq!(err_http.kind(), io::ErrorKind::InvalidInput);
+
+        let err_s4_user =
+            dial_via_upstream_socks4a("127.0.0.1", 1, "user\0evil", "example.com", 80).unwrap_err();
+        assert_eq!(err_s4_user.kind(), io::ErrorKind::InvalidInput);
+
+        let err_s4_host =
+            dial_via_upstream_socks4a("127.0.0.1", 1, "user", "evil\0.example", 80).unwrap_err();
+        assert_eq!(err_s4_host.kind(), io::ErrorKind::InvalidInput);
+
+        // 2. RouteDecision::MullvadRelay with no upstream_vpn_socks5 MUST fail-closed (REP=0x02)
+        //    even when tunnel_established=true and block_lan_rfc1918=false.
+        let ks = Arc::new(AtomicSocketKillSwitch::new(true, false));
+        ks.set_tunnel_established(true);
+        let policy = SplitTunnelPolicy {
+            default_relay_hostname: Some("ch-zrh-wg-001".into()),
+            ..Default::default()
+        };
+        let mut bridge = LoopbackProxyBridge::new(Arc::clone(&ks), policy, HashMap::new());
+        let port = bridge.start().expect("start bridge");
+
+        {
+            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            client.write_all(&[0x05, 0x01, 0x02]).unwrap();
+            let mut m = [0u8; 2];
+            client.read_exact(&mut m).unwrap();
+            assert_eq!(m, [0x05, 0x02]);
+
+            let uname = bridge.session_username().as_bytes();
+            let tok = bridge.session_token().as_bytes();
+            let mut auth = vec![0x01, uname.len() as u8];
+            auth.extend_from_slice(uname);
+            auth.push(tok.len() as u8);
+            auth.extend_from_slice(tok);
+            client.write_all(&auth).unwrap();
+            let mut aresp = [0u8; 2];
+            client.read_exact(&mut aresp).unwrap();
+            assert_eq!(aresp, [0x01, 0x00]);
+
+            // CRLF in ATYP=0x03 must be rejected with REP=0x01
+            let bad_dom = b"example.com\r\nHost: evil";
+            let mut bad_req = vec![0x05, 0x01, 0x00, 0x03, bad_dom.len() as u8];
+            bad_req.extend_from_slice(bad_dom);
+            bad_req.extend_from_slice(&443u16.to_be_bytes());
+            client.write_all(&bad_req).unwrap();
+            let mut rep = [0u8; 10];
+            client.read_exact(&mut rep).unwrap();
+            assert_eq!(rep[1], 0x01, "Control/CRLF domain must be rejected with REP=0x01");
+        }
+
+        {
+            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            client.write_all(&[0x05, 0x01, 0x02]).unwrap();
+            let mut m = [0u8; 2];
+            client.read_exact(&mut m).unwrap();
+            assert_eq!(m, [0x05, 0x02]);
+
+            let uname = bridge.session_username().as_bytes();
+            let tok = bridge.session_token().as_bytes();
+            let mut auth = vec![0x01, uname.len() as u8];
+            auth.extend_from_slice(uname);
+            auth.push(tok.len() as u8);
+            auth.extend_from_slice(tok);
+            client.write_all(&auth).unwrap();
+            let mut aresp = [0u8; 2];
+            client.read_exact(&mut aresp).unwrap();
+            assert_eq!(aresp, [0x01, 0x00]);
+
+            // Valid domain routed to MullvadRelay with no upstream VPN SOCKS5 -> fail-closed REP=0x02
+            let dom = b"example.com";
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, dom.len() as u8];
+            req.extend_from_slice(dom);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            client.write_all(&req).unwrap();
+            let mut rep = [0u8; 10];
+            client.read_exact(&mut rep).unwrap();
+            assert_eq!(
+                rep[1], 0x02,
+                "MullvadRelay without upstream_vpn_socks5 must fail-closed with REP=0x02"
+            );
+        }
+        bridge.stop();
+
+        // 3. Active relay_bidirectional tunnel must be severed promptly on Emergency Lockdown
+        let (echo_port, echo_handle) = spawn_loopback_echo_server();
+        let ks2 = Arc::new(AtomicSocketKillSwitch::new(true, false));
+        ks2.set_tunnel_established(true);
+        let mut bridge2 =
+            LoopbackProxyBridge::new(Arc::clone(&ks2), SplitTunnelPolicy::default(), HashMap::new());
+        let port2 = bridge2.start().expect("start bridge2");
+
+        let auth_b64 = BASE64.encode(format!(
+            "{}:{}",
+            bridge2.session_username(),
+            bridge2.session_token()
+        ));
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port2)).unwrap();
+        let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
+        let req = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            echo_port, echo_port, auth_b64
+        );
+        client.write_all(req.as_bytes()).unwrap();
+        let mut hdr = Vec::new();
+        let mut b = [0u8; 1];
+        while !hdr.ends_with(b"\r\n\r\n") {
+            client.read_exact(&mut b).unwrap();
+            hdr.push(b[0]);
+        }
+        assert!(std::str::from_utf8(&hdr)
+            .unwrap()
+            .starts_with("HTTP/1.1 200"));
+
+        client.write_all(b"ping").unwrap();
+        let mut pong = [0u8; 4];
+        client.read_exact(&mut pong).unwrap();
+        assert_eq!(&pong, b"ping");
+
+        // Trigger Emergency Lockdown while tunnel is open -> relay must close within ~250ms
+        ks2.set_emergency_lockdown(true);
+        let mut drain = [0u8; 16];
+        match client.read(&mut drain) {
+            Ok(0) => {} // Cleanly closed by kill-switch
+            Err(e) if e.kind() != io::ErrorKind::TimedOut && e.kind() != io::ErrorKind::WouldBlock => {}
+            other => panic!("Expected active tunnel to close on emergency lockdown, got {:?}", other),
+        }
+
+        bridge2.stop();
+        let _ = echo_handle.join();
     }
 }

@@ -219,7 +219,7 @@ impl ParsedOriginUrl {
         }
         let rest = &trimmed[sep + 3..];
         let no_frag = rest.split('#').next().unwrap_or(rest);
-        let (authority, path_query) = match no_frag.find('/') {
+        let (authority, path_query) = match no_frag.find(['/', '?', '\\']) {
             Some(idx) => (&no_frag[..idx], &no_frag[idx..]),
             None => (no_frag, "/"),
         };
@@ -306,16 +306,39 @@ impl ParsedOriginUrl {
     }
 }
 
+fn decode_pct_dots(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'2'
+            && (bytes[i + 2] == b'e' || bytes[i + 2] == b'E')
+        {
+            out.push('.');
+            i += 3;
+        } else {
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 fn normalize_dot_segments(raw_path: &str) -> String {
-    let trailing_slash = raw_path.ends_with('/') && raw_path.len() > 1;
-    let mut segs: Vec<&str> = Vec::new();
-    for seg in raw_path.split('/') {
-        match seg {
+    let slash_norm = raw_path.replace('\\', "/");
+    let trailing_slash = slash_norm.ends_with('/') && slash_norm.len() > 1;
+    let mut segs: Vec<String> = Vec::new();
+    for raw_seg in slash_norm.split('/') {
+        let seg = decode_pct_dots(raw_seg);
+        match seg.as_str() {
             "" | "." => {}
             ".." => {
                 segs.pop();
             }
-            s => segs.push(s),
+            _ => segs.push(seg),
         }
     }
     if segs.is_empty() {
@@ -327,6 +350,19 @@ fn normalize_dot_segments(raw_path: &str) -> String {
     }
 }
 
+fn has_valid_rfc3986_scheme_prefix(s: &str) -> bool {
+    let Some(sep) = s.find("://") else {
+        return false;
+    };
+    let scheme = &s[..sep];
+    let mut bytes = scheme.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
 /// Resolves a relative or absolute manifest URL against `base_url`.
 pub fn resolve_manifest_url(base_url: &str, candidate: &str) -> Result<String, PwaError> {
     let base = ParsedOriginUrl::parse(base_url)?;
@@ -334,14 +370,18 @@ pub fn resolve_manifest_url(base_url: &str, candidate: &str) -> Result<String, P
     if trimmed.is_empty() {
         return Ok(base.to_canonical_url());
     }
-    if trimmed.contains("://") {
+    if has_valid_rfc3986_scheme_prefix(trimmed) {
         return Ok(ParsedOriginUrl::parse(trimmed)?.to_canonical_url());
     }
-    if let Some(after_slashes) = trimmed.strip_prefix("//") {
-        let full = format!("{}:{}", base.scheme, format!("//{}", after_slashes));
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2
+        && matches!(bytes[0], b'/' | b'\\')
+        && matches!(bytes[1], b'/' | b'\\')
+    {
+        let full = format!("{}://{}", base.scheme, &trimmed[2..]);
         return Ok(ParsedOriginUrl::parse(&full)?.to_canonical_url());
     }
-    if trimmed.starts_with('/') {
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
         let full = format!("{}{}", base.origin_string(), trimmed);
         return Ok(ParsedOriginUrl::parse(&full)?.to_canonical_url());
     }
@@ -1045,6 +1085,29 @@ fn sanitize_xdg_value(raw: &str) -> String {
         .collect()
 }
 
+/// Escapes an argument placed inside double quotes (`"..."`) in a FreeDesktop Desktop Entry
+/// `Exec=` line:
+/// - Strips control characters (`\r`, `\n`, etc.).
+/// - Escapes `%` as `%%` so untrusted values cannot trigger Desktop Entry field code expansion.
+/// - Escapes `\`, `"`, `$`, and `` ` `` with a backslash per the `Exec` quoting rule, and doubles
+///   the backslash per the Desktop Entry general `string` value escape rule (`\` -> `\\\\`,
+///   `"` -> `\\"`, `$` -> `\\$`, `` ` `` -> `` \\` ``).
+fn escape_xdg_exec_quoted_arg(raw: &str) -> String {
+    let clean = sanitize_xdg_value(raw);
+    let mut out = String::with_capacity(clean.len() + 8);
+    for ch in clean.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\\\"),
+            '"' => out.push_str(r#"\\""#),
+            '$' => out.push_str(r"\\$"),
+            '`' => out.push_str(r"\\`"),
+            '%' => out.push_str("%%"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Generates a Linux XDG `.desktop` entry for an installed PWA, including `Actions=`
 /// jump-list shortcuts and `MimeType=` registrations for validated protocol & file handlers.
 pub fn generate_linux_desktop_file(
@@ -1052,7 +1115,8 @@ pub fn generate_linux_desktop_file(
     executable_path: &str,
     icon_path: Option<&str>,
 ) -> String {
-    let exe = sanitize_xdg_value(executable_path);
+    let exe = escape_xdg_exec_quoted_arg(executable_path);
+    let safe_id = escape_xdg_exec_quoted_arg(&app.id);
     let name = sanitize_xdg_value(app.manifest.display_title());
     let comment = sanitize_xdg_value(
         app.manifest
@@ -1098,7 +1162,7 @@ pub fn generate_linux_desktop_file(
         name = name,
         comment = comment,
         exe = exe,
-        id = app.id,
+        id = safe_id,
         icon = icon,
     );
 
@@ -1115,8 +1179,8 @@ pub fn generate_linux_desktop_file(
                 idx = idx,
                 sname = sanitize_xdg_value(&shortcut.name),
                 exe = exe,
-                id = app.id,
-                surl = sanitize_xdg_value(&shortcut.url).replace('"', ""),
+                id = safe_id,
+                surl = escape_xdg_exec_quoted_arg(&shortcut.url),
             ));
         }
     }
@@ -1369,5 +1433,120 @@ mod tests {
         assert!(win.registered_extensions.contains(&".md".to_string()));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_linux_desktop_file_exec_escaping() {
+        let mut manifest =
+            parse_web_app_manifest(RICH_MANIFEST, "https://notes.example.com/manifest.json")
+                .unwrap();
+        manifest.shortcuts = vec![ManifestShortcut {
+            name: "Injected".into(),
+            short_name: None,
+            description: None,
+            url: r#"https://notes.example.com/app/open?q=100%&cmd=$(id)&bt=`uname`&dq="x"&bs=\y"#.into(),
+            icons: vec![],
+        }];
+        let app = InstalledPwa {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            manifest,
+            is_synthetic: false,
+            open_in_window: true,
+            launch_at_os_login: false,
+            capture_links: true,
+            badge_count: 0,
+            installed_unix: 0,
+        };
+        let desktop = generate_linux_desktop_file(
+            &app,
+            r#"/opt/my"app/$HOME/`bin`\100%/singularity"#,
+            Some("/icons/app.png"),
+        );
+
+        let exec_lines: Vec<&str> = desktop
+            .lines()
+            .filter(|l| l.starts_with("Exec="))
+            .collect();
+        assert_eq!(exec_lines.len(), 2);
+
+        // Executable path escaping: \ -> \\\\, " -> \\", $ -> \\$, ` -> \\`, % -> %%
+        assert!(
+            exec_lines[0].contains(r#"/opt/my\\"app/\\$HOME/\\`bin\\`\\\\100%%/singularity"#),
+            "unexpected primary Exec line: {}",
+            exec_lines[0]
+        );
+        assert!(exec_lines[0].ends_with(" %u"));
+
+        // Shortcut URL escaping in Desktop Action Exec=
+        assert!(
+            exec_lines[1].contains(r#"--app-url="https://notes.example.com/app/open?q=100%%&cmd=\\$(id)&bt=\\`uname\\`&dq=\\"x\\"&bs=\\\\y""#),
+            "unexpected shortcut Exec line: {}",
+            exec_lines[1]
+        );
+    }
+
+    #[test]
+    fn test_url_parsing_dot_segments_backslashes_and_query_scheme_resolution() {
+        // 1. %2e / %2E and backslash path normalization prevent scope bypasses
+        assert!(!is_url_within_scope(
+            "https://notes.example.com/app/%2e%2e/secret",
+            "https://notes.example.com/app/"
+        ));
+        assert!(!is_url_within_scope(
+            "https://notes.example.com/app/.%2E/secret",
+            "https://notes.example.com/app/"
+        ));
+        assert!(!is_url_within_scope(
+            r"https://notes.example.com/app\..\secret",
+            "https://notes.example.com/app/"
+        ));
+        assert!(is_url_within_scope(
+            r"https://notes.example.com/app\sub\%2e/doc",
+            "https://notes.example.com/app/"
+        ));
+
+        // 2. Authority terminates at ?, #, \ as well as /
+        assert!(is_url_within_scope(
+            "https://notes.example.com?foo=1",
+            "https://notes.example.com/"
+        ));
+        assert!(!is_url_within_scope(
+            r"https://evil.com\notes.example.com/app/",
+            "https://notes.example.com/app/"
+        ));
+        assert!(!is_url_within_scope(
+            "https://evil.com?notes.example.com/app/",
+            "https://notes.example.com/app/"
+        ));
+
+        // 3. resolve_manifest_url must NOT treat `://` inside query string as absolute scheme
+        let resolved_q = resolve_manifest_url(
+            "https://notes.example.com/app/index.html",
+            "/app/share?next=https://other.example/x",
+        )
+        .expect("query containing :// must resolve relative to base origin");
+        assert_eq!(
+            resolved_q,
+            "https://notes.example.com/app/share?next=https://other.example/x"
+        );
+        let resolved_rel_q = resolve_manifest_url(
+            "https://notes.example.com/app/index.html",
+            "open?target=https://other.example/y",
+        )
+        .expect("relative path with query containing :// must resolve against parent dir");
+        assert_eq!(
+            resolved_rel_q,
+            "https://notes.example.com/app/open?target=https://other.example/y"
+        );
+        let resolved_backslash_proto = resolve_manifest_url(
+            "https://notes.example.com/app/index.html",
+            r"/\evil.example/phish",
+        )
+        .expect("backslash protocol-relative resolves to evil origin");
+        assert_eq!(resolved_backslash_proto, "https://evil.example/phish");
+        assert!(!is_url_within_scope(
+            &resolved_backslash_proto,
+            "https://notes.example.com/app/"
+        ));
     }
 }

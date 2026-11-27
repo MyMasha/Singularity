@@ -251,8 +251,14 @@ pub fn compute_bounded_pip_rect(
 
     let width = desired_width.clamp(1, max_w);
     let height = desired_height.clamp(1, max_h);
-    let x = vw.saturating_sub(width).saturating_sub(margin_x) as i32;
-    let y = vh.saturating_sub(height).saturating_sub(margin_y) as i32;
+    let x = vw
+        .saturating_sub(width)
+        .saturating_sub(margin_x)
+        .min(i32::MAX as u32) as i32;
+    let y = vh
+        .saturating_sub(height)
+        .saturating_sub(margin_y)
+        .min(i32::MAX as u32) as i32;
     (x, y, width, height)
 }
 
@@ -479,8 +485,8 @@ impl OledMediaPlayer {
         };
         let clamped_w = width.clamp(1, vw);
         let clamped_h = height.clamp(1, vh);
-        let max_x = vw.saturating_sub(clamped_w) as i32;
-        let max_y = vh.saturating_sub(clamped_h) as i32;
+        let max_x = vw.saturating_sub(clamped_w).min(i32::MAX as u32) as i32;
+        let max_y = vh.saturating_sub(clamped_h).min(i32::MAX as u32) as i32;
         self.dock_mode = PlayerDockMode::FloatingPictureInPicture {
             x: x.clamp(0, max_x),
             y: y.clamp(0, max_y),
@@ -628,6 +634,27 @@ fn clean_ass_dialogue_text(raw: &str) -> String {
                 i = i + 1 + rel_close + 1;
                 continue;
             }
+            // No closing '}' remains anywhere: consume the remainder in a single O(N) pass.
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    match chars[i + 1] {
+                        'N' | 'n' => {
+                            stripped.push('\n');
+                            i += 2;
+                            continue;
+                        }
+                        'h' => {
+                            stripped.push(' ');
+                            i += 2;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                stripped.push(chars[i]);
+                i += 1;
+            }
+            break;
         }
         if chars[i] == '\\' && i + 1 < chars.len() {
             match chars[i + 1] {
@@ -1000,5 +1027,32 @@ Dialogue: 0,0:00:02.00,0:00:05.00,Sign,,0,0,0,,Intro\hCard
         );
         assert_eq!(player.tracks.next_chapter_start_ms(15_000), Some(30_000));
         assert_eq!(player.tracks.prev_chapter_start_ms(45_000), Some(30_000));
+    }
+
+    #[test]
+    fn test_pip_bounds_large_viewport_no_panic_and_ass_unclosed_braces_linear() {
+        let mut player = OledMediaPlayer::default();
+        // Viewports > i32::MAX must never wrap negative and panic in i32::clamp
+        player.set_picture_in_picture_bounds(500, 300, 480, 270, u32::MAX, u32::MAX);
+        assert_eq!(
+            player.dock_mode,
+            PlayerDockMode::FloatingPictureInPicture {
+                x: 500,
+                y: 300,
+                width: 480,
+                height: 270,
+            }
+        );
+
+        let (bx, by, bw, bh) = compute_bounded_pip_rect(u32::MAX, u32::MAX, 480, 270);
+        assert!(bx >= 0 && by >= 0);
+        assert_eq!((bw, bh), (480, 270));
+
+        // 50,000 unclosed '{' characters must complete in O(N) while preserving escapes
+        let mut adversarial = "{".repeat(50_000);
+        adversarial.push_str(r"hello\Nworld\h!");
+        let cleaned = clean_ass_dialogue_text(&adversarial);
+        assert!(cleaned.starts_with(&"{".repeat(50_000)));
+        assert!(cleaned.ends_with("hello\nworld !"));
     }
 }

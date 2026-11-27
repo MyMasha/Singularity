@@ -970,7 +970,7 @@ fn wrap_oled_shell(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'nonce-__CSP_NONCE__'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none';">
 <title>browser://{slug} — {title}</title>
 <style>
 :root {{
@@ -1077,7 +1077,7 @@ h1 {{ margin: 8px 0 4px; font-size: 24px; font-weight: 700; letter-spacing: -0.0
   </main>
 </div>
 <div id="sg-toast" class="sg-toast" role="status"></div>
-<script>
+<script nonce="__CSP_NONCE__">
 (function() {{
   "use strict";
   const SG_TOKEN = {token_json};
@@ -1094,14 +1094,56 @@ h1 {{ margin: 8px 0 4px; font-size: 24px; font-weight: 700; letter-spacing: -0.0
     el.__t = setTimeout(() => {{ el.style.display = "none"; }}, 2600);
   }}
 
+  const __sgPendingReqs = new Map();
+  let __sgReqSeq = 0;
+
+  window.addEventListener("message", (ev) => {{
+    const msg = ev && ev.data;
+    if (!msg || msg.type !== "sg-internal-api-reply" || !msg.reqId) return;
+    const entry = __sgPendingReqs.get(msg.reqId);
+    if (!entry) return;
+    __sgPendingReqs.delete(msg.reqId);
+    clearTimeout(entry.timer);
+    entry.resolve(msg);
+  }});
+
   window.sgApi = async function(path, method, payload) {{
+    const m = method || "POST";
+    if (window.parent && window.parent !== window && window.location.origin === "null") {{
+      const reqId = "sg-" + (++__sgReqSeq) + "-" + Date.now();
+      return new Promise((resolve) => {{
+        const timer = setTimeout(() => {{
+          __sgPendingReqs.delete(reqId);
+          showToast("API timeout: " + path);
+          resolve({{ ok: false, status: 504, text: "Request timed out" }});
+        }}, 15000);
+        __sgPendingReqs.set(reqId, {{
+          timer,
+          resolve: (reply) => {{
+            const ok = Boolean(reply.ok);
+            const status = typeof reply.status === "number" ? reply.status : (ok ? 200 : 500);
+            const txt = reply.error
+              ? String(reply.error)
+              : (typeof reply.data === "string"
+                  ? reply.data
+                  : (reply.data !== undefined ? JSON.stringify(reply.data) : ""));
+            showToast(ok ? ("OK: " + path) : ("HTTP " + status + ": " + txt.slice(0, 120)));
+            resolve({{ ok, status, text: txt, data: reply.data }});
+          }},
+        }});
+        window.parent.postMessage(
+          {{ type: "sg-internal-api", reqId, method: m, path, body: payload }},
+          "*"
+        );
+      }});
+    }}
     const headers = {{ "Content-Type": "application/json" }};
     if (SG_TOKEN) headers["X-Singularity-Token"] = SG_TOKEN;
     try {{
       const res = await fetch(SG_API_BASE + path, {{
-        method: method || "POST",
+        method: m,
         headers,
-        body: payload !== undefined ? JSON.stringify(payload) : undefined,
+        body: (m.toUpperCase() !== "GET" && payload !== undefined) ? JSON.stringify(payload) : undefined,
       }});
       const txt = await res.text();
       showToast(res.ok ? ("OK: " + path) : ("HTTP " + res.status + ": " + txt.slice(0, 120)));
@@ -1151,13 +1193,18 @@ h1 {{ margin: 8px 0 4px; font-size: 24px; font-weight: 700; letter-spacing: -0.0
   }}
 
   document.addEventListener("click", (ev) => {{
+    const backBtn = ev.target.closest("[data-action=\"history-back\"]");
+    if (backBtn) {{
+      history.back();
+      return;
+    }}
     const btn = ev.target.closest("[data-api-action]");
     if (!btn) return;
     const path = btn.getAttribute("data-api-action");
     const method = btn.getAttribute("data-api-method") || "POST";
     const rawPayload = btn.getAttribute("data-api-payload");
     let payload = undefined;
-    if (rawPayload) {{
+    if (method.toUpperCase() !== "GET" && rawPayload) {{
       try {{ payload = JSON.parse(rawPayload); }} catch (_) {{ payload = rawPayload; }}
     }}
     window.sgApi(path, method, payload);
@@ -1266,13 +1313,13 @@ fn render_flags_body(ctx: &InternalPageContext, is_fr: bool) -> (String, String,
     };
     let mut html = format!(
         "<div style=\"margin-bottom:14px\">\
-         <button class=\"sg-btn danger\" data-api-action=\"/api/settings/reset_all\" data-api-payload=\"{{}}\">{}</button>\
+         <button class=\"sg-btn danger\" data-api-action=\"/api/flags/reset_all\" data-api-payload=\"{{}}\">{}</button>\
          </div><div class=\"sg-grid\">",
         html_escape(reset_lbl)
     );
     for flag in &ctx.flags {
-        let next_state = !flag.enabled;
-        let payload = serde_json::json!({ "key": flag.id, "value": next_state }).to_string();
+        let next_idx: u64 = if flag.enabled { 0 } else { 1 };
+        let payload = serde_json::json!({ "id": flag.id, "option_index": next_idx }).to_string();
         let state_badge = if flag.enabled {
             "<span class=\"sg-badge ok\">ENABLED</span>"
         } else {
@@ -1293,7 +1340,7 @@ fn render_flags_body(ctx: &InternalPageContext, is_fr: bool) -> (String, String,
              <p class=\"sg-desc\" style=\"margin-bottom:10px\">{desc}</p>\
              <div style=\"display:flex;justify-content:space-between;align-items:center\">\
              <code class=\"sg-muted\">{id}</code>\
-             <button class=\"sg-btn primary\" data-api-action=\"/api/settings/set\" data-api-payload=\"{payload}\">{toggle_lbl}</button>\
+             <button class=\"sg-btn primary\" data-api-action=\"/api/flags/set\" data-api-payload=\"{payload}\">{toggle_lbl}</button>\
              </div></div>",
             id = html_escape(&flag.id),
             name = html_escape(&flag.name),
@@ -1389,7 +1436,7 @@ fn render_net_internals_body(ctx: &InternalPageContext, is_fr: bool) -> (String,
     let flush_lbl = if is_fr { "Vider le cache DNS" } else { "Flush DNS Cache" };
     let mut html = format!(
         "<div style=\"margin-bottom:14px\">\
-         <button class=\"sg-btn primary\" data-api-action=\"/api/net/flush_dns\" data-api-payload=\"{{}}\">{}</button>\
+         <button class=\"sg-btn primary\" data-api-action=\"/api/dns/clear_cache\" data-api-payload=\"{{}}\">{}</button>\
          </div>\
          <table class=\"sg-table\"><thead><tr>\
          <th>Time</th><th>Protocol</th><th>Host</th><th>Status</th><th>Latency</th><th>Mullvad</th>\
@@ -1425,7 +1472,7 @@ fn render_net_internals_body(ctx: &InternalPageContext, is_fr: bool) -> (String,
 fn render_crashes_body(ctx: &InternalPageContext, _is_fr: bool) -> (String, String, String) {
     let mut html = String::from(
         "<div style=\"margin-bottom:14px\">\
-         <button class=\"sg-btn danger\" data-api-action=\"/api/crashes/clear\" data-api-payload=\"{}\">Clear Local Crash Journal</button>\
+         <button class=\"sg-btn danger\" data-api-action=\"/api/crashes/purge\" data-api-payload=\"{}\">Clear Local Crash Journal</button>\
          </div><table class=\"sg-table\"><thead><tr>\
          <th>ID</th><th>Timestamp</th><th>Process</th><th>Reason</th><th>Recovered Tabs</th>\
          </tr></thead><tbody>",
@@ -1452,7 +1499,6 @@ fn render_crashes_body(ctx: &InternalPageContext, _is_fr: bool) -> (String, Stri
 fn render_components_body(ctx: &InternalPageContext, _is_fr: bool) -> (String, String, String) {
     let mut html = String::from("<div class=\"sg-grid\">");
     for c in &ctx.components {
-        let payload = serde_json::json!({ "component_id": c.id }).to_string();
         let sig = if c.signature_verified {
             "<span class=\"sg-badge ok\">ED25519 VERIFIED</span>"
         } else {
@@ -1464,14 +1510,13 @@ fn render_components_body(ctx: &InternalPageContext, _is_fr: bool) -> (String, S
              <span class=\"sg-badge cyan\">v{ver}</span>{sig}</div>\
              <h3 style=\"margin-top:8px\">{name}</h3>\
              <p class=\"sg-desc\">Status: {status}</p>\
-             <button class=\"sg-btn\" style=\"margin-top:10px\" data-api-action=\"/api/components/check\" data-api-payload=\"{payload}\">Check Update</button>\
+             <button class=\"sg-btn\" style=\"margin-top:10px\" data-api-action=\"/api/internal/components\" data-api-method=\"GET\">Check Update</button>\
              </div>",
             id = html_escape(&c.id),
             name = html_escape(&c.name),
             ver = html_escape(&c.version),
             sig = sig,
             status = html_escape(&c.status),
-            payload = html_escape(&payload),
         ));
     }
     html.push_str("</div>");
@@ -1705,7 +1750,7 @@ const probeOut = document.getElementById("omni-out");
 if (probeBtn && probeIn && probeOut) {
   probeBtn.addEventListener("click", async () => {
     const q = probeIn.value.trim();
-    const res = await window.sgApi("/api/omnibox/debug", "POST", { query: q });
+    const res = await window.sgApi("/api/omnibox/suggest?q=" + encodeURIComponent(q), "GET");
     probeOut.textContent = res.text || JSON.stringify({ query: q, ok: res.ok }, null, 2);
   });
 }
@@ -1767,7 +1812,7 @@ fn render_performance_body(ctx: &InternalPageContext, _is_fr: bool) -> (String, 
 fn render_logger_body(ctx: &InternalPageContext, _is_fr: bool) -> (String, String, String) {
     let mut html = String::from(
         "<div style=\"margin-bottom:14px\">\
-         <button class=\"sg-btn\" data-api-action=\"/api/logger/clear\" data-api-payload=\"{}\">Clear Log</button>\
+         <button class=\"sg-btn\" data-api-action=\"/api/shields/logger_toggle\" data-api-payload='{\"enabled\":true,\"clear\":true}'>Clear Log</button>\
          </div><table class=\"sg-table\"><thead><tr>\
          <th>Time</th><th>Level</th><th>Source</th><th>Target</th><th>Rule</th><th>Action</th>\
          </tr></thead><tbody>",
@@ -1801,12 +1846,12 @@ fn render_diff_body(ctx: &InternalPageContext, is_fr: bool) -> (String, String, 
          </tr></thead><tbody>",
     );
     for d in &ctx.diff_entries {
-        let payload = serde_json::json!({ "key": d.key, "value": d.default_value }).to_string();
+        let payload = serde_json::json!({ "key": d.key }).to_string();
         html.push_str(&format!(
             "<tr data-filterable=\"{k} {def} {cur}\">\
              <td><code>{k}</code></td><td class=\"sg-muted\"><code>{def}</code></td>\
              <td><code style=\"color:var(--gold)\">{cur}</code></td>\
-             <td><button class=\"sg-btn\" data-api-action=\"/api/settings/set\" data-api-payload=\"{payload}\">{lbl}</button></td></tr>",
+             <td><button class=\"sg-btn\" data-api-action=\"/api/settings/reset_key\" data-api-payload=\"{payload}\">{lbl}</button></td></tr>",
             k = html_escape(&d.key),
             def = html_escape(&d.default_value),
             cur = html_escape(&d.current_value),
@@ -1827,8 +1872,8 @@ fn render_apps_body(ctx: &InternalPageContext, is_fr: bool) -> (String, String, 
     let remove_lbl = if is_fr { "Désinstaller" } else { "Uninstall" };
     let mut html = String::from("<div class=\"sg-grid\">");
     for a in &ctx.pwa_apps {
-        let launch_p = serde_json::json!({ "app_id": a.id, "action": "launch" }).to_string();
-        let del_p = serde_json::json!({ "app_id": a.id, "action": "uninstall" }).to_string();
+        let launch_p = serde_json::json!({ "id": a.id }).to_string();
+        let del_p = serde_json::json!({ "id": a.id }).to_string();
         let kind_badge = if a.is_synthetic {
             "<span class=\"sg-badge cyan\">SITE APP</span>"
         } else {
@@ -1839,8 +1884,8 @@ fn render_apps_body(ctx: &InternalPageContext, is_fr: bool) -> (String, String, 
              {kind_badge}<h3 style=\"margin-top:8px\">{name}</h3>\
              <p class=\"sg-desc\"><code>{url}</code></p>\
              <div style=\"margin-top:12px;display:flex;gap:8px\">\
-             <button class=\"sg-btn primary\" data-api-action=\"/api/pwa/action\" data-api-payload=\"{launch_p}\">{launch_lbl}</button>\
-             <button class=\"sg-btn danger\" data-api-action=\"/api/pwa/action\" data-api-payload=\"{del_p}\">{remove_lbl}</button>\
+             <button class=\"sg-btn primary\" data-api-action=\"/api/pwa/launch\" data-api-payload=\"{launch_p}\">{launch_lbl}</button>\
+             <button class=\"sg-btn danger\" data-api-action=\"/api/pwa/uninstall\" data-api-payload=\"{del_p}\">{remove_lbl}</button>\
              </div></div>",
             kind_badge = kind_badge,
             name = html_escape(&a.name),
@@ -1886,7 +1931,7 @@ fn render_userscripts_body(ctx: &InternalPageContext, is_fr: bool) -> (String, S
              <p class=\"sg-desc\"><code>{matches}</code></p>\
              <div style=\"margin-top:12px;display:flex;gap:8px\">\
              <button class=\"sg-btn primary\" data-api-action=\"/api/userscripts/toggle\" data-api-payload=\"{toggle_p}\">{toggle_lbl}</button>\
-             <button class=\"sg-btn danger\" data-api-action=\"/api/userscripts/remove\" data-api-payload=\"{del_p}\">Remove</button>\
+             <button class=\"sg-btn danger\" data-api-action=\"/api/userscripts/delete\" data-api-payload=\"{del_p}\">Remove</button>\
              </div></div>",
             name = html_escape(&s.name),
             ver = html_escape(&s.version),
@@ -1943,7 +1988,7 @@ fn render_cert_error_body(ctx: &InternalPageContext, is_fr: bool) -> (String, St
            <dt>SPKI SHA-256</dt><dd><code>{spki}</code></dd>\
          </dl>\
          <div style=\"display:flex;gap:12px;margin-top:20px\">\
-           <button class=\"sg-btn primary\" type=\"button\" onclick=\"history.back()\">{back_lbl}</button>\
+           <button class=\"sg-btn primary\" type=\"button\" data-action=\"history-back\">{back_lbl}</button>\
            <button class=\"sg-btn danger\" type=\"button\" data-api-action=\"/api/security/cert_bypass\" data-api-payload=\"{proceed_payload}\">Proceed Temporarily (Unsafe)</button>\
          </div></div>",
         code = html_escape(&info.error_code),
@@ -1989,7 +2034,7 @@ fn render_https_warning_body(ctx: &InternalPageContext, is_fr: bool) -> (String,
          <p class=\"sg-desc\"><code>{url}</code></p>\
          <p style=\"margin:14px 0\">{reason}</p>\
          <div style=\"display:flex;gap:12px;margin-top:20px\">\
-           <button class=\"sg-btn primary\" type=\"button\" onclick=\"history.back()\">{back_lbl}</button>\
+           <button class=\"sg-btn primary\" type=\"button\" data-action=\"history-back\">{back_lbl}</button>\
            <button class=\"sg-btn\" type=\"button\" data-api-action=\"/api/security/allow_http_once\" data-api-payload=\"{allow_payload}\">Continue to HTTP Site (Session Only)</button>\
          </div></div>",
         heading = html_escape(heading),
@@ -2132,13 +2177,56 @@ mod tests {
             assert!(html.contains("id=\"sg-filter\""), "{} must include filter box", slug);
             assert!(html.contains("id=\"sg-export-json\""), "{} must include export JSON", slug);
             assert!(html.contains("Content-Security-Policy"), "{} must enforce CSP", slug);
+            assert!(!html.contains("onclick="), "{} must not use inline onclick handlers", slug);
+            assert!(
+                !html.contains("script-src 'unsafe-inline'"),
+                "{} must not use unsafe-inline in script-src",
+                slug
+            );
+            assert!(
+                !html.contains("http://127.0.0.1:*"),
+                "{} must not use wildcard loopback connect-src",
+                slug
+            );
+            assert!(
+                html.contains("sg-internal-api") && html.contains("sg-internal-api-reply"),
+                "{} must support sandboxed iframe postMessage relay",
+                slug
+            );
         }
 
-        // Verify cert-error thoroughly escapes malicious host/issuer payloads
+        // Verify cert-error thoroughly escapes malicious host/issuer payloads & uses data-action
         let cert_html = render_internal_page_html("cert-error", &ctx).unwrap();
         assert!(!cert_html.contains("<script>alert(1)</script>"));
         assert!(!cert_html.contains("<img src=x onerror=alert(1)>"));
         assert!(cert_html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(cert_html.contains("data-action=\"history-back\""));
+        let https_html = render_internal_page_html("https-warning", &ctx).unwrap();
+        assert!(https_html.contains("data-action=\"history-back\""));
+
+        // Verify aligned internal page API routes
+        let flags_html = render_internal_page_html("flags", &ctx).unwrap();
+        assert!(flags_html.contains("/api/flags/reset_all"));
+        assert!(flags_html.contains("/api/flags/set"));
+        let net_html = render_internal_page_html("net-internals", &ctx).unwrap();
+        assert!(net_html.contains("/api/dns/clear_cache"));
+        let crashes_html = render_internal_page_html("crashes", &ctx).unwrap();
+        assert!(crashes_html.contains("/api/crashes/purge"));
+        let omni_html = render_internal_page_html("omnibox", &ctx).unwrap();
+        assert!(omni_html.contains("/api/omnibox/suggest?q="));
+        let logger_html = render_internal_page_html("logger", &ctx).unwrap();
+        assert!(logger_html.contains("/api/shields/logger_toggle"));
+        ctx.userscripts.push(UserscriptSummaryEntry {
+            id: "us-1".into(),
+            name: "Sample".into(),
+            version: "1.0".into(),
+            enabled: true,
+            matches: vec!["https://example.com/*".into()],
+            risk_level: "Standard".into(),
+        });
+        let us_html = render_internal_page_html("userscripts", &ctx).unwrap();
+        assert!(us_html.contains("/api/userscripts/delete"));
+        assert!(!us_html.contains("/api/userscripts/remove"));
 
         // French rendering works cleanly
         ctx.language = "fr".into();

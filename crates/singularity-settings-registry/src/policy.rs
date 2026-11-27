@@ -149,6 +149,23 @@ fn parse_source(raw: &str) -> Result<PolicySource, String> {
     }
 }
 
+/// Clamps a JSON-derived [`ManagedPolicyEntry`] so untrusted or lower-privilege JSON inputs
+/// cannot self-elevate `enforcement` (e.g. `Recommended` -> `Mandatory`) or `source` priority
+/// above the caller-supplied `(max_source, max_enforcement)` ceiling.
+fn clamp_policy_entry_privileges(
+    mut entry: ManagedPolicyEntry,
+    max_source: PolicySource,
+    max_enforcement: PolicyEnforcement,
+) -> ManagedPolicyEntry {
+    if max_enforcement == PolicyEnforcement::Recommended {
+        entry.enforcement = PolicyEnforcement::Recommended;
+    }
+    if entry.source.priority() > max_source.priority() {
+        entry.source = max_source;
+    }
+    entry
+}
+
 /// Central enterprise policy loader, inspector, and enforcer for `browser://policy`.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyEngine {
@@ -281,7 +298,8 @@ impl PolicyEngine {
             for item in arr {
                 let entry: ManagedPolicyEntry = serde_json::from_value(item.clone())
                     .map_err(|e| format!("Invalid ManagedPolicyEntry in array: {}", e))?;
-                if self.insert_policy(entry) {
+                let clamped = clamp_policy_entry_privileges(entry, source, default_enforcement);
+                if self.insert_policy(clamped) {
                     loaded += 1;
                 }
             }
@@ -297,7 +315,8 @@ impl PolicyEngine {
             let entries: Vec<ManagedPolicyEntry> = serde_json::from_value(policies_val.clone())
                 .map_err(|e| format!("Invalid 'policies' array in snapshot: {}", e))?;
             for entry in entries {
-                if self.insert_policy(entry) {
+                let clamped = clamp_policy_entry_privileges(entry, source, default_enforcement);
+                if self.insert_policy(clamped) {
                     loaded += 1;
                 }
             }
@@ -334,13 +353,17 @@ impl PolicyEngine {
                         .and_then(JsonValue::as_str)
                         .unwrap_or(default_scope)
                         .to_string();
-                    ManagedPolicyEntry {
-                        key: key.clone(),
-                        value: typed_val,
-                        source: entry_source,
-                        enforcement,
-                        scope,
-                    }
+                    clamp_policy_entry_privileges(
+                        ManagedPolicyEntry {
+                            key: key.clone(),
+                            value: typed_val,
+                            source: entry_source,
+                            enforcement,
+                            scope,
+                        },
+                        source,
+                        default_enforcement,
+                    )
                 } else {
                     return Err(format!(
                         "Policy object for key '{}' must contain 'value'",
@@ -552,9 +575,9 @@ mod tests {
         let reloaded = engine2
             .load_json_str(
                 &exported,
-                PolicySource::Default,
-                PolicyEnforcement::Recommended,
-                "user",
+                PolicySource::LinuxManagedJson,
+                PolicyEnforcement::Mandatory,
+                "machine",
             )
             .expect("reload exported snapshot");
         assert_eq!(reloaded, 4);
@@ -562,5 +585,102 @@ mod tests {
         assert!(!engine2.is_mandatory_locked("media.audio.volume_boost_percent"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_policy_json_cannot_self_elevate_enforcement_or_source() {
+        let mut engine = PolicyEngine::new();
+        // Seed a Mandatory CommandLine policy
+        assert!(engine.insert_policy(ManagedPolicyEntry {
+            key: "security.sandbox.level".into(),
+            value: SettingValue::Int(4),
+            source: PolicySource::CommandLine,
+            enforcement: PolicyEnforcement::Mandatory,
+            scope: "machine".into(),
+        }));
+
+        // 1. Recommended JSON (rich object) attempting to self-elevate to Mandatory + CommandLine
+        let loaded_rec = engine
+            .load_json_str(
+                r#"{
+                    "security.sandbox.level": {
+                        "value": 1,
+                        "enforcement": "Mandatory",
+                        "source": "CommandLine",
+                        "scope": "machine"
+                    },
+                    "ui.sidebar.position": {
+                        "value": "right",
+                        "enforcement": "Mandatory",
+                        "source": "CommandLine",
+                        "scope": "user"
+                    }
+                }"#,
+                PolicySource::LinuxManagedJson,
+                PolicyEnforcement::Recommended,
+                "user",
+            )
+            .expect("load recommended json");
+        // security.sandbox.level must NOT be overwritten; ui.sidebar.position is clamped to Recommended/LinuxManagedJson
+        assert_eq!(loaded_rec, 1);
+        assert_eq!(
+            engine.get("security.sandbox.level").unwrap().value,
+            SettingValue::Int(4)
+        );
+        let sidebar = engine.get("ui.sidebar.position").unwrap();
+        assert_eq!(sidebar.enforcement, PolicyEnforcement::Recommended);
+        assert_eq!(sidebar.source, PolicySource::LinuxManagedJson);
+        assert!(!engine.is_mandatory_locked("ui.sidebar.position"));
+
+        // 2. LinuxManagedJson (Mandatory) attempting to spoof source="CommandLine" to override CLI policy
+        let loaded_spoof = engine
+            .load_json_str(
+                r#"[
+                    {
+                        "key": "security.sandbox.level",
+                        "value": {"type": "Int", "value": 0},
+                        "source": "CommandLine",
+                        "enforcement": "Mandatory",
+                        "scope": "machine"
+                    },
+                    {
+                        "key": "security.v8.jitless_strict_mode",
+                        "value": {"type": "Bool", "value": true},
+                        "source": "CommandLine",
+                        "enforcement": "Mandatory",
+                        "scope": "machine"
+                    }
+                ]"#,
+                PolicySource::LinuxManagedJson,
+                PolicyEnforcement::Mandatory,
+                "machine",
+            )
+            .expect("load array json");
+        assert_eq!(loaded_spoof, 1);
+        assert_eq!(
+            engine.get("security.sandbox.level").unwrap().value,
+            SettingValue::Int(4)
+        );
+        assert_eq!(
+            engine.get("security.v8.jitless_strict_mode").unwrap().source,
+            PolicySource::LinuxManagedJson
+        );
+
+        // 3. Snapshot format loaded with Recommended + Default must clamp every entry
+        let exported = engine.export_json().expect("export snapshot");
+        let mut engine_low = PolicyEngine::new();
+        let loaded_low = engine_low
+            .load_json_str(
+                &exported,
+                PolicySource::Default,
+                PolicyEnforcement::Recommended,
+                "user",
+            )
+            .expect("load snapshot under low trust");
+        assert!(loaded_low >= 3);
+        for pol in engine_low.list_policies() {
+            assert_eq!(pol.enforcement, PolicyEnforcement::Recommended);
+            assert_eq!(pol.source, PolicySource::Default);
+        }
     }
 }

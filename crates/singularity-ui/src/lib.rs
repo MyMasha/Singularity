@@ -767,7 +767,8 @@ mod tests {
 
         let updater_src = include_str!("updater.rs");
         assert!(updater_src.contains("https://github.com/MyMasha/Singularity"));
-        assert!(updater_src.contains("winhttp_get_https_bytes"));
+        assert!(updater_src.contains("winhttp_get_allowed_https_bytes"));
+        assert!(updater_src.contains("winhttp_get_no_redirect"));
         assert!(updater_src.contains("winhttp_download_https_to_file"));
         assert!(!updater_src.contains("/contents/dist/"));
     }
@@ -823,11 +824,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.3");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.4");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.4"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1220,7 +1221,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.4"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1472,7 +1473,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v3.0.3"));
+        assert!(txt.contains("v3.0.4"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1506,7 +1507,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.4"));
     }
 
     #[test]
@@ -1979,8 +1980,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.3");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.4");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.4"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -2089,8 +2090,8 @@ mod tests {
         assert!(prog_json.get("speed_bps").is_some());
 
         // 6. Verify v3.0.1 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.3");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.3"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.4");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.4"));
         assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
         assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
         assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));

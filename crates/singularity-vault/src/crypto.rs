@@ -15,7 +15,7 @@ use std::fmt;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1076,7 +1076,9 @@ pub fn unseal_attachment_chunks(
     let subkey = dek.derive_subkey(&salt, info.as_bytes())?;
 
     let total_chunks = sealed.chunks_base64.len();
-    let mut output = Vec::with_capacity(sealed.plaintext_size.min(64 * 1024 * 1024) as usize);
+    let mut output = Zeroizing::new(Vec::with_capacity(
+        sealed.plaintext_size.min(64 * 1024 * 1024) as usize,
+    ));
 
     for (idx, chunk_b64) in sealed.chunks_base64.iter().enumerate() {
         let is_final = idx + 1 == total_chunks;
@@ -1091,19 +1093,17 @@ pub fn unseal_attachment_chunks(
             idx as u64,
             is_final,
         );
-        let mut pt = subkey.decrypt_xchacha20_poly1305(&ct, &nonce, &aad)?;
+        let pt = Zeroizing::new(subkey.decrypt_xchacha20_poly1305(&ct, &nonce, &aad)?);
         output.extend_from_slice(&pt);
-        pt.zeroize();
     }
 
     if output.len() as u64 != sealed.plaintext_size {
-        output.zeroize();
         return Err(VaultCryptoError::StreamAttachmentError(
             "Authenticated plaintext length mismatch".into(),
         ));
     }
 
-    Ok(output)
+    Ok(std::mem::take(&mut *output))
 }
 
 /// X25519 keypair used for asymmetric encrypted `Singularity Send` and CXP sharing.

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish assets for (required when publishing, e.g. v3.0.3)"
+        description: "Release tag to build and publish assets for (required when publishing, e.g. v3.0.4)"
         required: false
         default: ""
       publish:
@@ -256,19 +256,41 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Resolve and validate release tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TARGET_TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_TAG}" ]; then
+            TARGET_TAG="${INPUT_TAG}"
+          else
+            echo "[ERROR] Missing release tag: trigger via a vX.Y.Z git tag push or provide the 'tag' workflow_dispatch input." >&2
+            exit 1
+          fi
+          if [[ ! "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "[ERROR] Invalid release tag '${TARGET_TAG}' (must match strict SemVer ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$)." >&2
+            exit 1
+          fi
+          echo "TAG=${TARGET_TAG}" >> "${GITHUB_ENV}"
+          echo "[OK] Resolved release tag: ${TARGET_TAG}"
+
       - name: Generate SHA256SUMS.txt (and optional Ed25519 signature)
         env:
           SIGNING_KEY_PEM: ${{ secrets.SINGULARITY_RELEASE_SIGNING_KEY }}
         run: |
           cd artifacts
-          sha256sum \
-            Singularity-setup.exe \
-            Singularity-Debian.deb \
-            Singularity-Ubuntu.deb \
-            Singularity-Bazzite.rpm \
-            Singularity-Mint.deb \
-            singularity.exe \
-            singularity-linux-x86_64 > SHA256SUMS.txt
+          {
+            printf '# Singularity-Release: %s\n' "${{ env.TAG }}"
+            sha256sum \
+              Singularity-setup.exe \
+              Singularity-Debian.deb \
+              Singularity-Ubuntu.deb \
+              Singularity-Bazzite.rpm \
+              Singularity-Mint.deb \
+              singularity.exe \
+              singularity-linux-x86_64
+          } > SHA256SUMS.txt
           cat SHA256SUMS.txt
           if [ -n "${SIGNING_KEY_PEM}" ]; then
             umask 077
@@ -285,19 +307,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          INPUT_TAG: ${{ inputs.tag }}
           ALLOW_CLOBBER: ${{ inputs.allow_clobber }}
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TARGET_TAG="${GITHUB_REF_NAME}"
-          elif [ -n "${INPUT_TAG}" ]; then
-            TARGET_TAG="${INPUT_TAG}"
-          else
-            echo "[ERROR] Missing release tag: trigger via a vX.Y.Z git tag push or provide the 'tag' workflow_dispatch input." >&2
-            exit 1
-          fi
-          if [[ ! "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?$ ]]; then
-            echo "[ERROR] Invalid release tag '${TARGET_TAG}' (must match ^v[0-9]+\\.[0-9]+\\.[0-9]+([.-][0-9A-Za-z]+)?$)." >&2
+          TARGET_TAG="${{ env.TAG }}"
+          if [[ ! "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "[ERROR] Invalid release tag '${TARGET_TAG}'." >&2
             exit 1
           fi
 

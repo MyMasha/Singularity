@@ -151,9 +151,11 @@ pub fn list_crash_reports(roaming_root: &Path) -> Vec<CrashReport> {
             }
         }
     }
-    if reports.is_empty() {
-        if let Ok(bytes) = std::fs::read(dir.join("last_crash.json")) {
-            if let Ok(rep) = serde_json::from_slice::<CrashReport>(&bytes) {
+    if let Ok(bytes) = std::fs::read(dir.join("last_crash.json")) {
+        if let Ok(rep) = serde_json::from_slice::<CrashReport>(&bytes) {
+            if reports.is_empty()
+                || (!rep.acknowledged && !reports.iter().any(|existing| existing.id == rep.id))
+            {
                 reports.push(rep);
             }
         }
@@ -379,7 +381,8 @@ pub fn detect_previous_crash_and_mark_running_with_cef_log(
 ) -> Option<CrashReport> {
     let mut detected: Option<CrashReport> = None;
 
-    let last_json = crashes_dir(roaming_root).join("last_crash.json");
+    let dir = crashes_dir(roaming_root);
+    let last_json = dir.join("last_crash.json");
     if let Ok(bytes) = std::fs::read(&last_json) {
         if let Ok(mut rep) = serde_json::from_slice::<CrashReport>(&bytes) {
             if !rep.acknowledged {
@@ -393,7 +396,24 @@ pub fn detect_previous_crash_and_mark_running_with_cef_log(
                     rep.cef_log_tail = log_tail;
                 }
                 if let Ok(updated) = serde_json::to_vec_pretty(&rep) {
-                    let _ = std::fs::write(&last_json, updated);
+                    let _ = std::fs::write(&last_json, &updated);
+                    // Archive SEH (or otherwise unarchived) crash reports under `crashes/<id>.json`
+                    // so subsequent crashes do not erase history and `is_crash_loop_detected` works.
+                    let id_is_safe = !rep.id.is_empty()
+                        && rep
+                            .id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                    if id_is_safe {
+                        let archive_json = dir.join(format!("{}.json", rep.id));
+                        if !archive_json.exists() {
+                            let _ = std::fs::write(&archive_json, &updated);
+                        }
+                        let archive_txt = dir.join(format!("{}.txt", rep.id));
+                        if !archive_txt.exists() {
+                            let _ = std::fs::write(&archive_txt, rep.format_copyable_text());
+                        }
+                    }
                 }
                 detected = Some(rep);
             }
@@ -681,6 +701,7 @@ fn install_windows_seh_filter(roaming_root: &Path) {
             lp_overlapped: *mut core::ffi::c_void,
         ) -> i32;
         fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+        fn Sleep(dw_milliseconds: u32);
         fn TerminateProcess(h_process: *mut core::ffi::c_void, u_exit_code: u32) -> i32;
     }
 
@@ -730,6 +751,8 @@ fn install_windows_seh_filter(roaming_root: &Path) {
         };
         let exit_code = if code != 0 { code } else { 1 };
         if SEH_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            // Allow the first crashing thread to finish flushing `last_crash.json` before exit.
+            Sleep(3000);
             let _ = TerminateProcess(GetCurrentProcess(), exit_code);
             return EXCEPTION_EXECUTE_HANDLER;
         }
@@ -756,6 +779,8 @@ fn install_windows_seh_filter(roaming_root: &Path) {
         if let Some(json_path) = SEH_CRASH_JSON_PATH_W.get() {
             let mut jbuf = StackBuf::<1024>::new();
             jbuf.push_bytes(b"{\"id\":\"seh-");
+            jbuf.push_dec_u64(ts_unix);
+            jbuf.push_bytes(b"-");
             jbuf.push_dec_u64(pid as u64);
             jbuf.push_bytes(b"-");
             jbuf.push_hex_u32(code);
@@ -1294,6 +1319,97 @@ impl Drop for Win32ShutdownSentinel {
             }
             self.hwnd = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_seh_consecutive_crashes_archived_and_trigger_crash_loop_detection() {
+        let unique = format!(
+            "singularity_crash_loop_seh_test_{}_{}",
+            std::process::id(),
+            unix_now_secs()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&root);
+        let crashes = crashes_dir(&root);
+        std::fs::create_dir_all(&crashes).expect("mkdir crashes");
+
+        let now = unix_now_secs();
+        let seh1 = CrashReport {
+            id: format!("seh-{}-1001-C0000005", now.saturating_sub(15)),
+            timestamp_unix: now.saturating_sub(15),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            os_arch: "windows-x86_64".to_string(),
+            kind: "windows_seh_exception".to_string(),
+            summary: "EXCEPTION_ACCESS_VIOLATION (0xC0000005) at 0x0".to_string(),
+            details: "Crash 1".to_string(),
+            cef_log_tail: String::new(),
+            acknowledged: false,
+        };
+        std::fs::write(
+            crashes.join("last_crash.json"),
+            serde_json::to_vec(&seh1).unwrap(),
+        )
+        .expect("write seh1");
+
+        let d1 = detect_previous_crash_and_mark_running_with_cef_log(&root, "cef line 1")
+            .expect("detect seh1");
+        assert_eq!(d1.id, seh1.id);
+        assert!(crashes.join(format!("{}.json", seh1.id)).is_file());
+        assert!(!is_crash_loop_detected(&root, now, 60));
+
+        // Second SEH crash overwrites `last_crash.json` without creating its own archive file.
+        let seh2 = CrashReport {
+            id: format!("seh-{}-1002-C0000005", now.saturating_sub(5)),
+            timestamp_unix: now.saturating_sub(5),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            os_arch: "windows-x86_64".to_string(),
+            kind: "windows_seh_exception".to_string(),
+            summary: "EXCEPTION_ACCESS_VIOLATION (0xC0000005) at 0x10".to_string(),
+            details: "Crash 2".to_string(),
+            cef_log_tail: String::new(),
+            acknowledged: false,
+        };
+        std::fs::write(
+            crashes.join("last_crash.json"),
+            serde_json::to_vec(&seh2).unwrap(),
+        )
+        .expect("write seh2");
+
+        // Even before archiving seh2, crash loop is already detectable, and after archiving both exist.
+        assert!(is_crash_loop_detected(&root, now, 60));
+        let d2 = detect_previous_crash_and_mark_running_with_cef_log(&root, "cef line 2")
+            .expect("detect seh2");
+        assert_eq!(d2.id, seh2.id);
+        assert!(crashes.join(format!("{}.json", seh2.id)).is_file());
+        assert_eq!(list_crash_reports(&root).len(), 2);
+        assert!(is_crash_loop_detected(&root, now, 60));
+
+        // Path traversal IDs in `last_crash.json` must never be written outside `crashes/`.
+        let bad = CrashReport {
+            id: "../escape".to_string(),
+            timestamp_unix: now,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            os_arch: "windows-x86_64".to_string(),
+            kind: "windows_seh_exception".to_string(),
+            summary: "bad".to_string(),
+            details: "bad".to_string(),
+            cef_log_tail: String::new(),
+            acknowledged: false,
+        };
+        std::fs::write(
+            crashes.join("last_crash.json"),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .expect("write bad");
+        let _ = detect_previous_crash_and_mark_running_with_cef_log(&root, "");
+        assert!(!root.join("escape.json").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

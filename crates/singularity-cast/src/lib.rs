@@ -34,6 +34,9 @@ const DNS_TYPE_AAAA: u16 = 28;
 const DNS_TYPE_SRV: u16 = 33;
 const DNS_CLASS_IN: u16 = 1;
 const MAX_DNS_COMPRESSION_HOPS: usize = 16;
+const MAX_DNS_NAME_OCTETS: usize = 255;
+const MAX_MDNS_RESOURCE_RECORDS: usize = 256;
+const MAX_DISCOVERED_DEVICES: usize = 256;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CastError {
@@ -277,6 +280,25 @@ impl OptInCastController {
         }
     }
 
+    fn insert_discovered_device(&mut self, device: CastDevice) {
+        if !self.discovered_devices.contains_key(&device.id)
+            && self.discovered_devices.len() >= MAX_DISCOVERED_DEVICES
+        {
+            let evict_key = self
+                .discovered_devices
+                .iter()
+                .filter(|(id, _)| self.active_device_id.as_deref() != Some(id.as_str()))
+                .min_by_key(|(_, dev)| dev.discovered_at_ms)
+                .map(|(id, _)| id.clone());
+            if let Some(key) = evict_key {
+                self.discovered_devices.remove(&key);
+            } else {
+                return;
+            }
+        }
+        self.discovered_devices.insert(device.id.clone(), device);
+    }
+
     /// Parses and registers an SSDP `M-SEARCH` response ONLY while discovery is explicitly active.
     pub fn ingest_ssdp_packet(
         &mut self,
@@ -291,8 +313,7 @@ impl OptInCastController {
         if !is_local_lan_ip(device.ip_addr) {
             return Err(CastError::NonLocalReceiverIp(device.ip_addr));
         }
-        self.discovered_devices
-            .insert(device.id.clone(), device.clone());
+        self.insert_discovered_device(device.clone());
         Ok(device)
     }
 
@@ -310,8 +331,7 @@ impl OptInCastController {
         let mut accepted = Vec::new();
         for device in devices {
             if is_local_lan_ip(device.ip_addr) {
-                self.discovered_devices
-                    .insert(device.id.clone(), device.clone());
+                self.insert_discovered_device(device.clone());
                 accepted.push(device);
             }
         }
@@ -474,8 +494,9 @@ impl OptInCastController {
     }
 }
 
-/// Returns `true` iff `ip` is a local unicast LAN address (RFC 1918 IPv4, IPv4 link-local,
-/// IPv6 ULA `fc00::/7`, or IPv6 link-local `fe80::/10`) and NOT multicast/broadcast/unspecified/public.
+/// Returns `true` iff `ip` is a local unicast LAN address (RFC 1918 IPv4,
+/// IPv6 ULA `fc00::/7`, or IPv6 link-local `fe80::/10`) and NOT multicast/broadcast/unspecified/public
+/// or IPv4 link-local/cloud metadata (`169.254.0.0/16`, including `169.254.169.254`).
 pub fn is_local_lan_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -483,7 +504,8 @@ pub fn is_local_lan_ip(ip: IpAddr) -> bool {
                 && !v4.is_broadcast()
                 && !v4.is_multicast()
                 && !v4.is_loopback()
-                && (v4.is_private() || v4.is_link_local())
+                && !v4.is_link_local()
+                && v4.is_private()
         }
         IpAddr::V6(v6) => {
             if v6.is_unspecified() || v6.is_multicast() || v6.is_loopback() {
@@ -604,10 +626,27 @@ pub fn parse_ssdp_response(
         CastProtocol::DlnaUpnp
     };
 
-    let (ip_addr, port) = location
+    let normalize_ip = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    let (ip_addr, port) = match location
         .as_deref()
         .and_then(extract_ip_and_port_from_http_url)
-        .unwrap_or((source_ip, protocol.default_port()));
+    {
+        Some((loc_ip, loc_port)) => {
+            if normalize_ip(loc_ip) != normalize_ip(source_ip) {
+                return Err(CastError::MalformedSsdp(format!(
+                    "SSDP LOCATION IP {loc_ip} does not match packet source IP {source_ip}"
+                )));
+            }
+            (source_ip, loc_port)
+        }
+        None => (source_ip, protocol.default_port()),
+    };
 
     let id = usn
         .as_deref()
@@ -685,6 +724,11 @@ pub fn parse_mdns_query(raw: &[u8]) -> Result<Vec<MdnsQuestion>, CastError> {
         ));
     }
     let qdcount = u16::from_be_bytes([raw[4], raw[5]]) as usize;
+    if qdcount > MAX_MDNS_RESOURCE_RECORDS {
+        return Err(CastError::MalformedMdns(format!(
+            "mDNS query exceeds maximum allowed question count ({MAX_MDNS_RESOURCE_RECORDS})"
+        )));
+    }
     let mut offset = 12usize;
     let mut questions = Vec::with_capacity(qdcount.min(32));
 
@@ -724,6 +768,12 @@ pub fn parse_mdns_response(
     let nscount = u16::from_be_bytes([raw[8], raw[9]]) as usize;
     let arcount = u16::from_be_bytes([raw[10], raw[11]]) as usize;
 
+    if qdcount > MAX_MDNS_RESOURCE_RECORDS {
+        return Err(CastError::MalformedMdns(format!(
+            "mDNS response exceeds maximum allowed question count ({MAX_MDNS_RESOURCE_RECORDS})"
+        )));
+    }
+
     let mut offset = 12usize;
     for _ in 0..qdcount {
         let (_, next_off) = read_dns_name(raw, offset)?;
@@ -738,6 +788,11 @@ pub fn parse_mdns_response(
     let total_rrs = ancount
         .saturating_add(nscount)
         .saturating_add(arcount);
+    if total_rrs > MAX_MDNS_RESOURCE_RECORDS {
+        return Err(CastError::MalformedMdns(format!(
+            "mDNS response exceeds maximum allowed resource records ({MAX_MDNS_RESOURCE_RECORDS})"
+        )));
+    }
 
     // Maps assembled across Answer + Authority + Additional records
     let mut ptr_instances: Vec<(String, String)> = Vec::new(); // (service_type, instance_name)
@@ -898,6 +953,7 @@ fn read_dns_name(packet: &[u8], start_offset: usize) -> Result<(String, usize), 
     let mut end_offset = start_offset;
     let mut jumped = false;
     let mut hops = 0usize;
+    let mut total_octets = 0usize;
 
     loop {
         if offset >= packet.len() {
@@ -905,6 +961,12 @@ fn read_dns_name(packet: &[u8], start_offset: usize) -> Result<(String, usize), 
         }
         let len_byte = packet[offset];
         if len_byte == 0 {
+            total_octets = total_octets.saturating_add(1);
+            if total_octets > MAX_DNS_NAME_OCTETS {
+                return Err(CastError::MalformedMdns(
+                    "DNS name exceeds maximum 255 octets (RFC 1035)".into(),
+                ));
+            }
             if !jumped {
                 end_offset = offset + 1;
             }
@@ -941,6 +1003,12 @@ fn read_dns_name(packet: &[u8], start_offset: usize) -> Result<(String, usize), 
             ));
         } else {
             let label_len = len_byte as usize;
+            total_octets = total_octets.saturating_add(label_len + 1);
+            if total_octets > MAX_DNS_NAME_OCTETS {
+                return Err(CastError::MalformedMdns(
+                    "DNS name exceeds maximum 255 octets (RFC 1035)".into(),
+                ));
+            }
             let label_start = offset + 1;
             let label_end = label_start
                 .checked_add(label_len)
@@ -1484,5 +1552,55 @@ mod tests {
             .unwrap();
         assert_eq!(dlna_wire.endpoint_hint, "RenderingControl#SetVolume");
         assert!(dlna_wire.payload.contains("<DesiredVolume>50</DesiredVolume>"));
+    }
+
+    #[test]
+    fn security_mdns_255_octet_limit_ssdp_source_ip_and_metadata_exclusion() {
+        // Cloud metadata / IPv4 APIPA must never be treated as a valid local LAN cast target
+        assert!(!is_local_lan_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(!is_local_lan_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(!is_local_lan_ip(IpAddr::V6(
+            "::ffff:169.254.169.254".parse().unwrap()
+        )));
+        assert!(is_local_lan_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
+
+        // Spoofed SSDP LOCATION pointing to another IP than source_ip must be rejected
+        let spoofed_ssdp = b"HTTP/1.1 200 OK\r\nLOCATION: http://169.254.169.254:80/latest/meta-data/\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSN: uuid:spoof::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+        assert!(matches!(
+            parse_ssdp_response(spoofed_ssdp, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 100),
+            Err(CastError::MalformedSsdp(_))
+        ));
+
+        // mDNS name > 255 octets (RFC 1035 violation) must be rejected
+        let mut oversized = vec![0u8; 12];
+        oversized[5] = 1; // QDCOUNT = 1
+        for _ in 0..5 {
+            oversized.push(60);
+            oversized.extend_from_slice(&[b'a'; 60]);
+        }
+        oversized.push(0);
+        oversized.extend_from_slice(&[0x00, 0x0C, 0x00, 0x01]);
+        assert!(matches!(
+            parse_mdns_query(&oversized),
+            Err(CastError::MalformedMdns(_))
+        ));
+
+        // Discovered devices map must be strictly bounded to MAX_DISCOVERED_DEVICES
+        let mut ctrl = OptInCastController::new();
+        ctrl.begin_user_discovery_session(1000).unwrap();
+        for idx in 0..(MAX_DISCOVERED_DEVICES + 10) {
+            let ip = IpAddr::V4(Ipv4Addr::new(
+                192,
+                168,
+                ((idx / 200) + 1) as u8,
+                ((idx % 200) + 1) as u8,
+            ));
+            let pkt = format!(
+                "HTTP/1.1 200 OK\r\nLOCATION: http://{ip}:1400/desc.xml\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSN: uuid:dev-{idx}::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+            );
+            ctrl.ingest_ssdp_packet(pkt.as_bytes(), ip, 1000 + idx as u64)
+                .unwrap();
+        }
+        assert_eq!(ctrl.discovered_devices().len(), MAX_DISCOVERED_DEVICES);
     }
 }

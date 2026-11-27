@@ -273,14 +273,28 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     dp[n]
 }
 
-/// Bounded linear-time regex subset matcher supporting `^`, `$`, `.`, `.*`, `.+`, `?`, `\*`, `\.`,
+const MAX_REGEX_STEPS: usize = 10_000;
+
+/// Bounded regex subset matcher supporting `^`, `$`, `.`, `.*`, `.+`, `?`, `\*`, `\.`,
 /// character classes `[a-z0-9]`, and top-level alternation `(a|b)`.
 fn simple_regex_match(pattern: &str, text: &str) -> bool {
+    let mut remaining_steps = MAX_REGEX_STEPS;
+    simple_regex_match_budgeted(pattern, text, &mut remaining_steps)
+}
+
+fn simple_regex_match_budgeted(
+    pattern: &str,
+    text: &str,
+    remaining_steps: &mut usize,
+) -> bool {
+    if *remaining_steps == 0 {
+        return false;
+    }
+    *remaining_steps -= 1;
+
     let anchored_start = pattern.starts_with('^');
     let anchored_end = pattern.ends_with('$') && !pattern.ends_with("\\$");
-    let core = pattern
-        .strip_prefix('^')
-        .unwrap_or(pattern);
+    let core = pattern.strip_prefix('^').unwrap_or(pattern);
     let core = if anchored_end {
         core.strip_suffix('$').unwrap_or(core)
     } else {
@@ -291,7 +305,10 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
     if let Some((before, rest)) = core.split_once('(') {
         if let Some((group, after)) = rest.split_once(')') {
             if !group.contains('(') {
-                return group.split('|').any(|alt| {
+                for alt in group.split('|') {
+                    if *remaining_steps == 0 {
+                        return false;
+                    }
                     let expanded = format!(
                         "{}{}{}{}{}",
                         if anchored_start { "^" } else { "" },
@@ -300,8 +317,11 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
                         after,
                         if anchored_end { "$" } else { "" }
                     );
-                    simple_regex_match(&expanded, text)
-                });
+                    if simple_regex_match_budgeted(&expanded, text, remaining_steps) {
+                        return true;
+                    }
+                }
+                return false;
             }
         }
     }
@@ -310,7 +330,7 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
     enum Atom {
         Any,
         Literal(char),
-        Class(Vec<char>, bool), // chars, negated
+        Class(Vec<(char, char)>, bool), // inclusive (start, end) ranges, negated
     }
 
     #[derive(Clone)]
@@ -325,18 +345,20 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
     let mut tokens: Vec<(Atom, Quant)> = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
+        if *remaining_steps == 0 {
+            return false;
+        }
+        *remaining_steps -= 1;
+
         let atom = if chars[i] == '\\' && i + 1 < chars.len() {
             i += 1;
             let escaped = chars[i];
             match escaped {
-                'd' => Atom::Class(('0'..='9').collect(), false),
-                'w' => {
-                    let mut v: Vec<char> = ('a'..='z').collect();
-                    v.extend('A'..='Z');
-                    v.extend('0'..='9');
-                    v.push('_');
-                    Atom::Class(v, false)
-                }
+                'd' => Atom::Class(vec![('0', '9')], false),
+                'w' => Atom::Class(
+                    vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
+                    false,
+                ),
                 c => Atom::Literal(c),
             }
         } else if chars[i] == '.' {
@@ -349,19 +371,25 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
             } else {
                 false
             };
-            let mut set = Vec::new();
+            let mut ranges: Vec<(char, char)> = Vec::new();
             while i < chars.len() && chars[i] != ']' {
+                if *remaining_steps == 0 {
+                    return false;
+                }
+                *remaining_steps -= 1;
                 if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] != ']' {
-                    for c in chars[i]..=chars[i + 2] {
-                        set.push(c);
+                    let start = chars[i];
+                    let end = chars[i + 2];
+                    if start <= end {
+                        ranges.push((start, end));
                     }
                     i += 3;
                 } else {
-                    set.push(chars[i]);
+                    ranges.push((chars[i], chars[i]));
                     i += 1;
                 }
             }
-            Atom::Class(set, negated)
+            Atom::Class(ranges, negated)
         } else {
             Atom::Literal(chars[i])
         };
@@ -393,8 +421,16 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
         match atom {
             Atom::Any => true,
             Atom::Literal(lc) => lc.eq_ignore_ascii_case(&c),
-            Atom::Class(set, neg) => {
-                let hit = set.iter().any(|sc| sc.eq_ignore_ascii_case(&c));
+            Atom::Class(ranges, neg) => {
+                let hit = if c.is_ascii_alphabetic() {
+                    let lo = c.to_ascii_lowercase();
+                    let hi = c.to_ascii_uppercase();
+                    ranges
+                        .iter()
+                        .any(|&(s, e)| (s <= lo && lo <= e) || (s <= hi && hi <= e))
+                } else {
+                    ranges.iter().any(|&(s, e)| s <= c && c <= e)
+                };
                 if *neg { !hit } else { hit }
             }
         }
@@ -404,65 +440,69 @@ fn simple_regex_match(pattern: &str, text: &str) -> bool {
     let n = t.len();
     let m = tokens.len();
 
-    let match_from = |start_pos: usize| -> bool {
-        let mut reachable = vec![false; n + 1];
-        reachable[start_pos] = true;
+    let mut reachable = if anchored_start {
+        let mut r = vec![false; n + 1];
+        r[0] = true;
+        r
+    } else {
+        vec![true; n + 1]
+    };
 
-        for ti in 0..m {
-            let (ref atom, ref quant) = tokens[ti];
-            let mut next = vec![false; n + 1];
-            match quant {
-                Quant::One => {
-                    for pos in 0..n {
-                        if reachable[pos] && atom_matches(atom, t[pos]) {
-                            next[pos + 1] = true;
-                        }
+    let token_step_cost = 1 + (n / 32);
+    for ti in 0..m {
+        if *remaining_steps < token_step_cost {
+            *remaining_steps = 0;
+            return false;
+        }
+        *remaining_steps -= token_step_cost;
+
+        let (ref atom, ref quant) = tokens[ti];
+        let mut next = vec![false; n + 1];
+        match quant {
+            Quant::One => {
+                for pos in 0..n {
+                    if reachable[pos] && atom_matches(atom, t[pos]) {
+                        next[pos + 1] = true;
                     }
                 }
-                Quant::ZeroOrOne => {
-                    for pos in 0..=n {
-                        if reachable[pos] {
-                            next[pos] = true;
-                            if pos < n && atom_matches(atom, t[pos]) {
-                                next[pos + 1] = true;
-                            }
-                        }
-                    }
-                }
-                Quant::ZeroOrMore => {
-                    for pos in 0..=n {
-                        if reachable[pos] {
-                            next[pos] = true;
-                        }
-                    }
-                    for pos in 0..n {
-                        if next[pos] && atom_matches(atom, t[pos]) {
-                            next[pos + 1] = true;
-                        }
-                    }
-                }
-                Quant::OneOrMore => {
-                    for pos in 0..n {
-                        if (reachable[pos] || next[pos]) && atom_matches(atom, t[pos]) {
+            }
+            Quant::ZeroOrOne => {
+                for pos in 0..=n {
+                    if reachable[pos] {
+                        next[pos] = true;
+                        if pos < n && atom_matches(atom, t[pos]) {
                             next[pos + 1] = true;
                         }
                     }
                 }
             }
-            reachable = next;
+            Quant::ZeroOrMore => {
+                for pos in 0..=n {
+                    if reachable[pos] {
+                        next[pos] = true;
+                    }
+                }
+                for pos in 0..n {
+                    if next[pos] && atom_matches(atom, t[pos]) {
+                        next[pos + 1] = true;
+                    }
+                }
+            }
+            Quant::OneOrMore => {
+                for pos in 0..n {
+                    if (reachable[pos] || next[pos]) && atom_matches(atom, t[pos]) {
+                        next[pos + 1] = true;
+                    }
+                }
+            }
         }
+        reachable = next;
+    }
 
-        if anchored_end {
-            reachable[n]
-        } else {
-            reachable.iter().any(|&b| b)
-        }
-    };
-
-    if anchored_start {
-        match_from(0)
+    if anchored_end {
+        reachable[n]
     } else {
-        (0..=n).any(match_from)
+        reachable.iter().any(|&b| b)
     }
 }
 
@@ -476,6 +516,24 @@ fn is_regex_like(pattern: &str) -> bool {
         || pattern.contains('(')
         || pattern.contains("\\d")
         || pattern.contains("\\w")
+}
+
+fn is_web_scheme_compatible(stored: &ParsedUri, target: &ParsedUri) -> bool {
+    let stored_scheme = match stored.scheme.as_deref() {
+        Some("https") | None => "https",
+        Some("http") => "http",
+        _ => return false,
+    };
+    let target_scheme = match target.scheme.as_deref() {
+        Some("https") => "https",
+        Some("http") => "http",
+        _ => return false,
+    };
+    // Never downgrade an HTTPS-stored credential to an insecure HTTP target URL
+    if stored_scheme == "https" && target_scheme == "http" {
+        return false;
+    }
+    true
 }
 
 /// Evaluates whether `target_uri` matches `stored_uri` under `rule`.
@@ -505,9 +563,12 @@ pub fn matches_uri_rule(stored_uri: &str, rule: UriMatchRule, target_uri: &str) 
 
     match rule {
         UriMatchRule::Never | UriMatchRule::GlobRegex => unreachable!(),
-        UriMatchRule::BaseDomain => stored.etld_plus_one == target.etld_plus_one,
+        UriMatchRule::BaseDomain => {
+            is_web_scheme_compatible(&stored, &target)
+                && stored.etld_plus_one == target.etld_plus_one
+        }
         UriMatchRule::Host => {
-            if stored.host != target.host {
+            if !is_web_scheme_compatible(&stored, &target) || stored.host != target.host {
                 return false;
             }
             let stored_port = stored.port.or(match stored.scheme.as_deref() {
@@ -1243,5 +1304,74 @@ mod tests {
 
         let secret_hits = fuzzy_search_items(&items, "super-secret-wifi", false);
         assert!(secret_hits.is_empty(), "Fuzzy search must never index secret password values");
+    }
+
+    #[test]
+    fn test_regex_budget_stops_redos_and_unicode_ranges_do_not_materialize() {
+        // 30 chained alternation groups = 2^30 branches without a step budget
+        let evil_pattern = format!("^{}$", "(a|b)".repeat(30));
+        assert!(!matches_uri_rule(
+            &evil_pattern,
+            UriMatchRule::GlobRegex,
+            "cccccccccccccccccccccccccccccc"
+        ));
+
+        // Wide Unicode range [\u{0}-\u{10FFFF}] must match in O(1) without materializing 1.1M chars
+        let wide_range = "^https://example\\.com/[\u{0000}-\u{10FFFF}]+$";
+        assert!(matches_uri_rule(
+            wide_range,
+            UriMatchRule::GlobRegex,
+            "https://example.com/hello-世界"
+        ));
+    }
+
+    #[test]
+    fn test_base_domain_and_host_block_https_downgrade_and_non_web_schemes() {
+        // HTTPS stored credential MUST NOT match HTTP target (prevents MITM downgrade autofill)
+        assert!(!matches_uri_rule(
+            "https://github.com",
+            UriMatchRule::BaseDomain,
+            "http://github.com/login"
+        ));
+        assert!(!matches_uri_rule(
+            "github.com",
+            UriMatchRule::BaseDomain,
+            "http://gist.github.com/login"
+        ));
+        assert!(!matches_uri_rule(
+            "https://github.com:8443",
+            UriMatchRule::Host,
+            "http://github.com:8443/login"
+        ));
+
+        // Non-web schemes MUST NOT match in BaseDomain or Host
+        for bad_target in [
+            "ftp://github.com/pub",
+            "javascript://github.com/%0aalert(1)",
+            "file://github.com/etc/passwd",
+        ] {
+            assert!(
+                !matches_uri_rule("https://github.com", UriMatchRule::BaseDomain, bad_target),
+                "BaseDomain must reject non-web target {}",
+                bad_target
+            );
+            assert!(
+                !matches_uri_rule("https://github.com", UriMatchRule::Host, bad_target),
+                "Host must reject non-web target {}",
+                bad_target
+            );
+        }
+
+        // Legitimate HTTP->HTTP and bare-domain->HTTPS continue to match
+        assert!(matches_uri_rule(
+            "http://intranet.local:8080",
+            UriMatchRule::Host,
+            "http://intranet.local:8080/dashboard"
+        ));
+        assert!(matches_uri_rule(
+            "github.com",
+            UriMatchRule::BaseDomain,
+            "https://gist.github.com/login"
+        ));
     }
 }

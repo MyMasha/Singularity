@@ -36,7 +36,7 @@ use singularity_core::{
 use singularity_settings_registry::schema::{SettingCategory, SettingValue};
 use singularity_vault::{
     generate_totp_code, Argon2idConfig, EncryptedSingularityVaultEnvelope, SingularityVault,
-    StoredPasskeyCredential, TotpAlgorithm, VaultCredentialEntry, VaultPlaintextPayload,
+    TotpAlgorithm, VaultCredentialEntry, VaultPlaintextPayload,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -76,11 +76,12 @@ const APPLE_BAR_LOGICAL_HEIGHT: f64 = 80.0;
 type AdoptTabCallback = Arc<Mutex<Option<Box<dyn Fn(TabHandoffPayload) + Send + Sync>>>>;
 type PrivateModeCallback = Arc<Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>>;
 
-/// Cached verified master secret & passkeys for performing Argon2id vault sealing outside `shell_mutex`.
-/// Immediately cleared and zeroized on manual lock or auto-lock.
+/// Cached verified master secret for performing Argon2id vault sealing outside `shell_mutex`.
+/// Live credentials and passkeys are always snapshotted atomically from `shell.vault` under
+/// `shell_mutex` (serialized via `vault_op_lock`) so passkeys enrolled via v3 routes are never
+/// lost. Immediately cleared and zeroized on manual lock or auto-lock.
 struct VaultSessionCache {
     master: Zeroizing<Vec<u8>>,
-    passkeys: Vec<StoredPasskeyCredential>,
 }
 
 /// Progressive exponential backoff and temporary lockout protecting `/api/vault/unlock` against brute force.
@@ -139,7 +140,7 @@ struct WindowTabSession {
 }
 
 #[derive(Clone)]
-struct ServerConfig {
+pub(crate) struct ServerConfig {
     bind_port: u16,
     ipc_token: Arc<String>,
     session_cookie: Arc<String>,
@@ -152,7 +153,7 @@ struct ServerConfig {
     rendered_html_template: Arc<String>,
     adopt_tab_tx: AdoptTabCallback,
     private_mode_tx: PrivateModeCallback,
-    vault_op_lock: Arc<Mutex<()>>,
+    pub(crate) vault_op_lock: Arc<Mutex<()>>,
     vault_session_cache: Arc<Mutex<Option<VaultSessionCache>>>,
     vault_rate_limiter: Arc<Mutex<VaultUnlockRateLimiter>>,
 }
@@ -1874,55 +1875,7 @@ fn run_windows_frameless_browser(
     }
 
     fn resolve_user_downloads_dir() -> std::path::PathBuf {
-        #[repr(C)]
-        struct Guid {
-            data1: u32,
-            data2: u16,
-            data3: u16,
-            data4: [u8; 8],
-        }
-        const FOLDERID_DOWNLOADS: Guid = Guid {
-            data1: 0x374D_E290,
-            data2: 0x123F,
-            data3: 0x4565,
-            data4: [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
-        };
-        #[link(name = "shell32")]
-        extern "system" {
-            fn SHGetKnownFolderPath(
-                rfid: *const Guid,
-                dw_flags: u32,
-                h_token: *mut core::ffi::c_void,
-                ppsz_path: *mut *mut u16,
-            ) -> i32;
-        }
-        #[link(name = "ole32")]
-        extern "system" {
-            fn CoTaskMemFree(pv: *mut core::ffi::c_void);
-        }
-        unsafe {
-            let mut ptr: *mut u16 = core::ptr::null_mut();
-            let hr = SHGetKnownFolderPath(&FOLDERID_DOWNLOADS, 0, core::ptr::null_mut(), &mut ptr);
-            if hr == 0 && !ptr.is_null() {
-                let mut len = 0usize;
-                while *ptr.add(len) != 0 && len < 4096 {
-                    len += 1;
-                }
-                let slice = core::slice::from_raw_parts(ptr, len);
-                let s = String::from_utf16_lossy(slice);
-                CoTaskMemFree(ptr as *mut core::ffi::c_void);
-                if !s.trim().is_empty() {
-                    let p = std::path::PathBuf::from(s.trim());
-                    let _ = std::fs::create_dir_all(&p);
-                    return p;
-                }
-            }
-        }
-        let fallback = std::env::var("USERPROFILE")
-            .map(|u| std::path::PathBuf::from(u).join("Downloads"))
-            .unwrap_or_else(|_| std::env::temp_dir());
-        let _ = std::fs::create_dir_all(&fallback);
-        fallback
+        resolve_downloads_dir()
     }
 
     fn choose_unique_download_path(
@@ -5298,7 +5251,8 @@ fn run_windows_frameless_browser(
                             if st.overlay_open {
                                 return;
                             }
-                            match action {
+                            let action_str: &str = action.as_ref();
+                            match action_str {
                                 "web_back" => {
                                     let is_private = shared_shell
                                         .lock()
@@ -5338,11 +5292,11 @@ fn run_windows_frameless_browser(
                                     );
                                 }
                                 "zoom_in" | "zoom_out" | "zoom_reset" => {
-                                    perform_tab_zoom(st, action);
+                                    perform_tab_zoom(st, action_str);
                                 }
                                 "devtools_toggle" | "devtools_inspect" | "devtools_console" => {
                                     if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
-                                        if action == "devtools_toggle" && b.has_devtools() {
+                                        if action_str == "devtools_toggle" && b.has_devtools() {
                                             b.close_devtools();
                                         } else {
                                             b.open_devtools(None, None);
@@ -5370,6 +5324,37 @@ fn run_windows_frameless_browser(
                                                 "audio_muted": next_muted
                                             }),
                                         );
+                                    }
+                                }
+                                other if other.starts_with("ui_shortcut:") => {
+                                    if let Some(json_str) = other.strip_prefix("ui_shortcut:") {
+                                        if let Ok(val) =
+                                            serde_json::from_str::<serde_json::Value>(json_str)
+                                        {
+                                            if val.get("shortcut").is_some() {
+                                                emit_ui_sync(&st.ui_browser, &val);
+                                            } else if val.get("k").and_then(|v| v.as_str())
+                                                == Some("shortcut")
+                                            {
+                                                if let Some(act) =
+                                                    val.get("a").and_then(|v| v.as_str())
+                                                {
+                                                    let idx = val
+                                                        .get("n")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0);
+                                                    emit_ui_sync(
+                                                        &st.ui_browser,
+                                                        &serde_json::json!({
+                                                            "shortcut": act,
+                                                            "shortcut_index": idx
+                                                        }),
+                                                    );
+                                                }
+                                            } else if val.is_object() {
+                                                emit_ui_sync(&st.ui_browser, &val);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -5406,6 +5391,24 @@ fn run_windows_frameless_browser(
                         if tab_id == 0 {
                             if let Some(ref sm) = smoke_tracker {
                                 sm.log(&format!("UI PageStarted: {}", url));
+                            }
+                            if !cef_runtime::is_exact_local_ui_origin(&url, bind_port)
+                                && !url.trim().eq_ignore_ascii_case("about:blank")
+                            {
+                                eprintln!(
+                                    "[singularity-ui] Self-healing ui_browser: unexpected main-frame navigation '{}' -> reloading local UI shell",
+                                    url
+                                );
+                                if let Some(st) = windows.get_mut(&wid) {
+                                    let fresh_nonce = cfg_clone.mint_bootstrap_nonce();
+                                    let fresh_url = format!(
+                                        "http://127.0.0.1:{}/?boot={}&win={}",
+                                        bind_port, fresh_nonce, st.session_id
+                                    );
+                                    st.ui_browser.load_url(&fresh_url);
+                                    st.layout_cache.invalidate_ui();
+                                    st.sync_layout();
+                                }
                             }
                             return;
                         }
@@ -5669,7 +5672,11 @@ fn run_windows_frameless_browser(
                             st.apply_fullscreen(prev_fs, next_fs);
                         }
                     }
-                    CefCallbackEvent::OpenNewTab { url, background } => {
+                    CefCallbackEvent::OpenNewTab {
+                        url,
+                        background,
+                        from_ui,
+                    } => {
                         let scrubbed_url = match check_navigation_policy(&url, &shared_shell) {
                             Ok(u) => u,
                             Err(reason) => {
@@ -5689,20 +5696,22 @@ fn run_windows_frameless_browser(
                         if let Some(st) = windows.get_mut(&wid) {
                             let mut bg = background;
                             let mut title: Option<String> = None;
-                            if let Some(intent) = st.tab_bg_intents.remove(&st.active_tab_id) {
-                                let age = intent.at.elapsed();
-                                if intent.kind == "bg_click" && age <= Duration::from_millis(1800) {
-                                    bg = true;
-                                    if !intent.title.is_empty() {
-                                        title = Some(intent.title);
-                                    }
-                                } else if intent.kind == "context_link"
-                                    && age <= Duration::from_secs(15)
-                                    && intent.href == url
-                                {
-                                    bg = true;
-                                    if !intent.title.is_empty() {
-                                        title = Some(intent.title);
+                            if !from_ui {
+                                if let Some(intent) = st.tab_bg_intents.remove(&st.active_tab_id) {
+                                    let age = intent.at.elapsed();
+                                    if intent.kind == "bg_click" && age <= Duration::from_millis(1800) {
+                                        bg = true;
+                                        if !intent.title.is_empty() {
+                                            title = Some(intent.title);
+                                        }
+                                    } else if intent.kind == "context_link"
+                                        && age <= Duration::from_secs(15)
+                                        && intent.href == url
+                                    {
+                                        bg = true;
+                                        if !intent.title.is_empty() {
+                                            title = Some(intent.title);
+                                        }
                                     }
                                 }
                             }
@@ -7517,7 +7526,10 @@ fn run_windows_frameless_browser(
                                 if let Some(st) = windows.get(&wid) {
                                     if let Some(b) = st.tab_browsers.get(&st.active_tab_id) {
                                         if let Some(p) = pdf_path.filter(|s| !s.trim().is_empty()) {
-                                            b.print_to_pdf(std::path::Path::new(&p));
+                                            if let Some(safe_pdf) = validate_safe_pdf_output_path(&p)
+                                            {
+                                                b.print_to_pdf(&safe_pdf);
+                                            }
                                         } else {
                                             b.print();
                                         }
@@ -7693,6 +7705,146 @@ fn is_windows_reserved_device_name(name: &str) -> bool {
     )
 }
 
+/// Resolves the user's configured OS Downloads directory (Windows Known Folder / `$HOME/Downloads`).
+pub(crate) fn resolve_downloads_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
+        }
+        const FOLDERID_DOWNLOADS: Guid = Guid {
+            data1: 0x374D_E290,
+            data2: 0x123F,
+            data3: 0x4565,
+            data4: [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
+        };
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SHGetKnownFolderPath(
+                rfid: *const Guid,
+                dw_flags: u32,
+                h_token: *mut core::ffi::c_void,
+                ppsz_path: *mut *mut u16,
+            ) -> i32;
+        }
+        #[link(name = "ole32")]
+        extern "system" {
+            fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+        }
+        unsafe {
+            let mut ptr: *mut u16 = core::ptr::null_mut();
+            let hr = SHGetKnownFolderPath(&FOLDERID_DOWNLOADS, 0, core::ptr::null_mut(), &mut ptr);
+            if hr == 0 && !ptr.is_null() {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 4096 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(ptr, len);
+                let s = String::from_utf16_lossy(slice);
+                CoTaskMemFree(ptr as *mut core::ffi::c_void);
+                if !s.trim().is_empty() {
+                    let p = PathBuf::from(s.trim());
+                    let _ = std::fs::create_dir_all(&p);
+                    return p;
+                }
+            }
+        }
+        let fallback = std::env::var("USERPROFILE")
+            .map(|u| PathBuf::from(u).join("Downloads"))
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let fallback = std::env::var("XDG_DOWNLOAD_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("Downloads")))
+            .unwrap_or_else(std::env::temp_dir);
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    }
+}
+
+/// Validates a PDF output path supplied by `UiIpcCmd::PrintPage`, rejecting UNC shares,
+/// Windows device namespaces (`\\.\`, `\\?\`), parent directory traversal (`..`),
+/// control characters, reserved DOS device names, and symlink targets.
+#[allow(dead_code)]
+fn validate_safe_pdf_output_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 1024
+        || trimmed.bytes().any(|b| {
+            b <= 0x1f
+                || b == 0x7f
+                || matches!(b, b'"' | b'*' | b'?' | b'<' | b'>' | b'|')
+        })
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("\\\\?\\")
+        || trimmed.starts_with("\\\\.\\")
+        || trimmed.starts_with("//?/")
+        || trimmed.starts_with("//./")
+    {
+        return None;
+    }
+    if trimmed.split(['/', '\\']).any(|seg| seg == "..") {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => return None,
+            std::path::Component::Prefix(prefix) => {
+                if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let file_name = path.file_name()?.to_str()?;
+    if file_name.is_empty() || is_windows_reserved_device_name(file_name) {
+        return None;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || meta.is_dir() {
+            return None;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return None;
+            }
+        }
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(pmeta) = std::fs::symlink_metadata(parent) {
+            if pmeta.file_type().is_symlink() || !pmeta.is_dir() {
+                return None;
+            }
+        }
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            if canon_parent
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("\\\\?\\UNC\\")
+            {
+                return None;
+            }
+        }
+    }
+    Some(path.to_path_buf())
+}
+
 /// Fail-closed check for global Mullvad Kill-Switch / Emergency Lockdown state.
 #[allow(dead_code)]
 fn check_killswitch_global_block(
@@ -7799,7 +7951,10 @@ fn extract_vault_kdf_config(shell: &SingularityBrowserShell) -> Argon2idConfig {
 
 /// Enforces vault inactivity auto-lock, bumps `STATE_REVISION` on transition to locked,
 /// and immediately wipes any cached master key copy in `ServerConfig`.
-fn enforce_vault_auto_lock_and_sync(shell: &mut SingularityBrowserShell, cfg: &ServerConfig) {
+pub(crate) fn enforce_vault_auto_lock_and_sync(
+    shell: &mut SingularityBrowserShell,
+    cfg: &ServerConfig,
+) {
     let was_locked = shell.vault.is_locked();
     shell.enforce_vault_auto_lock();
     if shell.vault.is_locked() {
@@ -7812,7 +7967,7 @@ fn enforce_vault_auto_lock_and_sync(shell: &mut SingularityBrowserShell, cfg: &S
 
 /// Replaces `__CSP_NONCE__` placeholders and automatically injects `nonce="<csp_nonce>"` into
 /// top-level `<script>` (and `<style>`) opening tags without altering text inside `<script>` bodies.
-fn inject_csp_nonce(html: &str, csp_nonce: &str) -> String {
+pub(crate) fn inject_csp_nonce(html: &str, csp_nonce: &str) -> String {
     let replaced = html.replace("__CSP_NONCE__", csp_nonce);
     let bytes = replaced.as_bytes();
     let mut out = String::with_capacity(replaced.len() + 64);
@@ -8179,12 +8334,27 @@ fn read_http_request(
     stream: &mut TcpStream,
     idle_timeout: Duration,
     cfg: &ServerConfig,
+    residual: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Option<ParsedHttpRequest>, HttpResponse> {
     let _ = stream.set_read_timeout(Some(idle_timeout));
-    let mut raw = Zeroizing::new(Vec::with_capacity(4096));
+    let mut raw = Zeroizing::new(Vec::with_capacity(4096.max(residual.len())));
     let mut chunk = Zeroizing::new([0u8; 4096]);
     let mut header_end: Option<usize> = None;
     let mut request_deadline: Option<Instant> = None;
+
+    if !residual.is_empty() {
+        raw.extend_from_slice(residual);
+        residual.clear();
+        request_deadline = Some(Instant::now() + MAX_HTTP_REQUEST_READ_DURATION);
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(pos + 4);
+        } else if raw.len() > MAX_HTTP_HEADER_BYTES {
+            return Err(HttpResponse::text(
+                "431 Request Header Fields Too Large",
+                "HTTP headers exceed maximum size",
+            ));
+        }
+    }
 
     while header_end.is_none() {
         if let Some(dl) = request_deadline {
@@ -8232,7 +8402,7 @@ fn read_http_request(
                 return Err(HttpResponse::text("400 Bad Request", "Malformed HTTP request"));
             }
         };
-        if raw.is_empty() {
+        if request_deadline.is_none() {
             request_deadline = Some(Instant::now() + MAX_HTTP_REQUEST_READ_DURATION);
         }
         raw.extend_from_slice(&chunk[..n]);
@@ -8378,6 +8548,7 @@ fn read_http_request(
         ));
     }
     if body.len() > content_length {
+        residual.extend_from_slice(&body[content_length..]);
         body.truncate(content_length);
     }
 
@@ -8403,13 +8574,14 @@ fn handle_ipc_connection(
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut residual = Zeroizing::new(Vec::new());
     for req_idx in 0..MAX_KEEPALIVE_REQUESTS_PER_CONN {
         let timeout = if req_idx == 0 {
             Duration::from_secs(3)
         } else {
             Duration::from_millis(350)
         };
-        match read_http_request(&mut stream, timeout, cfg) {
+        match read_http_request(&mut stream, timeout, cfg, &mut residual) {
             Ok(Some(req)) => {
                 let client_wants_close = req
                     .headers
@@ -9571,9 +9743,54 @@ fn dispatch_http_request(
                 Err(r) => return r,
             };
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
             let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let added = shell.roaming.toggle_bookmark(title, url);
+            if added {
+                let already_in_store = shell
+                    .bookmarks_store
+                    .search(url)
+                    .iter()
+                    .any(|n| n.url.as_deref() == Some(url));
+                if !already_in_store && !url.is_empty() {
+                    let display_title = if title.trim().is_empty() {
+                        url.to_string()
+                    } else {
+                        title.trim().to_string()
+                    };
+                    let _ = shell.bookmarks_store.add_node(
+                        crate::bookmarks_store::NewBookmarkNode {
+                            parent_id: crate::bookmarks_store::ROOT_BOOKMARK_BAR.to_string(),
+                            position: None,
+                            kind: crate::bookmarks_store::BookmarkNodeKind::Url,
+                            title: display_title,
+                            url: Some(url.to_string()),
+                            nickname: None,
+                            description: None,
+                            tags: Vec::new(),
+                            icon_only: false,
+                            custom_icon: None,
+                        },
+                        unix_now(),
+                    );
+                    let _ = shell.save_bookmarks_store();
+                }
+            } else if !url.is_empty() {
+                let matching_ids: Vec<String> = shell
+                    .bookmarks_store
+                    .search(url)
+                    .into_iter()
+                    .filter(|n| n.url.as_deref() == Some(url))
+                    .map(|n| n.id.clone())
+                    .collect();
+                if !matching_ids.is_empty() {
+                    let now = unix_now();
+                    for nid in matching_ids {
+                        let _ = shell.bookmarks_store.soft_delete(&nid, now);
+                    }
+                    let _ = shell.save_bookmarks_store();
+                }
+            }
             let out = serde_json::json!({
                 "added": added,
                 "bookmarks": shell.roaming.profile.bookmarks
@@ -9585,24 +9802,120 @@ fn dispatch_http_request(
                 Ok(b) => b,
                 Err(r) => return r,
             };
-            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let kind = match body.get("kind").and_then(|v| v.as_str()).unwrap_or("url") {
+                "folder" => crate::bookmarks_store::BookmarkNodeKind::Folder,
+                "separator" => crate::bookmarks_store::BookmarkNodeKind::Separator,
+                _ => crate::bookmarks_store::BookmarkNodeKind::Url,
+            };
+            let has_v3_fields = body.get("parent_id").is_some()
+                || body.get("folder_id").is_some()
+                || body.get("tags").is_some()
+                || body.get("kind").is_some()
+                || body.get("nickname").is_some()
+                || body.get("description").is_some()
+                || body.get("position").is_some();
+            let parent_id = body
+                .get("parent_id")
+                .or_else(|| body.get("folder_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(crate::bookmarks_store::ROOT_BOOKMARK_BAR)
+                .to_string();
+            let raw_title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let mut url = body
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+            if kind == crate::bookmarks_store::BookmarkNodeKind::Url
+                && !url.is_empty()
+                && !(url.len() >= 7 && url.as_bytes()[..7].eq_ignore_ascii_case(b"http://"))
+                && !(url.len() >= 8 && url.as_bytes()[..8].eq_ignore_ascii_case(b"https://"))
+            {
                 url = format!("https://{}", url);
             }
-            if parse_http_url_authority(&url).is_ok()
-                && !shell.roaming.profile.bookmarks.iter().any(|b| b.url == url)
+            let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if kind == crate::bookmarks_store::BookmarkNodeKind::Url
+                && parse_http_url_authority(&url).is_err()
             {
-                let _ = shell.roaming.toggle_bookmark(title, &url);
+                if has_v3_fields {
+                    return HttpResponse::json(
+                        "400 Bad Request",
+                        &serde_json::json!({ "ok": false, "error": "Invalid bookmark URL" }),
+                    );
+                }
+                let out = serde_json::json!({ "ok": false, "bookmarks": shell.roaming.profile.bookmarks });
+                return HttpResponse::json("200 OK", &out);
             }
-            let out = serde_json::json!({ "bookmarks": shell.roaming.profile.bookmarks });
-            HttpResponse::json("200 OK", &out)
+            let display_title = if raw_title.trim().is_empty() && !url.is_empty() {
+                url.clone()
+            } else {
+                raw_title.trim().to_string()
+            };
+            let input = crate::bookmarks_store::NewBookmarkNode {
+                parent_id,
+                position: body
+                    .get("position")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize),
+                kind,
+                title: display_title.clone(),
+                url: if kind == crate::bookmarks_store::BookmarkNodeKind::Url {
+                    Some(url.clone())
+                } else {
+                    None
+                },
+                nickname: body
+                    .get("nickname")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                description: body
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                tags: body
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                icon_only: body
+                    .get("icon_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                custom_icon: body
+                    .get("custom_icon")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            };
+            match shell.bookmarks_store.add_node(input, unix_now()) {
+                Ok(node_id) => {
+                    let _ = shell.save_bookmarks_store();
+                    if kind == crate::bookmarks_store::BookmarkNodeKind::Url
+                        && !shell.roaming.profile.bookmarks.iter().any(|b| b.url == url)
+                    {
+                        shell.roaming.profile.bookmarks.push(BookmarkEntry {
+                            id: node_id.clone(),
+                            title: display_title,
+                            url,
+                        });
+                        let _ = shell.roaming.save_profile();
+                    }
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "id": node_id,
+                        "bookmarks": shell.roaming.profile.bookmarks
+                    });
+                    HttpResponse::json("200 OK", &out)
+                }
+                Err(e) => HttpResponse::json(
+                    "400 Bad Request",
+                    &serde_json::json!({ "ok": false, "error": e.to_string() }),
+                ),
+            }
         }
         "/api/bookmarks/delete" => {
             let body = match require_post() {
@@ -9611,9 +9924,43 @@ fn dispatch_http_request(
             };
             let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
             let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            shell.roaming.profile.bookmarks.retain(|b| b.id != id);
+            let store_url = shell
+                .bookmarks_store
+                .get_node(id)
+                .and_then(|n| n.url.clone());
+            let prof_url = shell
+                .roaming
+                .profile
+                .bookmarks
+                .iter()
+                .find(|b| b.id == id)
+                .map(|b| b.url.clone());
+            let now = unix_now();
+            if shell.bookmarks_store.soft_delete(id, now).is_ok() {
+                let _ = shell.save_bookmarks_store();
+            } else if let Some(ref u) = prof_url {
+                let matching_ids: Vec<String> = shell
+                    .bookmarks_store
+                    .search(u)
+                    .into_iter()
+                    .filter(|n| n.url.as_deref() == Some(u.as_str()))
+                    .map(|n| n.id.clone())
+                    .collect();
+                if !matching_ids.is_empty() {
+                    for nid in matching_ids {
+                        let _ = shell.bookmarks_store.soft_delete(&nid, now);
+                    }
+                    let _ = shell.save_bookmarks_store();
+                }
+            }
+            shell.roaming.profile.bookmarks.retain(|b| {
+                b.id != id && store_url.as_deref() != Some(b.url.as_str())
+            });
             let _ = shell.roaming.save_profile();
-            let out = serde_json::json!({ "bookmarks": shell.roaming.profile.bookmarks });
+            let out = serde_json::json!({
+                "ok": true,
+                "bookmarks": shell.roaming.profile.bookmarks
+            });
             HttpResponse::json("200 OK", &out)
         }
         "/api/bookmarks/import-file" => {
@@ -10291,7 +10638,6 @@ fn dispatch_http_request(
                 match EncryptedSingularityVaultEnvelope::unseal(&env_str, master.as_bytes()) {
                     Ok(payload) => {
                         let count = payload.credentials.len() + payload.passkeys.len();
-                        let passkeys_copy = payload.passkeys.clone();
                         let mut candidate = SingularityVault::new_locked(kdf_cfg);
                         if payload.passkeys.is_empty() {
                             candidate.reset_unlocked_empty();
@@ -10324,7 +10670,6 @@ fn dispatch_http_request(
                         if let Ok(mut cache) = cfg.vault_session_cache.lock() {
                             *cache = Some(VaultSessionCache {
                                 master: Zeroizing::new(master.as_bytes().to_vec()),
-                                passkeys: passkeys_copy,
                             });
                         }
                         bump_state_revision();
@@ -10407,7 +10752,6 @@ fn dispatch_http_request(
                         if let Ok(mut cache) = cfg.vault_session_cache.lock() {
                             *cache = Some(VaultSessionCache {
                                 master: Zeroizing::new(master.as_bytes().to_vec()),
-                                passkeys: Vec::new(),
                             });
                         }
                         bump_state_revision();
@@ -10549,7 +10893,7 @@ fn dispatch_http_request(
             }
 
             let id = generate_unique_cred_id();
-            let (creds_snapshot, kdf_cfg) = {
+            let (creds_snapshot, passkeys_snapshot, kdf_cfg) = {
                 let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 enforce_vault_auto_lock_and_sync(&mut shell, cfg);
                 if shell.vault.is_locked() {
@@ -10580,24 +10924,26 @@ fn dispatch_http_request(
                     .credentials()
                     .map(|c| c.to_vec())
                     .unwrap_or_default();
+                let passkeys = shell
+                    .vault
+                    .passkeys()
+                    .map(|p| p.to_vec())
+                    .unwrap_or_default();
                 let kdf = extract_vault_kdf_config(&shell);
-                (creds, kdf)
+                (creds, passkeys, kdf)
             };
 
             // Run Argon2id sealing outside `shell_mutex` whenever cached session key is available.
-            let cached_session = cfg.vault_session_cache.lock().ok().and_then(|g| {
-                g.as_ref().map(|c| {
-                    (
-                        Zeroizing::new(c.master.as_slice().to_vec()),
-                        c.passkeys.clone(),
-                    )
-                })
-            });
+            let cached_master = cfg
+                .vault_session_cache
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|c| Zeroizing::new(c.master.as_slice().to_vec())));
 
-            let persist_res: Result<(), String> = if let Some((master, passkeys)) = cached_session {
+            let persist_res: Result<(), String> = if let Some(master) = cached_master {
                 let payload = VaultPlaintextPayload {
                     credentials: creds_snapshot,
-                    passkeys,
+                    passkeys: passkeys_snapshot,
                 };
                 match EncryptedSingularityVaultEnvelope::seal(&payload, master.as_slice(), kdf_cfg)
                 {
@@ -10641,7 +10987,7 @@ fn dispatch_http_request(
                 .unwrap_or("")
                 .to_string();
 
-            let (removed_entry, creds_snapshot, kdf_cfg) = {
+            let (removed_entry, creds_snapshot, passkeys_snapshot, kdf_cfg) = {
                 let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 enforce_vault_auto_lock_and_sync(&mut shell, cfg);
                 if shell.vault.is_locked() {
@@ -10662,24 +11008,26 @@ fn dispatch_http_request(
                     .credentials()
                     .map(|c| c.to_vec())
                     .unwrap_or_default();
+                let passkeys = shell
+                    .vault
+                    .passkeys()
+                    .map(|p| p.to_vec())
+                    .unwrap_or_default();
                 let kdf = extract_vault_kdf_config(&shell);
-                (removed, creds, kdf)
+                (removed, creds, passkeys, kdf)
             };
 
             // Seal outside `shell_mutex` and restore the deleted entry in memory on any error.
-            let cached_session = cfg.vault_session_cache.lock().ok().and_then(|g| {
-                g.as_ref().map(|c| {
-                    (
-                        Zeroizing::new(c.master.as_slice().to_vec()),
-                        c.passkeys.clone(),
-                    )
-                })
-            });
+            let cached_master = cfg
+                .vault_session_cache
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|c| Zeroizing::new(c.master.as_slice().to_vec())));
 
-            let persist_res: Result<(), String> = if let Some((master, passkeys)) = cached_session {
+            let persist_res: Result<(), String> = if let Some(master) = cached_master {
                 let payload = VaultPlaintextPayload {
                     credentials: creds_snapshot,
-                    passkeys,
+                    passkeys: passkeys_snapshot,
                 };
                 match EncryptedSingularityVaultEnvelope::seal(&payload, master.as_slice(), kdf_cfg)
                 {
@@ -10736,7 +11084,7 @@ fn dispatch_http_request(
                 return r;
             }
             let _vault_op = cfg.vault_op_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let (creds_snapshot, kdf_cfg) = {
+            let (creds_snapshot, passkeys_snapshot, kdf_cfg) = {
                 let mut shell = shell_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 enforce_vault_auto_lock_and_sync(&mut shell, cfg);
                 if shell.vault.is_locked() {
@@ -10748,23 +11096,25 @@ fn dispatch_http_request(
                     .credentials()
                     .map(|c| c.to_vec())
                     .unwrap_or_default();
+                let passkeys = shell
+                    .vault
+                    .passkeys()
+                    .map(|p| p.to_vec())
+                    .unwrap_or_default();
                 let kdf = extract_vault_kdf_config(&shell);
-                (creds, kdf)
+                (creds, passkeys, kdf)
             };
 
-            let cached_session = cfg.vault_session_cache.lock().ok().and_then(|g| {
-                g.as_ref().map(|c| {
-                    (
-                        Zeroizing::new(c.master.as_slice().to_vec()),
-                        c.passkeys.clone(),
-                    )
-                })
-            });
+            let cached_master = cfg
+                .vault_session_cache
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|c| Zeroizing::new(c.master.as_slice().to_vec())));
 
-            let export_res = if let Some((master, passkeys)) = cached_session {
+            let export_res = if let Some(master) = cached_master {
                 let payload = VaultPlaintextPayload {
                     credentials: creds_snapshot,
-                    passkeys,
+                    passkeys: passkeys_snapshot,
                 };
                 EncryptedSingularityVaultEnvelope::seal(&payload, master.as_slice(), kdf_cfg)
                     .map(Zeroizing::new)
@@ -10890,7 +11240,7 @@ fn dispatch_http_request(
                 }),
             )
         }
-        _ => crate::api_v3::try_handle_v3_route(req, &params, shell_mutex)
+        _ => crate::api_v3::try_handle_v3_route_with_config(req, &params, shell_mutex, Some(cfg))
             .unwrap_or_else(|| HttpResponse::text("404 Not Found", "Not Found")),
     }
 }
@@ -11079,20 +11429,32 @@ fn run_curl_bounded(mut cmd: Command, max_total_bytes: usize) -> Option<Vec<u8>>
     Some(out)
 }
 
+fn rewrite_duckduckgo_proxy_url(url: &str) -> String {
+    let is_ddg_host = parse_http_url_authority(url)
+        .ok()
+        .map(|(h, _)| {
+            let is_ddg = h == "duckduckgo.com" || h.ends_with(".duckduckgo.com");
+            is_ddg && h != "html.duckduckgo.com"
+        })
+        .unwrap_or(false);
+    let has_query_q = url
+        .split_once('?')
+        .map(|(_, q)| q.split('&').any(|kv| kv.starts_with("q=")))
+        .unwrap_or(false);
+    if is_ddg_host && has_query_q {
+        let query_part = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        format!("https://html.duckduckgo.com/html/?{}", query_part)
+    } else {
+        url.to_string()
+    }
+}
+
 fn fetch_and_rewrite_external_page(
     url: &str,
     initial_ips: Vec<IpAddr>,
     shell_mutex: &Arc<Mutex<SingularityBrowserShell>>,
 ) -> (Vec<u8>, &'static str, bool) {
-    let mut current_url = if url.contains("duckduckgo.com")
-        && url.contains("q=")
-        && !url.contains("html.duckduckgo.com")
-    {
-        let query_part = url.split_once('?').map(|(_, q)| q).unwrap_or("");
-        format!("https://html.duckduckgo.com/html/?{}", query_part)
-    } else {
-        url.to_string()
-    };
+    let mut current_url = rewrite_duckduckgo_proxy_url(url);
     current_url = strip_trailing_dot_from_url_host(&current_url);
 
     let uniform_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -11171,7 +11533,7 @@ fn fetch_and_rewrite_external_page(
             ) else {
                 break;
             };
-            (resp.status_code, resp.location, None, resp.body)
+            (resp.status_code, resp.location, resp.content_type, resp.body)
         };
 
         #[cfg(not(target_os = "windows"))]
@@ -11440,11 +11802,16 @@ fn resolve_redirect_url(base_url: &str, location: &str) -> Option<String> {
     if loc.is_empty() {
         return None;
     }
-    if loc.starts_with("https://") || loc.starts_with("http://") {
-        return Some(loc.to_string());
+    if loc.len() >= 8 && loc.as_bytes()[..8].eq_ignore_ascii_case(b"https://") {
+        return Some(format!("https://{}", &loc[8..]));
+    }
+    if loc.len() >= 7 && loc.as_bytes()[..7].eq_ignore_ascii_case(b"http://") {
+        return Some(format!("http://{}", &loc[7..]));
     }
     if loc.starts_with("//") {
-        let scheme = if base_url.starts_with("http://") {
+        let scheme = if base_url.len() >= 7
+            && base_url.as_bytes()[..7].eq_ignore_ascii_case(b"http://")
+        {
             "http:"
         } else {
             "https:"
@@ -12517,7 +12884,11 @@ pub fn parse_http_url_authority(url: &str) -> Result<(String, u16), &'static str
         let close = authority
             .find(']')
             .ok_or("Malformed IPv6 address in URL.")?;
-        let host = &authority[..=close];
+        let ipv6_inner = &authority[1..close];
+        if ipv6_inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("Invalid IPv6 address literal in URL.");
+        }
+        let host = authority[..=close].to_ascii_lowercase();
         let rest = &authority[close + 1..];
         let port = if rest.is_empty() {
             default_port
@@ -12530,7 +12901,7 @@ pub fn parse_http_url_authority(url: &str) -> Result<(String, u16), &'static str
         } else {
             return Err("Invalid IPv6 authority.");
         };
-        return Ok((host.to_string(), port));
+        return Ok((host, port));
     }
 
     let (host, port) = match authority.rsplit_once(':') {
@@ -12956,5 +13327,362 @@ mod tests {
         let html = "<html><head><script>const s = '<script>';</script></head></html>";
         let injected = inject_csp_nonce(html, "abc123");
         assert!(injected.contains("<script nonce=\"abc123\">const s = '<script>';</script>"));
+    }
+
+    #[test]
+    fn test_v3_vault_security_passkey_persistence_sync_redaction_and_mime_guard() {
+        // 1. Upstream text/plain and text/xml containing HTML tags must never be promoted to text/html
+        assert_eq!(
+            classify_safe_proxy_content_type(
+                Some("text/plain; charset=utf-8"),
+                b"<!doctype html><html><body><script>alert(1)</script></body></html>"
+            ),
+            ("text/plain; charset=utf-8", false)
+        );
+        assert_eq!(
+            classify_safe_proxy_content_type(
+                Some("text/xml"),
+                b"<html><head><title>x</title></head></html>"
+            ),
+            ("text/plain; charset=utf-8", false)
+        );
+
+        let mut rnd = [0u8; 8];
+        OsRng.fill_bytes(&mut rnd);
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "singularity-fix1-sec-{}",
+            hex::encode(rnd)
+        ));
+        let shell = Arc::new(Mutex::new(
+            SingularityBrowserShell::launch_at_dir(tmp_dir.clone()).expect("Launch isolated shell"),
+        ));
+        let cfg = ServerConfig::new(54329);
+        let host = "127.0.0.1:54329";
+        let tok = Some(cfg.ipc_token.as_str());
+
+        // 2. /api/vault/export_format rejects GET (405) and rejects POST while locked (423)
+        let get_exp = make_req("GET", "/api/vault/export_format", "format=json", host, tok, None, "");
+        assert_eq!(
+            dispatch_http_request(&get_exp, &cfg, &shell).status,
+            "405 Method Not Allowed"
+        );
+        let locked_exp = make_req(
+            "POST",
+            "/api/vault/export_format",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"format":"json"}"#,
+        );
+        assert_eq!(
+            dispatch_http_request(&locked_exp, &cfg, &shell).status,
+            "423 Locked"
+        );
+
+        // 3. Create & unlock vault, enroll passkey via v3, then add + delete a credential via v1
+        let unlock_body = r#"{"master":"S1ngularity!Master#2026"}"#;
+        let unlock_req = make_req("POST", "/api/vault/unlock", "", host, tok, None, unlock_body);
+        assert_eq!(dispatch_http_request(&unlock_req, &cfg, &shell).status, "200 OK");
+
+        let enroll_req = make_req(
+            "POST",
+            "/api/vault/passkeys/enroll",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"rp_id":"example.com","user_name":"alice"}"#,
+        );
+        assert_eq!(dispatch_http_request(&enroll_req, &cfg, &shell).status, "200 OK");
+
+        let add_req = make_req(
+            "POST",
+            "/api/vault/add",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"origin":"https://example.com","user":"alice","pass":"SuperSecret!99"}"#,
+        );
+        assert_eq!(dispatch_http_request(&add_req, &cfg, &shell).status, "200 OK");
+
+        let list_req = make_req("GET", "/api/vault/list", "", host, tok, None, "");
+        let list_resp = dispatch_http_request(&list_req, &cfg, &shell);
+        assert_eq!(list_resp.status, "200 OK");
+        let list_json: serde_json::Value =
+            serde_json::from_slice(&list_resp.body).expect("parse vault list");
+        let cred_id = list_json[0]["id"].as_str().expect("cred id").to_string();
+
+        let del_body = serde_json::json!({ "id": cred_id }).to_string();
+        let del_req = make_req("POST", "/api/vault/delete", "", host, tok, None, &del_body);
+        assert_eq!(dispatch_http_request(&del_req, &cfg, &shell).status, "200 OK");
+
+        // 4. Encrypted export AND disk persistence MUST still retain the enrolled passkey
+        let exp_v1 = make_req("POST", "/api/vault/export", "", host, tok, None, "{}");
+        let exp_v1_resp = dispatch_http_request(&exp_v1, &cfg, &shell);
+        assert_eq!(exp_v1_resp.status, "200 OK");
+        let exported_str = String::from_utf8_lossy(&exp_v1_resp.body);
+        let unsealed = EncryptedSingularityVaultEnvelope::unseal(
+            &exported_str,
+            b"S1ngularity!Master#2026",
+        )
+        .expect("unseal exported vault");
+        assert_eq!(unsealed.passkeys.len(), 1);
+        assert_eq!(unsealed.passkeys[0].rp_id, "example.com");
+
+        // POST /api/vault/export_format succeeds while unlocked
+        let ok_exp = make_req(
+            "POST",
+            "/api/vault/export_format",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"format":"json"}"#,
+        );
+        assert_eq!(dispatch_http_request(&ok_exp, &cfg, &shell).status, "200 OK");
+
+        // Lock & re-unlock from disk: enrolled passkey survives reload
+        let lock_req = make_req("POST", "/api/vault/lock", "", host, tok, None, "{}");
+        assert_eq!(dispatch_http_request(&lock_req, &cfg, &shell).status, "200 OK");
+        let locked_items = make_req("GET", "/api/vault/items", "", host, tok, None, "");
+        assert_eq!(dispatch_http_request(&locked_items, &cfg, &shell).status, "423 Locked");
+
+        let relock_open = make_req("POST", "/api/vault/unlock", "", host, tok, None, unlock_body);
+        assert_eq!(dispatch_http_request(&relock_open, &cfg, &shell).status, "200 OK");
+        let pk_req = make_req("GET", "/api/vault/passkeys", "", host, tok, None, "");
+        let pk_resp = dispatch_http_request(&pk_req, &cfg, &shell);
+        assert_eq!(pk_resp.status, "200 OK");
+        let pk_json: serde_json::Value =
+            serde_json::from_slice(&pk_resp.body).expect("parse passkeys");
+        assert_eq!(pk_json["passkeys"].as_array().unwrap().len(), 1);
+
+        // 5. Auto-lock is enforced on v3 vault routes and clears VaultSessionCache
+        {
+            let mut s = shell.lock().unwrap();
+            s.vault_auto_lock_secs = 1;
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        let expired_items = make_req("GET", "/api/vault/items", "", host, tok, None, "");
+        assert_eq!(
+            dispatch_http_request(&expired_items, &cfg, &shell).status,
+            "423 Locked"
+        );
+        assert!(cfg.vault_session_cache.lock().unwrap().is_none());
+
+        // 6. GET /api/sync/status redacts daily_25_word_phrase; POST /api/sync/daily_phrase reveals it
+        let sync_create = make_req(
+            "POST",
+            "/api/sync/create_chain",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"device_name":"TestNode"}"#,
+        );
+        assert_eq!(dispatch_http_request(&sync_create, &cfg, &shell).status, "200 OK");
+
+        let sync_status = make_req("GET", "/api/sync/status", "", host, tok, None, "");
+        let sync_status_resp = dispatch_http_request(&sync_status, &cfg, &shell);
+        assert_eq!(sync_status_resp.status, "200 OK");
+        let sync_json: serde_json::Value =
+            serde_json::from_slice(&sync_status_resp.body).expect("parse sync status");
+        assert_eq!(sync_json["linked"], true);
+        assert!(sync_json["daily_25_word_phrase"].is_null());
+
+        let get_phrase = make_req("GET", "/api/sync/daily_phrase", "", host, tok, None, "");
+        assert_eq!(
+            dispatch_http_request(&get_phrase, &cfg, &shell).status,
+            "405 Method Not Allowed"
+        );
+        let post_phrase = make_req("POST", "/api/sync/daily_phrase", "", host, tok, None, "{}");
+        let post_phrase_resp = dispatch_http_request(&post_phrase, &cfg, &shell);
+        assert_eq!(post_phrase_resp.status, "200 OK");
+        let phrase_json: serde_json::Value =
+            serde_json::from_slice(&post_phrase_resp.body).expect("parse daily phrase");
+        assert_eq!(
+            phrase_json["daily_25_word_phrase"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            25
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_remediation_paths_pipelining_csp_bookmarks_and_url_hardening() {
+        // 1. Safe PDF output path rejects UNC, device namespaces, traversal, and reserved DOS names
+        assert!(validate_safe_pdf_output_path(r"\\attacker\share\out.pdf").is_none());
+        assert!(validate_safe_pdf_output_path("//attacker/share/out.pdf").is_none());
+        assert!(validate_safe_pdf_output_path(r"\\?\C:\Temp\out.pdf").is_none());
+        assert!(validate_safe_pdf_output_path(r"\\.\PhysicalDrive0").is_none());
+        assert!(validate_safe_pdf_output_path("../escape/out.pdf").is_none());
+        assert!(validate_safe_pdf_output_path("C:\\Users\\test\\..\\out.pdf").is_none());
+        assert!(validate_safe_pdf_output_path("CON.pdf").is_none());
+        let safe_pdf = std::env::temp_dir().join("singularity_safe_print.pdf");
+        assert!(validate_safe_pdf_output_path(&safe_pdf.to_string_lossy()).is_some());
+
+        // 2. IPv6 validation, DuckDuckGo exact host check, and case-insensitive redirect resolution
+        assert!(parse_http_url_authority("http://[evil.com]:8080/").is_err());
+        assert!(parse_http_url_authority("http://[]/").is_err());
+        assert!(parse_http_url_authority("http://[not:an:ipv6]/").is_err());
+        assert_eq!(
+            parse_http_url_authority("https://[2001:DB8::1]:8443/ok"),
+            Ok(("[2001:db8::1]".to_string(), 8443))
+        );
+
+        assert_eq!(
+            rewrite_duckduckgo_proxy_url("https://duckduckgo.com/?q=rust"),
+            "https://html.duckduckgo.com/html/?q=rust"
+        );
+        assert_eq!(
+            rewrite_duckduckgo_proxy_url("https://www.duckduckgo.com/?q=rust"),
+            "https://html.duckduckgo.com/html/?q=rust"
+        );
+        assert_eq!(
+            rewrite_duckduckgo_proxy_url("https://evil.com/?r=duckduckgo.com&q=rust"),
+            "https://evil.com/?r=duckduckgo.com&q=rust"
+        );
+        assert_eq!(
+            rewrite_duckduckgo_proxy_url("https://notduckduckgo.com/?q=rust"),
+            "https://notduckduckgo.com/?q=rust"
+        );
+
+        assert_eq!(
+            resolve_redirect_url("https://example.com/a", "HTTPS://Other.Test/path"),
+            Some("https://Other.Test/path".to_string())
+        );
+        assert_eq!(
+            resolve_redirect_url("HTTP://example.com/a", "//cdn.example.com/x"),
+            Some("http://cdn.example.com/x".to_string())
+        );
+        assert_eq!(resolve_redirect_url("https://example.com/", "javascript:alert(1)"), None);
+
+        // 3. Keep-Alive pipelined requests preserve residual bytes without desynchronization
+        let cfg = ServerConfig::new(54331);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client_handle = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).expect("connect");
+            let pipelined = concat!(
+                "POST /api/one HTTP/1.1\r\nHost: 127.0.0.1:54331\r\nContent-Length: 2\r\n\r\n{}",
+                "GET /api/two HTTP/1.1\r\nHost: 127.0.0.1:54331\r\nConnection: close\r\n\r\n"
+            );
+            client.write_all(pipelined.as_bytes()).expect("write pipelined");
+            client
+        });
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let mut residual = Zeroizing::new(Vec::new());
+        let r1 = read_http_request(&mut server_stream, Duration::from_secs(2), &cfg, &mut residual)
+            .map_err(|resp| resp.status)
+            .expect("req1 ok")
+            .expect("req1 some");
+        assert_eq!(r1.path, "/api/one");
+        assert_eq!(r1.body.as_slice(), b"{}");
+        assert!(!residual.is_empty());
+        let r2 = read_http_request(&mut server_stream, Duration::from_secs(2), &cfg, &mut residual)
+            .map_err(|resp| resp.status)
+            .expect("req2 ok")
+            .expect("req2 some");
+        assert_eq!(r2.path, "/api/two");
+        assert!(residual.is_empty());
+        let _ = client_handle.join();
+
+        // 4. /browser/<slug> CSP nonce (no unsafe-inline in script-src), path confinement, unified bookmarks
+        let mut rnd = [0u8; 8];
+        OsRng.fill_bytes(&mut rnd);
+        let tmp_dir = std::env::temp_dir().join(format!("singularity-rem1-{}", hex::encode(rnd)));
+        let shell = Arc::new(Mutex::new(
+            SingularityBrowserShell::launch_at_dir(tmp_dir.clone()).expect("Launch isolated shell"),
+        ));
+        let host = "127.0.0.1:54331";
+        let tok = Some(cfg.ipc_token.as_str());
+
+        let page_req = make_req("GET", "/browser/flags", "", host, tok, None, "");
+        let page_resp = dispatch_http_request(&page_req, &cfg, &shell);
+        assert_eq!(page_resp.status, "200 OK");
+        let csp = page_resp
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-security-policy"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(csp.contains("script-src 'self' 'nonce-"));
+        assert!(!csp.contains("script-src 'unsafe-inline'"));
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'self'"));
+        let page_body = String::from_utf8_lossy(&page_resp.body);
+        assert!(!page_body.contains("__CSP_NONCE__"));
+        assert!(page_body.contains("<script nonce=\""));
+
+        // Verify UNC / unconfined path rejection on downloads & extension review
+        let bad_sha = make_req(
+            "POST",
+            "/api/downloads/verify_sha256",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"path":"\\\\attacker\\share\\a.bin","expected_sha256":"00"}"#,
+        );
+        assert_eq!(dispatch_http_request(&bad_sha, &cfg, &shell).status, "400 Bad Request");
+        let bad_ext = make_req(
+            "POST",
+            "/api/extensions/stage_review",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"path":"\\\\.\\PhysicalDrive0"}"#,
+        );
+        assert_eq!(dispatch_http_request(&bad_ext, &cfg, &shell).status, "400 Bad Request");
+
+        // Unified /api/bookmarks/add & /api/bookmarks/delete synchronize bookmarks_store + profile.bookmarks
+        let bm_add = make_req(
+            "POST",
+            "/api/bookmarks/add",
+            "",
+            host,
+            tok,
+            None,
+            r#"{"title":"Unified BM","url":"https://example.org/unified","tags":["dev"]}"#,
+        );
+        let bm_add_resp = dispatch_http_request(&bm_add, &cfg, &shell);
+        assert_eq!(bm_add_resp.status, "200 OK");
+        let bm_add_json: serde_json::Value = serde_json::from_slice(&bm_add_resp.body).unwrap();
+        assert_eq!(bm_add_json["ok"], true);
+        let bm_id = bm_add_json["id"].as_str().expect("bookmark id").to_string();
+        assert!(bm_add_json["bookmarks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["url"] == "https://example.org/unified"));
+        let bm_tree = make_req("GET", "/api/bookmarks/tree", "", host, tok, None, "");
+        let bm_tree_resp = dispatch_http_request(&bm_tree, &cfg, &shell);
+        assert!(String::from_utf8_lossy(&bm_tree_resp.body).contains("https://example.org/unified"));
+
+        let bm_del = make_req(
+            "POST",
+            "/api/bookmarks/delete",
+            "",
+            host,
+            tok,
+            None,
+            &serde_json::json!({ "id": bm_id }).to_string(),
+        );
+        let bm_del_resp = dispatch_http_request(&bm_del, &cfg, &shell);
+        assert_eq!(bm_del_resp.status, "200 OK");
+        let bm_del_json: serde_json::Value = serde_json::from_slice(&bm_del_resp.body).unwrap();
+        assert!(bm_del_json["bookmarks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["url"] != "https://example.org/unified"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

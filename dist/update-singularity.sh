@@ -58,6 +58,8 @@ NEW_BIN="${WORK_DIR}/singularity-linux-x86_64"
 SUMS_FILE="${WORK_DIR}/SHA256SUMS.txt"
 SIG_FILE="${WORK_DIR}/SHA256SUMS.txt.sig"
 
+MAX_REDIRECTS=5
+
 validate_github_https_url() {
   local url="$1"
   local label="$2"
@@ -73,12 +75,15 @@ allowed_hosts = {
     "release-assets.githubusercontent.com",
     "github-releases.githubusercontent.com",
 }
-if not url or any(ch.isspace() or ord(ch) < 32 for ch in url):
+if not url or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
     print(f"[ERROR] Refused malformed URL for {label}", file=sys.stderr)
     sys.exit(1)
 parsed = urlparse(url)
 if parsed.scheme != "https":
     print(f"[ERROR] Refused non-HTTPS URL for {label}: {url}", file=sys.stderr)
+    sys.exit(1)
+if parsed.port is not None and parsed.port != 443:
+    print(f"[ERROR] Refused non-443 HTTPS port for {label}: {url}", file=sys.stderr)
     sys.exit(1)
 if parsed.username is not None or parsed.password is not None:
     print(f"[ERROR] Refused URL containing credentials for {label}", file=sys.stderr)
@@ -88,6 +93,111 @@ if host not in allowed_hosts:
     print(f"[ERROR] Refused untrusted download host '{host}' for {label}", file=sys.stderr)
     sys.exit(1)
 PY
+}
+
+resolve_and_validate_redirect_url() {
+  local base_url="$1"
+  local location="$2"
+  local label="$3"
+  python3 - "$base_url" "$location" "$label" <<'PY'
+import sys
+from urllib.parse import urljoin, urlparse
+
+base_url, location, label = sys.argv[1], sys.argv[2], sys.argv[3]
+allowed_hosts = {
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+}
+loc = location.strip()
+if not loc or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in loc):
+    print(f"[ERROR] Refused malformed redirect Location for {label}", file=sys.stderr)
+    sys.exit(1)
+resolved = urljoin(base_url, loc)
+parsed = urlparse(resolved)
+if parsed.scheme != "https":
+    print(f"[ERROR] Refused non-HTTPS redirect URL for {label}: {resolved}", file=sys.stderr)
+    sys.exit(1)
+if parsed.port is not None and parsed.port != 443:
+    print(f"[ERROR] Refused non-443 HTTPS redirect port for {label}: {resolved}", file=sys.stderr)
+    sys.exit(1)
+if parsed.username is not None or parsed.password is not None:
+    print(f"[ERROR] Refused redirect URL containing credentials for {label}", file=sys.stderr)
+    sys.exit(1)
+host = (parsed.hostname or "").lower()
+if host not in allowed_hosts:
+    print(f"[ERROR] Refused redirect to untrusted host '{host}' for {label}", file=sys.stderr)
+    sys.exit(1)
+print(resolved)
+PY
+}
+
+is_same_https_origin() {
+  local url_a="$1"
+  local url_b="$2"
+  python3 - "$url_a" "$url_b" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+a, b = urlparse(sys.argv[1]), urlparse(sys.argv[2])
+same = (
+    a.scheme == b.scheme
+    and (a.hostname or "").lower() == (b.hostname or "").lower()
+    and (a.port or 443) == (b.port or 443)
+)
+sys.exit(0 if same else 1)
+PY
+}
+
+download_allowed_https() {
+  local start_url="$1"
+  local out_file="$2"
+  local max_time="$3"
+  local label="$4"
+  local current_url="$start_url"
+  local hop=0
+
+  validate_github_https_url "${current_url}" "${label}"
+
+  while [ "${hop}" -le "${MAX_REDIRECTS}" ]; do
+    local hdr_file="${WORK_DIR}/.hdr.$$.${hop}"
+    local http_code
+    rm -f -- "${hdr_file}"
+    http_code="$(curl -sS --proto '=https' --tlsv1.2 --max-time "${max_time}" -A "${UA}" -D "${hdr_file}" -o "${out_file}" -w '%{http_code}' -- "${current_url}")"
+
+    case "${http_code}" in
+      200|201|202|203|204|206)
+        rm -f -- "${hdr_file}"
+        return 0
+        ;;
+      301|302|303|307|308)
+        local raw_loc
+        raw_loc="$(awk 'BEGIN{IGNORECASE=1} /^location:[[:space:]]*/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); loc=$0} END{print loc}' "${hdr_file}")"
+        rm -f -- "${hdr_file}"
+        rm -f -- "${out_file}"
+        if [ -z "${raw_loc}" ]; then
+          echo "[ERROR] Redirect response (${http_code}) missing Location header for ${label}." >&2
+          return 1
+        fi
+        if [ "${hop}" -ge "${MAX_REDIRECTS}" ]; then
+          echo "[ERROR] Too many HTTP redirects (exceeded maximum of ${MAX_REDIRECTS} hops) for ${label}." >&2
+          return 1
+        fi
+        current_url="$(resolve_and_validate_redirect_url "${current_url}" "${raw_loc}" "${label}")"
+        hop=$((hop + 1))
+        ;;
+      *)
+        rm -f -- "${hdr_file}" "${out_file}"
+        echo "[ERROR] Download failed with HTTP status ${http_code} for ${label}." >&2
+        return 1
+        ;;
+    esac
+  done
+
+  echo "[ERROR] Too many HTTP redirects (exceeded maximum of ${MAX_REDIRECTS} hops) for ${label}." >&2
+  return 1
 }
 
 verify_ed25519_sig() {
@@ -219,16 +329,54 @@ PY
 
 api_fetch() {
   local tok="$1"
-  local cfg
-  local api_url="https://api.github.com/repos/${REPO}/releases/latest"
-  validate_github_https_url "${api_url}" "GitHub Releases API"
-  cfg="header = \"User-Agent: ${UA}\""$'\n'"header = \"Accept: application/vnd.github+json\""$'\n'
-  if [ -n "$tok" ]; then
-    local clean_tok
-    clean_tok="$(printf '%s' "$tok" | tr -d '\r\n"\\')"
-    cfg+="header = \"Authorization: Bearer ${clean_tok}\""$'\n'
-  fi
-  printf '%s' "$cfg" | curl -fsS --proto '=https' --max-time 15 -K - -- "${api_url}"
+  local initial_url="https://api.github.com/repos/${REPO}/releases/latest"
+  local current_url="${initial_url}"
+  local hop=0
+  validate_github_https_url "${current_url}" "GitHub Releases API"
+
+  while [ "${hop}" -le "${MAX_REDIRECTS}" ]; do
+    local hdr_file="${WORK_DIR}/.api_hdr.$$.${hop}"
+    local body_file="${WORK_DIR}/.api_body.$$.${hop}"
+    local cfg
+    cfg="header = \"User-Agent: ${UA}\""$'\n'"header = \"Accept: application/vnd.github+json\""$'\n'
+    if [ -n "$tok" ] && is_same_https_origin "${initial_url}" "${current_url}"; then
+      local clean_tok
+      clean_tok="$(printf '%s' "$tok" | tr -d '\r\n"\\')"
+      cfg+="header = \"Authorization: Bearer ${clean_tok}\""$'\n'
+    fi
+    rm -f -- "${hdr_file}" "${body_file}"
+    local http_code
+    http_code="$(printf '%s' "$cfg" | curl -sS --proto '=https' --tlsv1.2 --max-time 15 -D "${hdr_file}" -o "${body_file}" -w '%{http_code}' -K - -- "${current_url}")"
+
+    case "${http_code}" in
+      200|201|202|203|204|206)
+        cat -- "${body_file}"
+        rm -f -- "${hdr_file}" "${body_file}"
+        return 0
+        ;;
+      301|302|303|307|308)
+        local raw_loc
+        raw_loc="$(awk 'BEGIN{IGNORECASE=1} /^location:[[:space:]]*/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); loc=$0} END{print loc}' "${hdr_file}")"
+        rm -f -- "${hdr_file}" "${body_file}"
+        if [ -z "${raw_loc}" ]; then
+          echo "[ERROR] Redirect response (${http_code}) missing Location header for GitHub Releases API." >&2
+          return 1
+        fi
+        if [ "${hop}" -ge "${MAX_REDIRECTS}" ]; then
+          echo "[ERROR] Too many HTTP redirects (exceeded maximum of ${MAX_REDIRECTS} hops) for GitHub Releases API." >&2
+          return 1
+        fi
+        current_url="$(resolve_and_validate_redirect_url "${current_url}" "${raw_loc}" "GitHub Releases API")"
+        hop=$((hop + 1))
+        ;;
+      *)
+        rm -f -- "${hdr_file}" "${body_file}"
+        return 1
+        ;;
+    esac
+  done
+
+  return 1
 }
 
 echo "[1/5] Checking latest public release at https://github.com/${REPO} ..."
@@ -240,13 +388,13 @@ else
 fi
 
 TAG="$(printf '%s' "$REL_JSON" | python3 -c 'import sys, json; print(json.load(sys.stdin).get("tag_name", ""))')"
-if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
   echo "[ERROR] Invalid GitHub release SemVer tag: $TAG" >&2
   exit 1
 fi
 echo "      Release found: $TAG"
 
-# SemVer anti-downgrade check against installed binary (or SINGULARITY_CURRENT_VERSION)
+# Strict SemVer 2.0 anti-downgrade check against installed binary (or SINGULARITY_CURRENT_VERSION)
 CURRENT_VER="${SINGULARITY_CURRENT_VERSION:-}"
 if [ -z "${CURRENT_VER}" ] && [ -x "${TARGET_BIN}" ] && [ ! -L "${TARGET_BIN}" ]; then
   CURRENT_VER="$("${TARGET_BIN}" --version 2>/dev/null || true)"
@@ -256,21 +404,59 @@ if [ -n "${CURRENT_VER}" ]; then
 import re, sys
 
 cur_raw, new_raw = sys.argv[1], sys.argv[2]
-pat = re.compile(r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z.-]+))?")
-m_cur = pat.search(cur_raw)
-m_new = pat.search(new_raw)
+strict_pat = re.compile(
+    r"^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+search_pat = re.compile(
+    r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+)
+
+def parse_semver_match(m):
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4))
+
+def cmp_prerelease(a, b):
+    pa, pb = a.split("."), b.split(".")
+    for i in range(max(len(pa), len(pb))):
+        if i >= len(pa):
+            return -1
+        if i >= len(pb):
+            return 1
+        sa, sb = pa[i], pb[i]
+        a_num, b_num = sa.isdigit(), sb.isdigit()
+        if a_num and b_num:
+            ia, ib = int(sa), int(sb)
+            if ia != ib:
+                return -1 if ia < ib else 1
+        elif a_num and not b_num:
+            return -1
+        elif not a_num and b_num:
+            return 1
+        elif sa != sb:
+            return -1 if sa < sb else 1
+    return 0
+
+def cmp_semver(a, b):
+    if a[:3] != b[:3]:
+        return -1 if a[:3] < b[:3] else 1
+    if a[3] is None and b[3] is None:
+        return 0
+    if a[3] is None:
+        return 1
+    if b[3] is None:
+        return -1
+    return cmp_prerelease(a[3], b[3])
+
+m_new = strict_pat.fullmatch(new_raw.strip())
 if not m_new:
-    print(f"[ERROR] Unparseable release SemVer: {new_raw}", file=sys.stderr)
+    print(f"[ERROR] Invalid release SemVer tag: {new_raw}", file=sys.stderr)
     sys.exit(1)
+m_cur = search_pat.search(cur_raw)
 if m_cur:
-    def key(m):
-        maj, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        pre = m.group(4)
-        # Release (no pre-release) sorts higher than any pre-release of the same X.Y.Z
-        return (maj, minor, patch, 1 if pre is None else 0, pre or "")
-    if key(m_new) < key(m_cur):
+    v_new = parse_semver_match(m_new)
+    v_cur = parse_semver_match(m_cur)
+    if cmp_semver(v_new, v_cur) < 0:
         print(
-            f"[ERROR] Refusing downgrade from installed version v{m_cur.group(1)}.{m_cur.group(2)}.{m_cur.group(3)} to older release {new_raw}.",
+            f"[ERROR] Refusing downgrade from installed version v{v_cur[0]}.{v_cur[1]}.{v_cur[2]} to older release {new_raw}.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -309,10 +495,10 @@ if [ -n "$SIG_URL" ]; then
 fi
 
 echo "[2/5] Downloading release artifacts into private staging directory..."
-curl -fsSL --proto '=https' --proto-redir '=https' --max-time 180 -A "$UA" -o "$NEW_BIN" -- "$BIN_URL"
-curl -fsSL --proto '=https' --proto-redir '=https' --max-time 30 -A "$UA" -o "$SUMS_FILE" -- "$SUMS_URL"
+download_allowed_https "$BIN_URL" "$NEW_BIN" 180 "singularity-linux-x86_64"
+download_allowed_https "$SUMS_URL" "$SUMS_FILE" 30 "SHA256SUMS.txt"
 if [ -n "${RELEASE_SIGNING_PUBKEY_HEX}" ]; then
-  curl -fsSL --proto '=https' --proto-redir '=https' --max-time 30 -A "$UA" -o "$SIG_FILE" -- "$SIG_URL"
+  download_allowed_https "$SIG_URL" "$SIG_FILE" 30 "SHA256SUMS.txt.sig"
 fi
 
 if [ -n "${RELEASE_SIGNING_PUBKEY_HEX}" ]; then
@@ -326,8 +512,111 @@ else
   echo "[3/5] Skipping Ed25519 check (SINGULARITY_ALLOW_UNSIGNED=1 explicitly set)."
 fi
 
+# Verify signed '# Singularity-Release:' version binding header (anti-rollback guard)
+if ! python3 - "$SUMS_FILE" "$TAG" "${CURRENT_VER}" "$([ -n "${RELEASE_SIGNING_PUBKEY_HEX}" ] && echo 1 || echo 0)" <<'PY'
+import re, sys
+
+sums_path, tag_raw, cur_raw, signed_mode = sys.argv[1], sys.argv[2].strip(), sys.argv[3], sys.argv[4] == "1"
+strict_pat = re.compile(
+    r"^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+search_pat = re.compile(
+    r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+)
+header_pat = re.compile(r"^#\s*Singularity-Release\s*:\s*(.*)$", re.IGNORECASE)
+
+def parse_strict(ver):
+    m = strict_pat.fullmatch(ver.strip())
+    if not m:
+        return None
+    norm = ver.strip()[1:] if ver.strip().startswith("v") else ver.strip()
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4), norm)
+
+def cmp_prerelease(a, b):
+    pa, pb = a.split("."), b.split(".")
+    for i in range(max(len(pa), len(pb))):
+        if i >= len(pa):
+            return -1
+        if i >= len(pb):
+            return 1
+        sa, sb = pa[i], pb[i]
+        a_num, b_num = sa.isdigit(), sb.isdigit()
+        if a_num and b_num:
+            ia, ib = int(sa), int(sb)
+            if ia != ib:
+                return -1 if ia < ib else 1
+        elif a_num and not b_num:
+            return -1
+        elif not a_num and b_num:
+            return 1
+        elif sa != sb:
+            return -1 if sa < sb else 1
+    return 0
+
+def cmp_semver(a, b):
+    if a[:3] != b[:3]:
+        return -1 if a[:3] < b[:3] else 1
+    if a[3] is None and b[3] is None:
+        return 0
+    if a[3] is None:
+        return 1
+    if b[3] is None:
+        return -1
+    return cmp_prerelease(a[3], b[3])
+
+tag_v = parse_strict(tag_raw)
+if not tag_v:
+    print(f"[ERROR] Invalid release SemVer tag: {tag_raw}", file=sys.stderr)
+    sys.exit(1)
+
+found = None
+with open(sums_path, "r", encoding="utf-8", errors="replace") as f:
+    for line in f:
+        m = header_pat.match(line.strip())
+        if m:
+            if found is not None:
+                print("[ERROR] Duplicate '# Singularity-Release:' header in SHA256SUMS.txt. Update aborted.", file=sys.stderr)
+                sys.exit(1)
+            raw_val = m.group(1).strip()
+            parsed = parse_strict(raw_val)
+            if not parsed:
+                print(f"[ERROR] Malformed '# Singularity-Release:' SemVer header '{raw_val}' in SHA256SUMS.txt. Update aborted.", file=sys.stderr)
+                sys.exit(1)
+            found = (raw_val, parsed)
+
+cutoff_v = parse_strict("3.0.3")
+if found is not None:
+    signed_raw, signed_v = found
+    if cmp_semver(signed_v, tag_v) != 0 or signed_v[4] != tag_v[4]:
+        print(
+            f"[ERROR] Signed SHA256SUMS.txt release version '{signed_raw}' does not match advertised GitHub release tag '{tag_raw}' (possible rollback attack). Update aborted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if cur_raw:
+        m_cur = search_pat.search(cur_raw)
+        if m_cur:
+            cur_v = (int(m_cur.group(1)), int(m_cur.group(2)), int(m_cur.group(3)), m_cur.group(4), "")
+            if cmp_semver(signed_v, cur_v) < 0:
+                print(
+                    f"[ERROR] Refusing downgrade from installed version v{cur_v[0]}.{cur_v[1]}.{cur_v[2]} to signed release {signed_raw}.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+    print(f"      Signed release version verified: {signed_raw}")
+elif signed_mode and cmp_semver(tag_v, cutoff_v) > 0:
+    print(
+        f"[ERROR] Signed SHA256SUMS.txt is missing mandatory '# Singularity-Release:' version header for release {tag_raw} (possible rollback attack). Update aborted.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+then
+  exit 1
+fi
+
 echo "[4/5] Verifying SHA-256 cryptographic integrity..."
-EXPECTED="$(awk '$2 == "singularity-linux-x86_64" || $2 == "*singularity-linux-x86_64" {print tolower($1); exit}' "$SUMS_FILE")"
+EXPECTED="$(awk '!/^[[:space:]]*#/ && ($2 == "singularity-linux-x86_64" || $2 == "*singularity-linux-x86_64") {print tolower($1); exit}' "$SUMS_FILE")"
 if [ -z "$EXPECTED" ] || [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
   echo "[ERROR] SHA-256 checksum for singularity-linux-x86_64 not found in SHA256SUMS.txt." >&2
   exit 1

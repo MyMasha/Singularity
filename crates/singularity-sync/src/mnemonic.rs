@@ -11,7 +11,7 @@ use std::fmt;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -132,10 +132,30 @@ impl SyncMasterKeys {
 
     /// Derives an additional 32-byte domain-separated subkey from the HKDF PRK.
     pub fn derive_custom_subkey(&self, domain_info: &[u8]) -> SecretKey32 {
-        let mut out = [0u8; 32];
-        hkdf_sha256_expand(self.hkdf_prk.as_bytes(), domain_info, &mut out)
+        let mut out = Zeroizing::new([0u8; 32]);
+        hkdf_sha256_expand(self.hkdf_prk.as_bytes(), domain_info, out.as_mut())
             .expect("32-byte HKDF output is always within RFC 5869 bounds");
-        SecretKey32::from_bytes(out)
+        SecretKey32::from_bytes(*out)
+    }
+}
+
+/// Wrapper around parsed mnemonic word strings that zeroizes every word on drop.
+struct ZeroizingWords(Vec<String>);
+
+impl std::ops::Deref for ZeroizingWords {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingWords {
+    fn drop(&mut self) {
+        for word in &mut self.0 {
+            word.zeroize();
+        }
+        self.0.clear();
     }
 }
 
@@ -154,9 +174,9 @@ impl fmt::Debug for SyncMnemonic {
 impl SyncMnemonic {
     /// Generates a brand-new cryptographically random 256-bit mnemonic using `OsRng`.
     pub fn generate() -> Self {
-        let mut entropy = [0u8; 32];
-        OsRng.fill_bytes(&mut entropy);
-        Self { entropy }
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(entropy.as_mut());
+        Self { entropy: *entropy }
     }
 
     /// Creates a mnemonic directly from raw 256-bit entropy bytes.
@@ -171,17 +191,19 @@ impl SyncMnemonic {
 
     /// Encodes the 256-bit entropy + 8-bit SHA-256 checksum into 24 words from `WORDLIST`.
     pub fn to_24_words(&self) -> [&'static str; PERMANENT_WORD_COUNT] {
-        let checksum_byte = Sha256::digest(self.entropy)[0];
-        let mut bits_264 = [0u8; 33];
+        let mut digest = Sha256::digest(self.entropy);
+        let checksum_byte = digest[0];
+        digest.as_mut_slice().zeroize();
+
+        let mut bits_264 = Zeroizing::new([0u8; 33]);
         bits_264[..32].copy_from_slice(&self.entropy);
         bits_264[32] = checksum_byte;
 
         let mut words = [""; PERMANENT_WORD_COUNT];
         for (i, slot) in words.iter_mut().enumerate() {
-            let idx = extract_11_bits(&bits_264, i * 11) as usize;
+            let idx = extract_11_bits(bits_264.as_ref(), i * 11) as usize;
             *slot = WORDLIST[idx];
         }
-        bits_264.zeroize();
         words
     }
 
@@ -205,10 +227,12 @@ impl SyncMnemonic {
 
     /// Parses and validates a permanent 24-word mnemonic phrase (verifying the 8-bit SHA-256 checksum).
     pub fn from_24_words(phrase: &str) -> Result<Self, MnemonicError> {
-        let tokens: Vec<String> = phrase
-            .split_whitespace()
-            .map(|w| w.trim().to_ascii_lowercase())
-            .collect();
+        let tokens = ZeroizingWords(
+            phrase
+                .split_whitespace()
+                .map(|w| w.trim().to_ascii_lowercase())
+                .collect(),
+        );
         if tokens.len() != PERMANENT_WORD_COUNT {
             return Err(MnemonicError::InvalidWordCount {
                 expected: PERMANENT_WORD_COUNT,
@@ -216,27 +240,27 @@ impl SyncMnemonic {
             });
         }
 
-        let mut bits_264 = [0u8; 33];
+        let mut bits_264 = Zeroizing::new([0u8; 33]);
         for (i, token) in tokens.iter().enumerate() {
             let idx = lookup_word_index(token).ok_or_else(|| MnemonicError::UnknownWord {
                 index: i,
                 word: token.clone(),
             })?;
-            write_11_bits(&mut bits_264, i * 11, idx as u16);
+            write_11_bits(bits_264.as_mut(), i * 11, idx as u16);
         }
 
-        let mut entropy = [0u8; 32];
+        let mut entropy = Zeroizing::new([0u8; 32]);
         entropy.copy_from_slice(&bits_264[..32]);
         let provided_checksum = bits_264[32];
-        bits_264.zeroize();
 
-        let expected_checksum = Sha256::digest(entropy)[0];
+        let mut digest = Sha256::digest(&*entropy);
+        let expected_checksum = digest[0];
+        digest.as_mut_slice().zeroize();
         if !bool::from(provided_checksum.ct_eq(&expected_checksum)) {
-            entropy.zeroize();
             return Err(MnemonicError::ChecksumMismatch);
         }
 
-        Ok(Self { entropy })
+        Ok(Self { entropy: *entropy })
     }
 
     /// Parses and strictly validates a 25-word enrollment phrase against `utc_unix_secs`
@@ -252,10 +276,12 @@ impl SyncMnemonic {
         utc_unix_secs: u64,
         tolerance_days: u64,
     ) -> Result<Self, MnemonicError> {
-        let tokens: Vec<String> = phrase
-            .split_whitespace()
-            .map(|w| w.trim().to_ascii_lowercase())
-            .collect();
+        let tokens = ZeroizingWords(
+            phrase
+                .split_whitespace()
+                .map(|w| w.trim().to_ascii_lowercase())
+                .collect(),
+        );
         if tokens.len() != ENROLLMENT_WORD_COUNT {
             return Err(MnemonicError::InvalidWordCount {
                 expected: ENROLLMENT_WORD_COUNT,
@@ -263,7 +289,7 @@ impl SyncMnemonic {
             });
         }
 
-        let permanent_phrase = tokens[..PERMANENT_WORD_COUNT].join(" ");
+        let permanent_phrase = Zeroizing::new(tokens[..PERMANENT_WORD_COUNT].join(" "));
         let mnemonic = Self::from_24_words(&permanent_phrase)?;
 
         let provided_25th = &tokens[PERMANENT_WORD_COUNT];
@@ -300,43 +326,44 @@ impl SyncMnemonic {
 
     /// Derives `SyncMasterKeys` using RFC 5869 HKDF-SHA256 with an optional extra user passphrase.
     pub fn derive_master_keys_with_passphrase(&self, optional_passphrase: &[u8]) -> SyncMasterKeys {
-        let mut salt = Vec::with_capacity(HKDF_SALT.len() + 1 + optional_passphrase.len());
+        let mut salt = Zeroizing::new(Vec::with_capacity(
+            HKDF_SALT.len() + 1 + optional_passphrase.len(),
+        ));
         salt.extend_from_slice(HKDF_SALT);
         if !optional_passphrase.is_empty() {
             salt.push(0x00);
             salt.extend_from_slice(optional_passphrase);
         }
 
-        let prk = hkdf_sha256_extract(&salt, &self.entropy);
-        salt.zeroize();
+        let prk = Zeroizing::new(hkdf_sha256_extract(&salt, &self.entropy));
+        drop(salt);
 
-        let mut chain_id_bytes = [0u8; 32];
-        let mut identity_seed = [0u8; 32];
-        let mut content_key = [0u8; 32];
-        let mut vault_subkey = [0u8; 32];
-        let mut x25519_seed = [0u8; 32];
+        let mut chain_id_bytes = Zeroizing::new([0u8; 32]);
+        let mut identity_seed = Zeroizing::new([0u8; 32]);
+        let mut content_key = Zeroizing::new([0u8; 32]);
+        let mut vault_subkey = Zeroizing::new([0u8; 32]);
+        let mut x25519_seed = Zeroizing::new([0u8; 32]);
 
-        hkdf_sha256_expand(&prk, DOMAIN_CHAIN_ID, &mut chain_id_bytes)
+        hkdf_sha256_expand(&prk, DOMAIN_CHAIN_ID, chain_id_bytes.as_mut())
             .expect("32-byte HKDF output");
-        hkdf_sha256_expand(&prk, DOMAIN_ED25519_IDENTITY, &mut identity_seed)
+        hkdf_sha256_expand(&prk, DOMAIN_ED25519_IDENTITY, identity_seed.as_mut())
             .expect("32-byte HKDF output");
-        hkdf_sha256_expand(&prk, DOMAIN_CONTENT_KEY, &mut content_key)
+        hkdf_sha256_expand(&prk, DOMAIN_CONTENT_KEY, content_key.as_mut())
             .expect("32-byte HKDF output");
-        hkdf_sha256_expand(&prk, DOMAIN_VAULT_SUBKEY, &mut vault_subkey)
+        hkdf_sha256_expand(&prk, DOMAIN_VAULT_SUBKEY, vault_subkey.as_mut())
             .expect("32-byte HKDF output");
-        hkdf_sha256_expand(&prk, DOMAIN_X25519_P2P, &mut x25519_seed)
+        hkdf_sha256_expand(&prk, DOMAIN_X25519_P2P, x25519_seed.as_mut())
             .expect("32-byte HKDF output");
 
-        let chain_id = hex::encode(chain_id_bytes);
-        chain_id_bytes.zeroize();
+        let chain_id = hex::encode(&*chain_id_bytes);
 
         SyncMasterKeys {
             chain_id,
-            identity_seed: SecretKey32::from_bytes(identity_seed),
-            content_encryption_key: SecretKey32::from_bytes(content_key),
-            vault_subkey: SecretKey32::from_bytes(vault_subkey),
-            p2p_x25519_seed: SecretKey32::from_bytes(x25519_seed),
-            hkdf_prk: SecretKey32::from_bytes(prk),
+            identity_seed: SecretKey32::from_bytes(*identity_seed),
+            content_encryption_key: SecretKey32::from_bytes(*content_key),
+            vault_subkey: SecretKey32::from_bytes(*vault_subkey),
+            p2p_x25519_seed: SecretKey32::from_bytes(*x25519_seed),
+            hkdf_prk: SecretKey32::from_bytes(*prk),
         }
     }
 }
@@ -373,8 +400,9 @@ fn compute_daily_25th_word_index(entropy: &[u8; 32], utc_day: u64) -> u16 {
         .expect("HMAC-SHA256 accepts any key length");
     mac.update(DOMAIN_DAILY_WORD);
     mac.update(&utc_day.to_be_bytes());
-    let tag = mac.finalize().into_bytes();
+    let mut tag = mac.finalize().into_bytes();
     let raw = u16::from_be_bytes([tag[0], tag[1]]);
+    tag.as_mut_slice().zeroize();
     raw & 0x07FF // 11 bits -> 0..2048
 }
 
@@ -389,9 +417,10 @@ pub fn hkdf_sha256_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(effective_salt)
         .expect("HMAC-SHA256 accepts any key length");
     mac.update(ikm);
-    let result = mac.finalize().into_bytes();
+    let mut result = mac.finalize().into_bytes();
     let mut prk = [0u8; 32];
     prk.copy_from_slice(&result);
+    result.as_mut_slice().zeroize();
     prk
 }
 
@@ -406,7 +435,7 @@ pub fn hkdf_sha256_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) -> Result
         return Ok(());
     }
 
-    let mut prev: [u8; HASH_LEN] = [0u8; HASH_LEN];
+    let mut prev = Zeroizing::new([0u8; HASH_LEN]);
     let mut has_prev = false;
     let mut offset = 0usize;
     let mut counter: u8 = 1;
@@ -415,12 +444,13 @@ pub fn hkdf_sha256_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) -> Result
         let mut mac = <HmacSha256 as Mac>::new_from_slice(prk)
             .expect("HMAC-SHA256 accepts 32-byte PRK");
         if has_prev {
-            mac.update(&prev);
+            mac.update(prev.as_ref());
         }
         mac.update(info);
         mac.update(&[counter]);
-        let block = mac.finalize().into_bytes();
+        let mut block = mac.finalize().into_bytes();
         prev.copy_from_slice(&block);
+        block.as_mut_slice().zeroize();
         has_prev = true;
 
         let take = (okm.len() - offset).min(HASH_LEN);
@@ -428,7 +458,6 @@ pub fn hkdf_sha256_expand(prk: &[u8; 32], info: &[u8], okm: &mut [u8]) -> Result
         offset += take;
         counter = counter.wrapping_add(1);
     }
-    prev.zeroize();
     Ok(())
 }
 
