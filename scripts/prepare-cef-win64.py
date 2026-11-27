@@ -166,7 +166,7 @@ def download_with_hashes(url: str, dest: Path) -> tuple[str, str, int]:
     for attempt in range(1, 4):
         try:
             print(f"[INFO] Downloading Pure Chromium CEF 150/7871 SDK (attempt {attempt}/3): {url}")
-            req = urllib.request.Request(url, headers={"User-Agent": "Singularity-CI/3.0.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Singularity-CI/3.0.1"})
             sha256 = hashlib.sha256()
             sha1 = hashlib.sha1()
             total = 0

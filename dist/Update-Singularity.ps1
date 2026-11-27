@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 $DefaultReleasePubKeyHex = "3af87c325effee5f8f23e1ba7d9b8c5e7cebda70388718e87cf308237e70c155"
 $Repo = "MyMasha/Singularity"
 $ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-$Ua = "Singularity-Updater/3.0.0"
+$Ua = "Singularity-Updater/3.0.1"
 $AllowedDownloadHosts = @(
     "github.com",
     "api.github.com",

@@ -2108,10 +2108,12 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   color: #f4f4f8;
   font-size: 12.5px;
   border: 1px solid transparent;
+  transition: background 0.16s var(--ease-snappy), border-color 0.16s var(--ease-snappy), transform 0.18s var(--ease-spring);
 }
 .omni-item:hover, .omni-item.active {
-  background: rgba(124, 58, 237, 0.18);
-  border-color: rgba(167, 139, 250, 0.35);
+  background: var(--gold-soft-bg);
+  border-color: var(--border-warm);
+  transform: translateX(2px);
 }
 .omni-item-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .omni-item-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
@@ -2140,7 +2142,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   flex-direction: column;
   box-shadow: 12px 0 40px rgba(0, 0, 0, 0.85);
 }
-#v3-sidebar.open { display: flex; }
+#v3-sidebar.open { display: flex; animation: sgSlideLeft 0.24s var(--ease-silk) both; }
 .v3-sb-tabs {
   display: flex;
   gap: 4px;
@@ -2149,6 +2151,8 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   overflow-x: auto;
 }
 .v3-sb-tab {
+  position: relative;
+  overflow: hidden;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: var(--text-secondary);
@@ -2157,11 +2161,14 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   border-radius: 8px;
   cursor: pointer;
   white-space: nowrap;
+  transition: background 0.16s var(--ease-snappy), border-color 0.16s var(--ease-snappy), color 0.16s ease, transform 0.16s var(--ease-spring);
 }
+.v3-sb-tab:hover { background: rgba(255, 255, 255, 0.10); color: #ffffff; }
+.v3-sb-tab:active { transform: scale(0.94); }
 .v3-sb-tab.active {
-  background: rgba(124, 58, 237, 0.28);
-  border-color: rgba(167, 139, 250, 0.5);
-  color: #ffffff;
+  background: var(--gold-soft-bg);
+  border-color: var(--border-warm);
+  color: var(--gold-bright);
 }
 .v3-sb-body {
   flex: 1;
@@ -2184,7 +2191,15 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   justify-content: center;
   padding-top: 72px;
 }
-#command-palette-modal.open, #tab-search-modal.open, #v3-internal-frame-modal.open { display: flex; }
+#command-palette-modal.open, #tab-search-modal.open, #v3-internal-frame-modal.open {
+  display: flex;
+  animation: sgBackdropFade 0.18s var(--ease-silk) both;
+}
+#command-palette-modal.open .v3-modal-card,
+#tab-search-modal.open .v3-modal-card,
+#v3-internal-frame-modal.open .v3-modal-card {
+  animation: sgModalPop 0.24s var(--ease-spring) both;
+}
 .v3-modal-card {
   width: min(640px, 92vw);
   max-height: 76vh;
@@ -2195,6 +2210,7 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  will-change: transform, opacity;
 }
 .v3-modal-input {
   width: 100%;
@@ -2236,8 +2252,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   border-radius: 11px;
   padding: 6px 10px;
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.9);
+  transform-origin: top right;
 }
-#find-in-page-bar.open { display: flex; }
+#find-in-page-bar.open { display: flex; animation: sgPopoverPop 0.2s var(--ease-spring) both; }
 #find-in-page-input {
   background: #000000;
   color: #ffffff;
@@ -2247,6 +2264,11 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   font-size: 12px;
   width: 200px;
   outline: none;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+#find-in-page-input:focus {
+  border-color: var(--border-warm);
+  box-shadow: 0 0 0 2px var(--gold-soft-bg);
 }
 
 #v3-popover-panel {
@@ -2265,8 +2287,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   flex-direction: column;
   gap: 10px;
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.92);
+  transform-origin: top right;
 }
-#v3-popover-panel.open { display: flex; }
+#v3-popover-panel.open { display: flex; animation: sgPopoverPop 0.22s var(--ease-spring) both; }
 
 #v3-status-bubble {
   position: fixed;
@@ -2287,9 +2310,9 @@ pub const SINGULARITY_UI_HTML: &str = r##"<!DOCTYPE html>
   pointer-events: none;
   display: none;
 }
-#v3-status-bubble.visible { display: block; }
+#v3-status-bubble.visible { display: block; animation: sgStatusIn 0.18s var(--ease-silk) both; }
 
-body.vertical-tabs #v3-vertical-rail { display: flex; }
+body.vertical-tabs #v3-vertical-rail { display: flex; animation: sgSlideLeft 0.22s var(--ease-silk) both; }
 #v3-vertical-rail {
   position: fixed;
   top: 46px;
@@ -2316,14 +2339,19 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
   color: var(--text-secondary);
   font-size: 12px;
   border: 1px solid transparent;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.18s var(--ease-spring);
 }
+.v3-vtab-row:hover { background: rgba(255, 255, 255, 0.06); color: #ffffff; transform: translateX(2px); }
+.v3-vtab-row:active { transform: scale(0.98); }
 .v3-vtab-row.active {
-  background: rgba(124, 58, 237, 0.22);
-  border-color: rgba(167, 139, 250, 0.42);
-  color: #ffffff;
+  background: var(--gold-soft-bg);
+  border-color: var(--border-warm);
+  color: var(--gold-bright);
 }
 .v3-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
 .v3-chip-btn {
+  position: relative;
+  overflow: hidden;
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.12);
   color: #f4f4f8;
@@ -2331,8 +2359,293 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
   padding: 6px 10px;
   font-size: 11.5px;
   cursor: pointer;
+  transition: background 0.16s var(--ease-snappy), border-color 0.16s var(--ease-snappy), color 0.16s ease, transform 0.16s var(--ease-spring);
 }
-.v3-chip-btn:hover { background: rgba(124, 58, 237, 0.24); border-color: rgba(167, 139, 250, 0.45); }
+.v3-chip-btn:hover { background: var(--gold-soft-bg); border-color: var(--border-warm); color: var(--gold-bright); transform: translateY(-1px); }
+.v3-chip-btn:active { transform: scale(0.95); }
+
+/* ============================================================================
+ * SINGULARITY SATISFYING MOTION & TACTILE MICRO-INTERACTIONS (GPU 120-200Hz)
+ * ============================================================================ */
+:root {
+  --ease-spring: cubic-bezier(0.22, 1.28, 0.36, 1);
+  --ease-snappy: cubic-bezier(0.2, 0.9, 0.25, 1);
+  --ease-silk: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes sgTabEnter {
+  0%   { opacity: 0; transform: translateY(5px) scale(0.93); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes sgTabAccentIn {
+  0%   { opacity: 0; transform: scaleX(0.25); }
+  100% { opacity: 1; transform: scaleX(1); }
+}
+@keyframes sgOmniDrop {
+  0%   { opacity: 0; transform: translateX(-50%) translateY(-8px) scale(0.985); }
+  100% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+}
+@keyframes sgBackdropFade {
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+@keyframes sgModalPop {
+  0%   { opacity: 0; transform: translateY(-14px) scale(0.96); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes sgSlideLeft {
+  0%   { opacity: 0; transform: translateX(-22px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+@keyframes sgPopoverPop {
+  0%   { opacity: 0; transform: translateY(-10px) scale(0.94); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes sgStatusIn {
+  0%   { opacity: 0; transform: translateY(6px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes sgPaneReveal {
+  0%   { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes sgNtpRise {
+  0%   { opacity: 0; transform: translateY(10px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes sgSpin360 {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+@keyframes sgStarPop {
+  0%   { transform: scale(1); }
+  38%  { transform: scale(1.34) rotate(-12deg); }
+  72%  { transform: scale(0.92) rotate(5deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
+@keyframes sgStarRing {
+  0%   { opacity: 0.78; transform: scale(0.55); }
+  100% { opacity: 0; transform: scale(1.9); }
+}
+@keyframes sgTogglePop {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(0.9); }
+  75%  { transform: scale(1.06); }
+  100% { transform: scale(1); }
+}
+@keyframes sgToastOrb {
+  0%, 100% { transform: scale(1); opacity: 0.9; }
+  50%      { transform: scale(1.28); opacity: 1; }
+}
+@keyframes sgRipple {
+  0%   { transform: translate(-50%, -50%) scale(0); opacity: 0.34; }
+  100% { transform: translate(-50%, -50%) scale(2.6); opacity: 0; }
+}
+
+/* Silky GPU-composited top page-loading hairline */
+#v3-load-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  pointer-events: none;
+  z-index: 95;
+  transform-origin: left center;
+  transform: scaleX(0);
+  opacity: 0;
+  background: linear-gradient(90deg, transparent 0%, var(--gold-core) 42%, var(--gold-bright) 100%);
+  box-shadow: 0 0 8px var(--gold-core);
+  transition: transform 0.22s var(--ease-silk), opacity 0.28s ease;
+  will-change: transform, opacity;
+}
+#v3-load-progress.loading { opacity: 0.95; }
+
+/* Omnibox dropdown spring drop */
+#omnibox-dropdown.open { animation: sgOmniDrop 0.19s var(--ease-spring) both; }
+
+/* Satisfying zero-jitter tab entrance & active underline glide */
+.tab-pill.tab-entering { animation: sgTabEnter 0.22s var(--ease-spring) both; }
+.tab-pill::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 1px;
+  height: 2px;
+  border-radius: 99px;
+  background: var(--gold-core);
+  opacity: 0;
+  transform: scaleX(0.25);
+  pointer-events: none;
+  transition: transform 0.24s var(--ease-spring), opacity 0.18s ease;
+}
+.tab-pill.active:not(.in-group)::before {
+  opacity: 0.85;
+  transform: scaleX(1);
+}
+.tab-pill:active:not(.dragging) { transform: scale(0.985); }
+.tab-favicon {
+  transform: scale(0.76);
+  transition: opacity 0.18s ease, transform 0.22s var(--ease-spring);
+}
+.tab-favicon.loaded { opacity: 1; transform: scale(1); }
+.tab-close-btn {
+  transition: background 0.14s ease, color 0.14s ease, opacity 0.14s ease, transform 0.18s var(--ease-spring);
+}
+.tab-close-btn:hover { transform: scale(1.12); }
+.tab-close-btn:active { transform: scale(0.84); }
+.tab-group-pill {
+  transition: filter 0.14s ease, transform 0.18s var(--ease-spring), box-shadow 0.18s ease;
+}
+.tab-group-pill:hover { transform: translateY(-1px); }
+.tab-group-pill:active { transform: scale(0.94); }
+
+/* Tactile toolbar icons, directional chevrons, rotating + & reload, popping bookmark star */
+.icon-btn {
+  transition: background 0.16s var(--ease-snappy), color 0.16s ease, opacity 0.16s ease, transform 0.18s var(--ease-spring);
+}
+.icon-btn:active:not(.nav-dim) { transform: scale(0.89); }
+.icon-btn svg { transition: transform 0.2s var(--ease-spring); }
+#btn-nav-back:hover:not(.nav-dim) svg { transform: translateX(-2px); }
+#btn-nav-fwd:hover:not(.nav-dim) svg { transform: translateX(2px); }
+#btn-new-tab:hover svg { transform: rotate(90deg) scale(1.06); }
+#btn-new-tab:active svg { transform: rotate(90deg) scale(0.9); }
+.brand-home-btn {
+  transition: background 0.16s ease, transform 0.2s var(--ease-spring);
+}
+.brand-home-btn:hover { transform: scale(1.06); }
+.brand-home-btn:active { transform: scale(0.92); }
+.omnibar-act-btn {
+  position: relative;
+  transition: color 0.15s ease, background 0.15s ease, transform 0.18s var(--ease-spring);
+}
+.omnibar-act-btn:hover { transform: scale(1.08); }
+.omnibar-act-btn:active { transform: scale(0.88); }
+#btn-reload-page.spinning svg { animation: sgSpin360 0.56s var(--ease-silk); }
+#btn-bookmark-star.star-pop svg { animation: sgStarPop 0.44s var(--ease-spring); }
+#btn-bookmark-star.star-pop::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  border: 1.5px solid var(--gold-core);
+  pointer-events: none;
+  animation: sgStarRing 0.48s var(--ease-silk) forwards;
+}
+
+/* Omnibar & NTP Search crisp focus elevation */
+.safari-omnibar {
+  transition: background 0.18s var(--ease-silk), border-color 0.18s var(--ease-silk), box-shadow 0.22s var(--ease-silk);
+}
+.safari-omnibar:focus-within {
+  box-shadow: 0 0 0 1px var(--border-warm), 0 6px 20px rgba(0, 0, 0, 0.42);
+}
+.ntp-search-bar {
+  transition: border-color 0.2s var(--ease-silk), background 0.2s var(--ease-silk), box-shadow 0.24s var(--ease-silk), transform 0.22s var(--ease-spring);
+}
+.ntp-search-bar:focus-within {
+  transform: translateY(-1px);
+  box-shadow: 0 0 0 1px var(--border-warm), 0 16px 40px rgba(0, 0, 0, 0.65);
+}
+.ntp-cluster.ntp-animate .hero-kicker { animation: sgNtpRise 0.34s var(--ease-silk) both; }
+.ntp-cluster.ntp-animate .hero-title { animation: sgNtpRise 0.38s var(--ease-silk) 0.04s both; }
+.ntp-cluster.ntp-animate .ntp-search-bar { animation: sgNtpRise 0.42s var(--ease-silk) 0.08s both; }
+.ntp-bm-item {
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.18s var(--ease-spring);
+}
+.ntp-bm-item:hover { transform: translateY(-1px); }
+.ntp-bm-item:active { transform: scale(0.95); }
+.ntp-bm-action-btn {
+  position: relative;
+  overflow: hidden;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.18s var(--ease-spring);
+}
+.ntp-bm-action-btn:hover { transform: translateY(-1px); }
+.ntp-bm-action-btn:active { transform: scale(0.94); }
+
+/* Settings sidebar indicator, pane cross-fade, mechanical toggles, cards & theme gallery */
+.sheet-tab-btn {
+  position: relative;
+  overflow: hidden;
+  transition: background 0.16s var(--ease-snappy), border-color 0.16s var(--ease-snappy), color 0.16s ease, transform 0.18s var(--ease-spring);
+}
+.sheet-tab-btn::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--gold-core);
+  transform: scaleY(0);
+  opacity: 0;
+  transition: transform 0.24s var(--ease-spring), opacity 0.16s ease;
+}
+.sheet-tab-btn.active::before { transform: scaleY(1); opacity: 1; }
+.sheet-tab-btn:hover:not(.active) { transform: translateX(2px); }
+.sheet-tab-btn:active { transform: scale(0.97); }
+.panel-grid.pane-entering { animation: sgPaneReveal 0.24s var(--ease-silk) both; }
+.info-card {
+  transition: border-color 0.2s ease, background 0.2s ease, transform 0.22s var(--ease-spring);
+}
+.info-card:hover { border-color: rgba(255, 255, 255, 0.13); }
+.toggle-pill {
+  position: relative;
+  overflow: hidden;
+  transition: background 0.18s var(--ease-silk), border-color 0.18s var(--ease-silk), color 0.18s ease, transform 0.18s var(--ease-spring);
+}
+.toggle-pill:hover { border-color: var(--border-strong); }
+.toggle-pill:active { transform: scale(0.92); }
+.toggle-pill.toggling { animation: sgTogglePop 0.26s var(--ease-spring); }
+.btn-subtle, .btn-primary, .eng-choice, .theme-card {
+  position: relative;
+  overflow: hidden;
+}
+.btn-subtle {
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, transform 0.18s var(--ease-spring);
+}
+.btn-subtle:hover { transform: translateY(-1px); }
+.btn-subtle:active { transform: scale(0.95); }
+.theme-card {
+  transition: transform 0.22s var(--ease-spring), border-color 0.2s ease, background 0.2s ease, box-shadow 0.22s ease;
+}
+.theme-card:hover { transform: translateY(-2px); }
+.theme-card:active { transform: scale(0.97); }
+.theme-card.selected { box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); }
+
+/* Onboarding wizard spring entrance & step transitions */
+#onboarding-overlay.open { animation: sgBackdropFade 0.2s var(--ease-silk) both; }
+#onboarding-overlay.open .welcome-card { animation: sgModalPop 0.28s var(--ease-spring) both; }
+.tuto-pane.active { animation: sgPaneReveal 0.24s var(--ease-silk) both; }
+
+/* Toast spring entrance & living orb */
+#toast {
+  transition: opacity 0.22s var(--ease-silk), transform 0.28s var(--ease-spring), border-color 0.18s ease;
+}
+#toast.show::before { animation: sgToastOrb 1.8s ease-in-out infinite; }
+
+/* Tactile pointer-origin ink ripple (GPU-only, auto-removed) */
+.sg-ripple {
+  position: absolute;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--gold-bright) 0%, var(--gold-core) 45%, transparent 72%);
+  pointer-events: none;
+  z-index: 3;
+  animation: sgRipple 0.44s var(--ease-silk) forwards;
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 </style>
 </head>
 <body>
@@ -2354,6 +2667,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
   <div id="app-shell">
     <!-- UNIFIED APPLE SAFARI TOP BAR (3-column symmetric Grid keeps URL bar centered always) -->
     <header class="apple-bar" id="apple-titlebar">
+      <div id="v3-load-progress" aria-hidden="true"></div>
       <!-- Left Column: Traffic Lights + Navigation + Overflow-Proof Tabs -->
       <div class="toolbar-left">
         <!-- Three Colored Apple Traffic Lights -->
@@ -2785,7 +3099,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
         </nav>
         <div class="settings-sidebar-footer">
           <div style="color:var(--text-secondary);font-weight:600;" data-i18n="about_singularity">About Singularity</div>
-          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.0</div>
+          <div id="sidebar-ver-label" style="font-family:var(--font-mono);color:var(--gold-bright);">v3.0.1</div>
         </div>
       </aside>
 
@@ -5286,6 +5600,10 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
     pill.appendChild(cls);
 
     syncTabPillElement(pill, t, grp);
+    if (typeof bootInitialized !== "undefined" && bootInitialized) {
+      pill.classList.add("tab-entering");
+      pill.addEventListener("animationend", () => pill.classList.remove("tab-entering"), { once: true });
+    }
     return pill;
   }
 
@@ -5855,9 +6173,11 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
         break;
       }
       case "reload_tab":
+        if (window.__sgMotion) window.__sgMotion.spinReload();
         reloadActivePage();
         break;
       case "toggle_bookmark":
+        if (window.__sgMotion) window.__sgMotion.popBookmarkStar();
         toggleActiveBookmark();
         break;
       case "open_history":
@@ -5915,6 +6235,7 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
         if (window.__v3) window.__v3.bookmarkAllTabs();
         break;
       case "hard_reload_tab":
+        if (window.__sgMotion) window.__sgMotion.spinReload();
         sendNativeIpc({ cmd: "hard_reload" });
         break;
       case "new_private_window":
@@ -6991,6 +7312,12 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
     }
     if (typeof msg.fullscreen === "boolean") {
       document.documentElement.classList.toggle("is-fullscreen", msg.fullscreen);
+    }
+    if (typeof msg.loading_progress === "number" && window.__sgMotion && window.__sgMotion.setLoadProgress) {
+      window.__sgMotion.setLoadProgress(msg.loading_progress);
+    }
+    if (typeof msg.status_message === "string" && window.__sgMotion && window.__sgMotion.setStatusBubble) {
+      window.__sgMotion.setStatusBubble(msg.status_message);
     }
     if (typeof msg.ram_active_count === "number") {
       nativeRamActiveCount = msg.ram_active_count;
@@ -8099,7 +8426,15 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
       const btn = document.getElementById("stab-" + k);
       const pane = document.getElementById("pane-" + k);
       if (btn) btn.classList.toggle("active", k === sec);
-      if (pane) pane.style.display = k === sec ? "flex" : "none";
+      if (pane) {
+        const isActive = k === sec;
+        pane.style.display = isActive ? "flex" : "none";
+        if (isActive) {
+          pane.classList.remove("pane-entering");
+          void pane.offsetWidth;
+          pane.classList.add("pane-entering");
+        }
+      }
     });
     syncUpdateFloatingBarVisibility();
 
@@ -10927,6 +11262,99 @@ body.vertical-tabs #v3-vertical-rail { display: flex; }
         sendNativeIpc({ cmd: "set_tab_audio_muted", tab_id: activeTabId, muted: activeMuted });
         showToast(activeMuted ? "Tab muted" : "Tab unmuted");
       }
+    };
+  })();
+
+  /* ============================================================================
+   * SINGULARITY SATISFYING MOTION ENGINE (RIPPLES, SPRING MICRO-INTERACTIONS)
+   * ============================================================================ */
+  (function initSingularitySatisfyingMotion() {
+    const RIPPLE_SEL = ".btn-primary, .btn-subtle, .v3-chip-btn, .toggle-pill, .sheet-tab-btn, .v3-sb-tab, .eng-choice, .ntp-bm-action-btn, .theme-card";
+    let loadFadeTimer = null;
+    let statusHideTimer = null;
+
+    const triggerOneShot = (el, cls, fallbackMs) => {
+      if (!el) return;
+      el.classList.remove(cls);
+      void el.offsetWidth;
+      el.classList.add(cls);
+      const cleanup = () => el.classList.remove(cls);
+      el.addEventListener("animationend", cleanup, { once: true });
+      setTimeout(cleanup, fallbackMs || 650);
+    };
+
+    document.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0 || !ev.target || !ev.target.closest) return;
+      const host = ev.target.closest(RIPPLE_SEL);
+      if (!host || host.disabled) return;
+      const rect = host.getBoundingClientRect();
+      if (rect.width < 12 || rect.height < 12) return;
+      const r = document.createElement("span");
+      r.className = "sg-ripple";
+      r.style.left = Math.round(ev.clientX - rect.left) + "px";
+      r.style.top = Math.round(ev.clientY - rect.top) + "px";
+      host.appendChild(r);
+      const rm = () => { if (r.parentNode) r.parentNode.removeChild(r); };
+      r.addEventListener("animationend", rm, { once: true });
+      setTimeout(rm, 520);
+    }, { passive: true });
+
+    document.addEventListener("click", (ev) => {
+      if (!ev.target || !ev.target.closest) return;
+      const tog = ev.target.closest(".toggle-pill");
+      if (tog) triggerOneShot(tog, "toggling", 340);
+      const reloadBtn = ev.target.closest("#btn-reload-page");
+      if (reloadBtn) triggerOneShot(reloadBtn, "spinning", 640);
+      const starBtn = ev.target.closest("#btn-bookmark-star");
+      if (starBtn) triggerOneShot(starBtn, "star-pop", 560);
+    }, true);
+
+    const ntpCluster = document.querySelector(".ntp-cluster");
+    if (ntpCluster) {
+      ntpCluster.classList.add("ntp-animate");
+    }
+
+    function setLoadProgress(p) {
+      const bar = document.getElementById("v3-load-progress");
+      if (!bar) return;
+      clearTimeout(loadFadeTimer);
+      const clamped = Math.max(0, Math.min(1, Number(p) || 0));
+      if (clamped <= 0.01) {
+        bar.classList.remove("loading");
+        bar.style.transform = "scaleX(0)";
+        return;
+      }
+      bar.classList.add("loading");
+      bar.style.transform = "scaleX(" + Math.max(0.08, clamped).toFixed(3) + ")";
+      if (clamped >= 0.995) {
+        loadFadeTimer = setTimeout(() => {
+          bar.classList.remove("loading");
+          setTimeout(() => {
+            if (!bar.classList.contains("loading")) bar.style.transform = "scaleX(0)";
+          }, 280);
+        }, 180);
+      }
+    }
+
+    function setStatusBubble(text) {
+      const el = document.getElementById("v3-status-bubble");
+      if (!el) return;
+      clearTimeout(statusHideTimer);
+      const clean = String(text || "").trim();
+      if (!clean) {
+        el.classList.remove("visible");
+        return;
+      }
+      el.textContent = clean;
+      el.classList.add("visible");
+      statusHideTimer = setTimeout(() => el.classList.remove("visible"), 4500);
+    }
+
+    window.__sgMotion = {
+      setLoadProgress,
+      setStatusBubble,
+      spinReload: () => triggerOneShot(document.getElementById("btn-reload-page"), "spinning", 640),
+      popBookmarkStar: () => triggerOneShot(document.getElementById("btn-bookmark-star"), "star-pop", 560),
     };
   })();
 

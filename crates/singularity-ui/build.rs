@@ -132,8 +132,8 @@ fn embed_windows_exe_resources() {
          {icon_line}\
          1 24 \"{manifest_escaped}\"\r\n\
          1 VERSIONINFO\r\n\
-         FILEVERSION 3,0,0,0\r\n\
-         PRODUCTVERSION 3,0,0,0\r\n\
+         FILEVERSION 3,0,1,0\r\n\
+         PRODUCTVERSION 3,0,1,0\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -146,11 +146,11 @@ fn embed_windows_exe_resources() {
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Singularity\\0\"\r\n\
                VALUE \"FileDescription\", \"Singularity Browser (Pure Chromium CEF)\\0\"\r\n\
-               VALUE \"FileVersion\", \"3.0.0.0\\0\"\r\n\
+               VALUE \"FileVersion\", \"3.0.1.0\\0\"\r\n\
                VALUE \"InternalName\", \"singularity\\0\"\r\n\
                VALUE \"OriginalFilename\", \"singularity.exe\\0\"\r\n\
                VALUE \"ProductName\", \"Singularity\\0\"\r\n\
-               VALUE \"ProductVersion\", \"3.0.0.0\\0\"\r\n\
+               VALUE \"ProductVersion\", \"3.0.1.0\\0\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\

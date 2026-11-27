@@ -1143,3 +1143,157 @@ pub fn show_native_crash_dialog(title: &str, report_text: &str) {
         }
     }
 }
+
+#[cfg(target_os = "windows")]
+static SHUTDOWN_SENTINEL_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Hidden top-level Win32 window created AFTER CEF initialization so Windows broadcasts
+/// `WM_QUERYENDSESSION` / `WM_ENDSESSION` to it even if Chromium's own hidden shutdown window
+/// exits before `tao`'s `Event::LoopDestroyed` finishes. Removes `running.lock` and arms
+/// `planned_restart.flag` atomically with zero mutexes and zero CEF re-entrancy.
+#[cfg(target_os = "windows")]
+pub struct Win32ShutdownSentinel {
+    hwnd: isize,
+}
+
+#[cfg(target_os = "windows")]
+impl Win32ShutdownSentinel {
+    pub fn install(roaming_root: &Path) -> Self {
+        use std::os::windows::ffi::OsStrExt;
+        let _ = SHUTDOWN_SENTINEL_ROOT.set(roaming_root.to_path_buf());
+
+        #[repr(C)]
+        struct WndClassExW {
+            cb_size: u32,
+            style: u32,
+            lpfn_wnd_proc:
+                unsafe extern "system" fn(*mut core::ffi::c_void, u32, usize, isize) -> isize,
+            cb_cls_extra: i32,
+            cb_wnd_extra: i32,
+            h_instance: *mut core::ffi::c_void,
+            h_icon: *mut core::ffi::c_void,
+            h_cursor: *mut core::ffi::c_void,
+            hbr_background: *mut core::ffi::c_void,
+            lpsz_menu_name: *const u16,
+            lpsz_class_name: *const u16,
+            h_icon_sm: *mut core::ffi::c_void,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(lp_module_name: *const u16) -> *mut core::ffi::c_void;
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn RegisterClassExW(wc: *const WndClassExW) -> u16;
+            fn CreateWindowExW(
+                dw_ex_style: u32,
+                lp_class_name: *const u16,
+                lp_window_name: *const u16,
+                dw_style: u32,
+                x: i32,
+                y: i32,
+                n_width: i32,
+                n_height: i32,
+                hwnd_parent: *mut core::ffi::c_void,
+                h_menu: *mut core::ffi::c_void,
+                h_instance: *mut core::ffi::c_void,
+                lp_param: *mut core::ffi::c_void,
+            ) -> *mut core::ffi::c_void;
+            fn DefWindowProcW(
+                hwnd: *mut core::ffi::c_void,
+                msg: u32,
+                wp: usize,
+                lp: isize,
+            ) -> isize;
+        }
+
+        const WM_QUERYENDSESSION: u32 = 0x0011;
+        const WM_ENDSESSION: u32 = 0x0016;
+        const WS_OVERLAPPED: u32 = 0x0000_0000;
+        const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+        const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+
+        unsafe extern "system" fn sentinel_wnd_proc(
+            hwnd: *mut core::ffi::c_void,
+            msg: u32,
+            wp: usize,
+            lp: isize,
+        ) -> isize {
+            match msg {
+                WM_QUERYENDSESSION => 1, // Ready to shut down; never block Windows shutdown
+                WM_ENDSESSION => {
+                    if wp != 0 {
+                        if let Some(root) = SHUTDOWN_SENTINEL_ROOT.get() {
+                            mark_planned_restart(root);
+                        }
+                    }
+                    0
+                }
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+
+        let cls: Vec<u16> = std::ffi::OsStr::new("SingularityShutdownSentinelClass")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let title: Vec<u16> = std::ffi::OsStr::new("SingularityShutdownSentinel")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+
+        let hwnd = unsafe {
+            let hinst = GetModuleHandleW(core::ptr::null());
+            let wc = WndClassExW {
+                cb_size: core::mem::size_of::<WndClassExW>() as u32,
+                style: 0,
+                lpfn_wnd_proc: sentinel_wnd_proc,
+                cb_cls_extra: 0,
+                cb_wnd_extra: 0,
+                h_instance: hinst,
+                h_icon: core::ptr::null_mut(),
+                h_cursor: core::ptr::null_mut(),
+                hbr_background: core::ptr::null_mut(),
+                lpsz_menu_name: core::ptr::null(),
+                lpsz_class_name: cls.as_ptr(),
+                h_icon_sm: core::ptr::null_mut(),
+            };
+            let _ = RegisterClassExW(&wc);
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                cls.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                hinst,
+                core::ptr::null_mut(),
+            )
+        };
+        Self {
+            hwnd: hwnd as isize,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Win32ShutdownSentinel {
+    fn drop(&mut self) {
+        if self.hwnd != 0 {
+            #[link(name = "user32")]
+            extern "system" {
+                fn DestroyWindow(hwnd: *mut core::ffi::c_void) -> i32;
+            }
+            unsafe {
+                let _ = DestroyWindow(self.hwnd as *mut core::ffi::c_void);
+            }
+            self.hwnd = 0;
+        }
+    }
+}
+

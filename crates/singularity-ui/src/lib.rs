@@ -823,11 +823,11 @@ mod tests {
         assert!(roaming_store::is_valid_language("en"));
         assert!(roaming_store::is_valid_language("fr"));
         assert!(!roaming_store::is_valid_language("xx"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.1");
 
         // 4. English HTML default, live EN/FR i18n, mandatory Step 1 language+theme gate, and zero bundled brand SVGs
         assert!(SINGULARITY_UI_HTML.contains("<html lang=\"en\">"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
         assert!(SINGULARITY_UI_HTML.contains("function applyLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function selectLanguage("));
         assert!(SINGULARITY_UI_HTML.contains("function pickOnboardLanguage("));
@@ -1220,7 +1220,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("focus_active_web"));
         assert!(SINGULARITY_UI_HTML.contains("toggle_media_play"));
         assert!(SINGULARITY_UI_HTML.contains("restored_windows_count"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
 
         let _ = std::fs::remove_dir_all(&test_dir);
     }
@@ -1387,7 +1387,7 @@ mod tests {
         // Write a stale dead-PID running.lock AND a crash_checkpoint.json with 2 windows + video timestamps
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999997,"started_unix":1700000000,"version":"3.0.0"}"#,
+            r#"{"pid":999997,"started_unix":1700000000,"version":"3.0.1"}"#,
         )
         .expect("write stale lock");
         assert!(crash_guard::has_unclean_crash_sentinel(&tmp_dir));
@@ -1472,7 +1472,7 @@ mod tests {
         let txt = rep.format_copyable_text();
         assert!(txt.contains("=== SINGULARITY BROWSER CRASH REPORT ==="));
         assert!(txt.contains("simulated crash line"));
-        assert!(txt.contains("v3.0.0"));
+        assert!(txt.contains("v3.0.1"));
 
         // Clean shutdown clears running.lock sentinel
         crash_guard::mark_clean_shutdown(&tmp_dir);
@@ -1506,7 +1506,7 @@ mod tests {
         assert!(SINGULARITY_UI_HTML.contains("copyCrashReport"));
         assert!(SINGULARITY_UI_HTML.contains("closeCrashReportModal"));
         assert!(SINGULARITY_UI_HTML.contains("copy_text"));
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
     }
 
     #[test]
@@ -1581,7 +1581,7 @@ mod tests {
         // windows + timestamps restore cleanly WITHOUT surfacing a false-positive crash dialog!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999996,"started_unix":1700000000,"version":"3.0.0"}"#,
+            r#"{"pid":999996,"started_unix":1700000000,"version":"3.0.1"}"#,
         )
         .expect("write running.lock");
         let sessions_dir = tmp_dir.join("sessions");
@@ -1647,7 +1647,7 @@ mod tests {
         // even after the new process truncates `cef.log`!
         std::fs::write(
             tmp_dir.join("running.lock"),
-            r#"{"pid":999995,"started_unix":1700000000,"version":"3.0.0"}"#,
+            r#"{"pid":999995,"started_unix":1700000000,"version":"3.0.1"}"#,
         )
         .expect("write dead lock");
         std::fs::write(tmp_dir.join("cef.log"), "[NEW_PID] fresh boot warning\n")
@@ -1979,8 +1979,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // 7. Verify UI, IPC, Win32 picker, and clean --wait-pid restart invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.0");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.1");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-file\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"btn-pick-ext-folder\""));
         assert!(SINGULARITY_UI_HTML.contains("id=\"ext-restart-banner\""));
@@ -2088,9 +2088,9 @@ mod tests {
         assert!(prog_json.get("percent").is_some());
         assert!(prog_json.get("speed_bps").is_some());
 
-        // 6. Verify v3.0.0 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
-        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.0");
-        assert!(SINGULARITY_UI_HTML.contains("v3.0.0"));
+        // 6. Verify v3.0.1 UI, tab-stability, update progress bar, and zero-restart dynamic extension invariants
+        assert_eq!(env!("CARGO_PKG_VERSION"), "3.0.1");
+        assert!(SINGULARITY_UI_HTML.contains("v3.0.1"));
         assert!(SINGULARITY_UI_HTML.contains("if ((ev.buttons & 1) === 0)"));
         assert!(SINGULARITY_UI_HTML.contains("window.addEventListener(\"pointerup\""));
         assert!(SINGULARITY_UI_HTML.contains("lostpointercapture"));
@@ -2382,7 +2382,7 @@ mod tests {
         let (st, dl_enq) = call_post(
             "/api/downloads/enqueue",
             serde_json::json!({
-                "url": "https://github.com/MyMasha/Singularity/releases/download/v3.0.0/singularity.zip",
+                "url": "https://github.com/MyMasha/Singularity/releases/download/v3.0.1/singularity.zip",
                 "filename": "singularity.zip",
                 "total_bytes": 1048576
             }),
@@ -2609,6 +2609,59 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn test_windows_shutdown_sentinel_and_cef_popup_client_invariants() {
+        let crash_src = include_str!("crash_guard.rs");
+        assert!(crash_src.contains("pub struct Win32ShutdownSentinel"));
+        assert!(crash_src.contains("WM_QUERYENDSESSION"));
+        assert!(crash_src.contains("WM_ENDSESSION"));
+        assert!(crash_src.contains("SingularityShutdownSentinelClass"));
+
+        let server_src = include_str!("server.rs");
+        assert!(server_src.contains("Win32ShutdownSentinel::install"));
+        assert!(!server_src.contains("SetWindowSubclass"));
+        // Verify Event::LoopDestroyed clears running.lock (mark_planned_restart) BEFORE close_cleanly
+        let loop_pos = server_src
+            .find("Event::LoopDestroyed =>")
+            .expect("Event::LoopDestroyed handler");
+        let loop_body = &server_src[loop_pos..];
+        let mark_pos = loop_body
+            .find("mark_planned_restart(&root_dir)")
+            .expect("mark_planned_restart inside LoopDestroyed");
+        let close_pos = loop_body
+            .find("st.close_cleanly()")
+            .expect("close_cleanly inside LoopDestroyed");
+        assert!(
+            mark_pos < close_pos,
+            "Event::LoopDestroyed must clear running.lock via mark_planned_restart BEFORE CEF/Win32 teardown"
+        );
+
+        let cef_src = include_str!("cef_runtime.rs");
+        assert!(cef_src.contains("IPH_ExtensionsZeroStatePromo"));
+        assert!(cef_src.contains("wi.runtime_style = RuntimeStyle::ALLOY"));
+        assert!(cef_src.contains("ext_popup_cfg"));
+        assert!(cef_src.contains("req.referrer_url()"));
+
+        // Satisfying GPU-composited motion & accessibility invariants
+        for marker in [
+            "--ease-spring:",
+            "@keyframes sgTabEnter",
+            "@keyframes sgModalPop",
+            "@keyframes sgStarPop",
+            "@keyframes sgRipple",
+            "id=\"v3-load-progress\"",
+            "initSingularitySatisfyingMotion",
+            "prefers-reduced-motion: reduce",
+        ] {
+            assert!(
+                SINGULARITY_UI_HTML.contains(marker),
+                "SINGULARITY_UI_HTML missing motion marker: {}",
+                marker
+            );
+        }
+    }
 }
+
 
 

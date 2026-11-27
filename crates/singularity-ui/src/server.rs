@@ -3111,6 +3111,15 @@ fn run_windows_frameless_browser(
         None
     };
 
+    // Register a hidden top-level Win32 WM_QUERYENDSESSION/WM_ENDSESSION sentinel AFTER CEF init
+    // so Windows OS shutdown/restart clears `running.lock` and arms `planned_restart.flag`
+    // immediately before Chromium/tao teardown can stall or exit.
+    let mut shutdown_sentinel = if smoke_opt.is_none() {
+        Some(crate::crash_guard::Win32ShutdownSentinel::install(&root_dir))
+    } else {
+        None
+    };
+
     let ctx_ready = cef_guard.wait_for_context_initialized(Duration::from_secs(5));
     if let Some(ref mut sm) = smoke_tracker {
         sm.context_initialized = ctx_ready;
@@ -7606,13 +7615,23 @@ fn run_windows_frameless_browser(
             },
             Event::LoopDestroyed => {
                 // On Windows Shutdown / Restart / Logoff (`WM_ENDSESSION`), `tao` fires
-                // `Event::LoopDestroyed` and immediately exits without firing `CloseRequested`.
-                // Persist every live window, flush Chromium's cookie store, remove `running.lock`,
-                // and arm `planned_restart.flag` so next boot restores all windows cleanly with
-                // ZERO false-positive Crash Report popups!
+                // `Event::LoopDestroyed` and immediately calls `exit(0)` without firing
+                // `CloseRequested`. CRITICAL: persist the live checkpoint AND clear `running.lock`
+                // (`mark_planned_restart` / `mark_clean_shutdown`) FIRST — BEFORE slow/blocking
+                // CEF/COM teardown (`close_cleanly`, `flush_cookie_store_cef_sync`, `drm_web_context`),
+                // so Windows terminating the process mid-teardown NEVER causes a false Crash Report!
                 let had_open_windows = !windows.is_empty();
                 if had_open_windows {
                     flush_live_crash_checkpoint(&windows, &cfg_clone, &shared_shell);
+                }
+                if smoke_tracker.is_none() {
+                    if had_open_windows {
+                        crate::crash_guard::mark_planned_restart(&root_dir);
+                    } else {
+                        crate::crash_guard::mark_clean_shutdown(&root_dir);
+                    }
+                }
+                if had_open_windows {
                     let drained: Vec<BrowserWindowState> =
                         windows.drain().map(|(_, st)| st).collect();
                     for mut st in drained {
@@ -7625,21 +7644,15 @@ fn run_windows_frameless_browser(
                         let _ = shell.roaming.save_profile();
                         history_dirty = false;
                     }
-                    cef_runtime::flush_cookie_store_cef_sync(Duration::from_millis(500));
+                    cef_runtime::flush_cookie_store_cef_sync(Duration::from_millis(350));
                     {
                         let shell = shared_shell.lock().unwrap_or_else(|e| e.into_inner());
                         shell.roaming.flush_async_persistence();
                         shell.roaming.unregister_live_window();
                     }
                 }
+                drop(shutdown_sentinel.take());
                 drop(drm_web_context.take());
-                if smoke_tracker.is_none() {
-                    if had_open_windows {
-                        crate::crash_guard::mark_planned_restart(&root_dir);
-                    } else {
-                        crate::crash_guard::mark_clean_shutdown(&root_dir);
-                    }
-                }
             }
             _ => {}
         }

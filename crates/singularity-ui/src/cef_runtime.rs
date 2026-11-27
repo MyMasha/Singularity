@@ -870,7 +870,7 @@ wrap_app! {
                 cmd.append_switch(Some(&CefString::from("disable-component-update")));
             }
 
-            let mut disable_feats = "BackForwardCache,RenderDocument,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls".to_string();
+            let mut disable_feats = "BackForwardCache,RenderDocument,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,Translate,InterestFeedContentSuggestions,AutofillServerCommunication,HeavyAdIntervention,GlobalMediaControls,IPH_ExtensionsZeroStatePromo".to_string();
             let mut enable_feats = "PlatformHEVCDecoderSupport".to_string();
             let mut extra_flag_switches: Vec<String> = Vec::new();
             if let Some(roaming_dir) = self.extensions_dir.as_ref().and_then(|d| d.parent()) {
@@ -1433,7 +1433,7 @@ wrap_life_span_handler! {
             target_disposition: WindowOpenDisposition,
             user_gesture: ::std::os::raw::c_int,
             popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
+            window_info: Option<&mut WindowInfo>,
             client: Option<&mut Option<Client>>,
             _settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
@@ -1448,12 +1448,34 @@ wrap_life_span_handler! {
                 .unwrap_or(false);
             if self.cfg.is_ext_popup {
                 if starts_with_ignore_ascii_case(&url, "chrome-extension://") {
+                    if let Some(wi) = window_info {
+                        wi.runtime_style = RuntimeStyle::ALLOY;
+                    }
+                    if let Some(client_slot) = client {
+                        let ext_popup_cfg = ClientConfig {
+                            is_ui: false,
+                            is_ext_popup: true,
+                            is_standalone_popup: true,
+                            tab_id: 0,
+                            bind_port: self.cfg.bind_port,
+                            sink: Arc::clone(&self.cfg.sink),
+                            shared_shell: Arc::clone(&self.cfg.shared_shell),
+                            download_resolver: Arc::clone(&self.cfg.download_resolver),
+                            downloads: Arc::new(Mutex::new(HashMap::new())),
+                            last_user_gesture_ms: Arc::new(AtomicU64::new(monotonic_millis())),
+                            no_gesture_urls: Arc::new(Mutex::new(HashMap::new())),
+                        };
+                        *client_slot = Some(SingularityCefClient::new(ext_popup_cfg));
+                    }
                     return 0;
                 }
                 if is_explicit_popup
                     && parse_http_host_port(&url).is_some()
                     && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
                 {
+                    if let Some(wi) = window_info {
+                        wi.runtime_style = RuntimeStyle::ALLOY;
+                    }
                     // SECURITY (N3 #27): Allow OAuth/SSO popup dialogs opened from Chrome extension
                     // popups so `window.opener` handoffs complete cleanly, BUT attach a fresh client
                     // with `is_ext_popup: false` so `ResourceRequestHandler` (adblocker + local IPC
@@ -1485,6 +1507,9 @@ wrap_life_span_handler! {
                 && !self.cfg.is_ui
                 && !is_blocked_local_ipc_url(&url, self.cfg.bind_port)
             {
+                if let Some(wi) = window_info {
+                    wi.runtime_style = RuntimeStyle::ALLOY;
+                }
                 if let Some(client_slot) = client {
                     let pip_cfg = ClientConfig {
                         is_ui: false,
@@ -1870,7 +1895,7 @@ wrap_resource_request_handler! {
         fn on_before_resource_load(
             &self,
             browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             _callback: Option<&mut Callback>,
         ) -> ReturnValue {
@@ -1935,8 +1960,31 @@ wrap_resource_request_handler! {
                 .map(|(h, _)| h)
                 .unwrap_or_default();
             if doc_host.is_empty() {
+                let ref_url = cef_str_userfree(req.referrer_url());
+                if starts_with_ignore_ascii_case(&ref_url, "chrome-extension://") {
+                    return ReturnValue::CONTINUE;
+                }
+                if let Some((rh, _)) = parse_http_host_port(&ref_url) {
+                    doc_host = rh;
+                }
+            }
+            if doc_host.is_empty() {
+                if let Some(f) = frame {
+                    if f.is_valid() != 0 {
+                        let frame_url = cef_str_userfree(f.url());
+                        if starts_with_ignore_ascii_case(&frame_url, "chrome-extension://") {
+                            return ReturnValue::CONTINUE;
+                        }
+                        if let Some((fh, _)) = parse_http_host_port(&frame_url) {
+                            doc_host = fh;
+                        }
+                    }
+                }
+            }
+            if doc_host.is_empty() {
                 if let Some(main_url) = browser
                     .and_then(|b| b.main_frame())
+                    .filter(|f| f.is_valid() != 0)
                     .map(|f| cef_str_userfree(f.url()))
                 {
                     if starts_with_ignore_ascii_case(&main_url, "chrome-extension://") {

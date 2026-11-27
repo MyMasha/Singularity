@@ -1663,7 +1663,7 @@ mod tests {
             "https://objects.githubusercontent.com/github-production-release-asset/foo",
             "https://release-assets.githubusercontent.com/bar",
             "https://github-releases.githubusercontent.com/baz",
-            "HTTPS://GITHUB.COM/MyMasha/Singularity/releases/download/v3.0.0/SHA256SUMS.txt",
+            "HTTPS://GITHUB.COM/MyMasha/Singularity/releases/download/v3.0.1/SHA256SUMS.txt",
         ] {
             assert!(is_allowed_update_https_url(ok), "should allow {}", ok);
         }
